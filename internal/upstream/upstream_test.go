@@ -174,17 +174,19 @@ func (f *fakeConnectProxy) handle(c net.Conn) {
 		statusText = "Status"
 	}
 	resp := "HTTP/1.1 " + itoa(f.status) + " " + statusText + "\r\n\r\n"
+	if f.status >= 200 && f.status < 300 && len(f.extra) > 0 {
+		// Send the 2xx response and the post-handshake bytes in a
+		// single Write so kernel coalescing lands them in the same
+		// read on the upstream side. Two separate Writes can land in
+		// two separate reads, in which case TestHTTPUpstreamCONNECT
+		// BufferedBytes loses the buffered-bytes path entirely.
+		resp += string(f.extra)
+	}
 	if _, err := c.Write([]byte(resp)); err != nil {
 		return
 	}
 	if f.status < 200 || f.status >= 300 {
 		return
-	}
-	// On 2xx, optionally write extra bytes the upstream should pick up
-	// after handshake, then tunnel to a real dst (if provided) so the
-	// caller can read/write through the conn.
-	if len(f.extra) > 0 {
-		_, _ = c.Write(f.extra)
 	}
 	if f.dst == "" {
 		return
