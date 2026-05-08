@@ -472,6 +472,198 @@ timout_ms = 9000
 	}
 }
 
+func TestScoringDefaultsApplied(t *testing.T) {
+	t.Parallel()
+	const minimal = `
+[[upstream]]
+id   = "direct"
+kind = "direct"
+`
+	cfg, err := Parse([]byte(minimal), "scoring-defaults.toml")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	s := cfg.Failure.Scoring
+	if s.RefusedPenalty != ScoringDefaults.RefusedPenalty {
+		t.Errorf("RefusedPenalty default = %v, want %v", s.RefusedPenalty, ScoringDefaults.RefusedPenalty)
+	}
+	if s.RefusedCooldown.Duration() != ScoringDefaults.RefusedCooldown.Duration() {
+		t.Errorf("RefusedCooldown default = %v, want %v", s.RefusedCooldown.Duration(), ScoringDefaults.RefusedCooldown.Duration())
+	}
+	if s.TimeoutPenalty != ScoringDefaults.TimeoutPenalty {
+		t.Errorf("TimeoutPenalty default = %v, want %v", s.TimeoutPenalty, ScoringDefaults.TimeoutPenalty)
+	}
+	if s.TimeoutCooldown.Duration() != ScoringDefaults.TimeoutCooldown.Duration() {
+		t.Errorf("TimeoutCooldown default = %v, want %v", s.TimeoutCooldown.Duration(), ScoringDefaults.TimeoutCooldown.Duration())
+	}
+	if s.SuccessWeight != ScoringDefaults.SuccessWeight {
+		t.Errorf("SuccessWeight default = %v, want %v", s.SuccessWeight, ScoringDefaults.SuccessWeight)
+	}
+	if s.ScoreCap != ScoringDefaults.ScoreCap {
+		t.Errorf("ScoreCap default = %v, want %v", s.ScoreCap, ScoringDefaults.ScoreCap)
+	}
+	if s.ProbeChance != ScoringDefaults.ProbeChance {
+		t.Errorf("ProbeChance default = %v, want %v", s.ProbeChance, ScoringDefaults.ProbeChance)
+	}
+	if s.DecayInterval.Duration() != ScoringDefaults.DecayInterval.Duration() {
+		t.Errorf("DecayInterval default = %v, want %v", s.DecayInterval.Duration(), ScoringDefaults.DecayInterval.Duration())
+	}
+	if s.DecayStep != ScoringDefaults.DecayStep {
+		t.Errorf("DecayStep default = %v, want %v", s.DecayStep, ScoringDefaults.DecayStep)
+	}
+	if s.CascadeTTL.Duration() != ScoringDefaults.CascadeTTL.Duration() {
+		t.Errorf("CascadeTTL default = %v, want %v", s.CascadeTTL.Duration(), ScoringDefaults.CascadeTTL.Duration())
+	}
+	if s.DebounceWindow.Duration() != ScoringDefaults.DebounceWindow.Duration() {
+		t.Errorf("DebounceWindow default = %v, want %v", s.DebounceWindow.Duration(), ScoringDefaults.DebounceWindow.Duration())
+	}
+}
+
+func TestScoringPartialOverridePreservesOtherDefaults(t *testing.T) {
+	t.Parallel()
+	const partial = `
+[failure.scoring]
+probe_chance = 0.25
+
+[[upstream]]
+id   = "direct"
+kind = "direct"
+`
+	cfg, err := Parse([]byte(partial), "scoring-partial.toml")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	s := cfg.Failure.Scoring
+	if s.ProbeChance != 0.25 {
+		t.Errorf("ProbeChance = %v, want 0.25 from user override", s.ProbeChance)
+	}
+	if s.RefusedPenalty != ScoringDefaults.RefusedPenalty {
+		t.Errorf("RefusedPenalty = %v, want %v from defaults", s.RefusedPenalty, ScoringDefaults.RefusedPenalty)
+	}
+	if s.DecayInterval.Duration() != ScoringDefaults.DecayInterval.Duration() {
+		t.Errorf("DecayInterval = %v, want %v from defaults", s.DecayInterval.Duration(), ScoringDefaults.DecayInterval.Duration())
+	}
+}
+
+func TestScoringValidationFailures(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name     string
+		toml     string
+		contains string
+	}{
+		{
+			name: "negative refused_penalty",
+			toml: `
+[failure.scoring]
+refused_penalty = -1
+
+[[upstream]]
+id   = "d"
+kind = "direct"
+`,
+			contains: "refused_penalty must be >= 0",
+		},
+		{
+			name: "negative refused_cooldown",
+			toml: `
+[failure.scoring]
+refused_cooldown = "-5s"
+
+[[upstream]]
+id   = "d"
+kind = "direct"
+`,
+			contains: "refused_cooldown must be >= 0",
+		},
+		{
+			name: "zero success_weight",
+			toml: `
+[failure.scoring]
+success_weight = 0
+
+[[upstream]]
+id   = "d"
+kind = "direct"
+`,
+			contains: "success_weight must be > 0",
+		},
+		{
+			name: "zero score_cap",
+			toml: `
+[failure.scoring]
+score_cap = 0
+
+[[upstream]]
+id   = "d"
+kind = "direct"
+`,
+			contains: "score_cap must be > 0",
+		},
+		{
+			name: "probe_chance too high",
+			toml: `
+[failure.scoring]
+probe_chance = 1.5
+
+[[upstream]]
+id   = "d"
+kind = "direct"
+`,
+			contains: "probe_chance must be in [0,1]",
+		},
+		{
+			name: "negative probe_chance",
+			toml: `
+[failure.scoring]
+probe_chance = -0.1
+
+[[upstream]]
+id   = "d"
+kind = "direct"
+`,
+			contains: "probe_chance must be in [0,1]",
+		},
+		{
+			name: "zero decay_interval",
+			toml: `
+[failure.scoring]
+decay_interval = "0s"
+
+[[upstream]]
+id   = "d"
+kind = "direct"
+`,
+			contains: "decay_interval must be > 0",
+		},
+		{
+			name: "negative debounce_window",
+			toml: `
+[failure.scoring]
+debounce_window = "-10ms"
+
+[[upstream]]
+id   = "d"
+kind = "direct"
+`,
+			contains: "debounce_window must be >= 0",
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := Parse([]byte(tc.toml), tc.name+".toml")
+			if err == nil {
+				t.Fatalf("Parse succeeded; want error containing %q", tc.contains)
+			}
+			if !strings.Contains(err.Error(), tc.contains) {
+				t.Fatalf("error %q does not contain %q", err.Error(), tc.contains)
+			}
+		})
+	}
+}
+
 func TestMarshalRoundTrip(t *testing.T) {
 	cfg, err := Parse([]byte(validConfig), "rt.toml")
 	if err != nil {

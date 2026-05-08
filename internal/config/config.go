@@ -122,11 +122,59 @@ type StatusRule struct {
 // "value == zero", so a user-provided 0 reaches Validate (and rightly fails)
 // instead of being silently replaced by the default.
 type FailureConfig struct {
-	ConnectionRefused    bool         `toml:"connection_refused"`      // default: true; user can opt out by setting connection_refused = false
-	TimeoutMS            int          `toml:"timeout_ms"`              // default: 8000
-	BodyRegex            []string     `toml:"body_regex"`              // default: []
-	MaxRetriesPerRequest int          `toml:"max_retries_per_request"` // default: 5
-	Status               []StatusRule `toml:"status"`                  // default: see DefaultStatusRules
+	ConnectionRefused    bool          `toml:"connection_refused"`      // default: true; user can opt out by setting connection_refused = false
+	TimeoutMS            int           `toml:"timeout_ms"`              // default: 8000
+	BodyRegex            []string      `toml:"body_regex"`              // default: []
+	MaxRetriesPerRequest int           `toml:"max_retries_per_request"` // default: 5
+	Status               []StatusRule  `toml:"status"`                  // default: see DefaultStatusRules
+	Scoring              ScoringConfig `toml:"scoring"`                 // default: see ScoringDefaults
+}
+
+// ScoringConfig drives the per-(host, upstream) scoreboard introduced in
+// Phase 4. Penalty values are positive numbers that the scoreboard subtracts
+// from the relevant entry's score; cooldown values name how long the
+// affected (host, upstream) pair sits out the rotation after a failure of
+// that kind.
+//
+// Phase 4 fires the refused and timeout policies from the dial path. The
+// rate-limit, forbidden, and legal-block kinds are populated from
+// [[failure.status]] entries (Phase 5 wires them through the listener);
+// body-match policy is left for Phase 8. ScoringConfig only carries the
+// kinds that do not have a natural home elsewhere in the config.
+type ScoringConfig struct {
+	RefusedPenalty  float64  `toml:"refused_penalty"`  // default: 3
+	RefusedCooldown Duration `toml:"refused_cooldown"` // default: 30s
+	TimeoutPenalty  float64  `toml:"timeout_penalty"`  // default: 2
+	TimeoutCooldown Duration `toml:"timeout_cooldown"` // default: 15s
+
+	SuccessWeight float64 `toml:"success_weight"` // default: 1
+	ScoreCap      float64 `toml:"score_cap"`      // default: 10
+
+	ProbeChance float64 `toml:"probe_chance"` // default: 0.05
+
+	DecayInterval Duration `toml:"decay_interval"` // default: 5m
+	DecayStep     float64  `toml:"decay_step"`     // default: 0.5
+
+	CascadeTTL     Duration `toml:"cascade_ttl"`     // default: 30s
+	DebounceWindow Duration `toml:"debounce_window"` // default: 100ms
+}
+
+// ScoringDefaults captures the proposal's recommended scoreboard tuning.
+// Used when [failure.scoring] is omitted entirely; per-key defaulting kicks
+// in for partial sections so a user can override one field without having
+// to restate the rest.
+var ScoringDefaults = ScoringConfig{
+	RefusedPenalty:  3,
+	RefusedCooldown: Duration(30 * time.Second),
+	TimeoutPenalty:  2,
+	TimeoutCooldown: Duration(15 * time.Second),
+	SuccessWeight:   1,
+	ScoreCap:        10,
+	ProbeChance:     0.05,
+	DecayInterval:   Duration(5 * time.Minute),
+	DecayStep:       0.5,
+	CascadeTTL:      Duration(30 * time.Second),
+	DebounceWindow:  Duration(100 * time.Millisecond),
 }
 
 // RuleConfig declares a per-host routing override.
@@ -201,6 +249,7 @@ func (c *Config) applyDefaults(md toml.MetaData) {
 	if !md.IsDefined("failure", "status") {
 		c.Failure.Status = append([]StatusRule(nil), DefaultStatusRules...)
 	}
+	c.applyScoringDefaults(md)
 	// IsDefined cannot single out individual array-of-tables entries, so
 	// per-upstream priority uses a *int sentinel: nil means the user
 	// omitted priority for this entry; non-nil (including 0) is verbatim
@@ -210,6 +259,47 @@ func (c *Config) applyDefaults(md toml.MetaData) {
 			v := 100
 			c.Upstreams[i].Priority = &v
 		}
+	}
+}
+
+// applyScoringDefaults fills any [failure.scoring] field the user omitted
+// with its ScoringDefaults value. Per-key IsDefined checks let a user
+// override one knob without having to restate the rest of the section.
+func (c *Config) applyScoringDefaults(md toml.MetaData) {
+	s := &c.Failure.Scoring
+	d := ScoringDefaults
+	if !md.IsDefined("failure", "scoring", "refused_penalty") {
+		s.RefusedPenalty = d.RefusedPenalty
+	}
+	if !md.IsDefined("failure", "scoring", "refused_cooldown") {
+		s.RefusedCooldown = d.RefusedCooldown
+	}
+	if !md.IsDefined("failure", "scoring", "timeout_penalty") {
+		s.TimeoutPenalty = d.TimeoutPenalty
+	}
+	if !md.IsDefined("failure", "scoring", "timeout_cooldown") {
+		s.TimeoutCooldown = d.TimeoutCooldown
+	}
+	if !md.IsDefined("failure", "scoring", "success_weight") {
+		s.SuccessWeight = d.SuccessWeight
+	}
+	if !md.IsDefined("failure", "scoring", "score_cap") {
+		s.ScoreCap = d.ScoreCap
+	}
+	if !md.IsDefined("failure", "scoring", "probe_chance") {
+		s.ProbeChance = d.ProbeChance
+	}
+	if !md.IsDefined("failure", "scoring", "decay_interval") {
+		s.DecayInterval = d.DecayInterval
+	}
+	if !md.IsDefined("failure", "scoring", "decay_step") {
+		s.DecayStep = d.DecayStep
+	}
+	if !md.IsDefined("failure", "scoring", "cascade_ttl") {
+		s.CascadeTTL = d.CascadeTTL
+	}
+	if !md.IsDefined("failure", "scoring", "debounce_window") {
+		s.DebounceWindow = d.DebounceWindow
 	}
 }
 
@@ -277,6 +367,10 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	if err := c.Failure.Scoring.validate(); err != nil {
+		errs = append(errs, err)
+	}
+
 	for i, r := range c.Rules {
 		if r.HostGlob == "" {
 			errs = append(errs, fmt.Errorf("rule[%d]: host_glob is required", i))
@@ -291,6 +385,49 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	return errors.Join(errs...)
+}
+
+// validate joins every [failure.scoring] field violation it finds. The
+// scoreboard relies on every field being non-negative (penalties, cooldowns,
+// decay step, debounce window) and on probe_chance falling in [0,1]; values
+// outside those ranges produce nonsense scoring behavior, so the parser
+// rejects them.
+func (s ScoringConfig) validate() error {
+	var errs []error
+	if s.RefusedPenalty < 0 {
+		errs = append(errs, fmt.Errorf("failure.scoring.refused_penalty must be >= 0, got %v", s.RefusedPenalty))
+	}
+	if s.RefusedCooldown < 0 {
+		errs = append(errs, fmt.Errorf("failure.scoring.refused_cooldown must be >= 0"))
+	}
+	if s.TimeoutPenalty < 0 {
+		errs = append(errs, fmt.Errorf("failure.scoring.timeout_penalty must be >= 0, got %v", s.TimeoutPenalty))
+	}
+	if s.TimeoutCooldown < 0 {
+		errs = append(errs, fmt.Errorf("failure.scoring.timeout_cooldown must be >= 0"))
+	}
+	if s.SuccessWeight <= 0 {
+		errs = append(errs, fmt.Errorf("failure.scoring.success_weight must be > 0, got %v", s.SuccessWeight))
+	}
+	if s.ScoreCap <= 0 {
+		errs = append(errs, fmt.Errorf("failure.scoring.score_cap must be > 0, got %v", s.ScoreCap))
+	}
+	if s.ProbeChance < 0 || s.ProbeChance > 1 {
+		errs = append(errs, fmt.Errorf("failure.scoring.probe_chance must be in [0,1], got %v", s.ProbeChance))
+	}
+	if s.DecayInterval <= 0 {
+		errs = append(errs, fmt.Errorf("failure.scoring.decay_interval must be > 0"))
+	}
+	if s.DecayStep < 0 {
+		errs = append(errs, fmt.Errorf("failure.scoring.decay_step must be >= 0, got %v", s.DecayStep))
+	}
+	if s.CascadeTTL < 0 {
+		errs = append(errs, fmt.Errorf("failure.scoring.cascade_ttl must be >= 0"))
+	}
+	if s.DebounceWindow < 0 {
+		errs = append(errs, fmt.Errorf("failure.scoring.debounce_window must be >= 0"))
+	}
 	return errors.Join(errs...)
 }
 
