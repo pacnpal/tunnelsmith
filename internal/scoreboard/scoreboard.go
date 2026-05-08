@@ -152,6 +152,15 @@ type Scoreboard struct {
 	cfg    Config
 	logger *slog.Logger
 
+	// poolEntries is a snapshot of pool.Entries() taken at construction.
+	// Pool entries are immutable after NewPool returns, so caching the
+	// copy avoids a per-Pick allocation on the hot path. Pool stays
+	// referenced for transparency and for the upstream-id list emitted
+	// in startup logs.
+	poolEntries  []upstream.PoolEntry
+	poolRetryCap int
+	poolLen      int
+
 	// mu guards entries and cascade. Pick takes RLock; Record* and the
 	// decay loop take Lock.
 	mu      sync.RWMutex
@@ -241,14 +250,17 @@ func New(pool *upstream.Pool, cfg Config, opts ...Option) (*Scoreboard, error) {
 		return nil, errors.New("scoreboard: pool is nil")
 	}
 	s := &Scoreboard{
-		pool:     pool,
-		cfg:      cfg,
-		logger:   slog.Default(),
-		entries:  make(map[string]map[string]*entry),
-		cascade:  make(map[string]time.Time),
-		debounce: make(map[debounceKey]time.Time),
-		clock:    time.Now,
-		rand:     rand.New(rand.NewSource(time.Now().UnixNano())),
+		pool:         pool,
+		poolEntries:  pool.Entries(),
+		poolRetryCap: pool.RetryCap(),
+		poolLen:      pool.Len(),
+		cfg:          cfg,
+		logger:       slog.Default(),
+		entries:      make(map[string]map[string]*entry),
+		cascade:      make(map[string]time.Time),
+		debounce:     make(map[debounceKey]time.Time),
+		clock:        time.Now,
+		rand:         rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -364,7 +376,7 @@ func (s *Scoreboard) Pick(host string, tried map[string]bool) (upstream.Upstream
 	if s.cascadeActive(host, now) {
 		return nil, &CascadeError{Host: host}
 	}
-	candidates := s.pool.Entries()
+	candidates := s.poolEntries
 	if len(candidates) == 0 {
 		return nil, ErrPoolExhausted
 	}
@@ -571,8 +583,8 @@ func (s *Scoreboard) DialFor(ctx context.Context, network, addr string) (net.Con
 	if s.cascadeActive(host, s.clock()) {
 		return nil, "", &CascadeError{Host: host}
 	}
-	retryCap := s.pool.RetryCap()
-	candidateCount := s.pool.Len()
+	retryCap := s.poolRetryCap
+	candidateCount := s.poolLen
 	limit := retryCap
 	if limit > candidateCount {
 		limit = candidateCount
