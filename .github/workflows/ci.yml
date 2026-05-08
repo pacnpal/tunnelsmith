@@ -56,8 +56,10 @@ jobs:
           cache: false
       - name: make build
         run: make build
-      - name: run binary
-        run: ./bin/tunnelsmith
+      - name: print version
+        run: ./bin/tunnelsmith --version
+      - name: print resolved config from example
+        run: ./bin/tunnelsmith --config examples/tunnelsmith.toml --print-config
 
   docker:
     name: docker
@@ -81,4 +83,4 @@ jobs:
             COMMIT=${{ github.sha }}
             DATE=${{ github.event.head_commit.timestamp }}
       - name: run image and print version
-        run: docker run --rm tunnelsmith:ci
+        run: docker run --rm tunnelsmith:ci --version
