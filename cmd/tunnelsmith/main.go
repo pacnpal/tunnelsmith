@@ -1,16 +1,26 @@
-// Command tunnelsmith is the per-destination egress router. Phase 1
-// covers config loading and structured logging only; the proxy listeners
-// land in Phase 2.
+// Command tunnelsmith is the per-destination egress router. Phase 2 wires
+// up the HTTP and SOCKS5 listeners against a single hardcoded upstream
+// (the first one in config). Phase 3 introduces a priority pool, Phase 4
+// introduces the per-host scoreboard.
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
+	"time"
+
+	"golang.org/x/sync/errgroup"
 
 	"github.com/pacnpal/tunnelsmith/internal/config"
+	"github.com/pacnpal/tunnelsmith/internal/listener"
+	"github.com/pacnpal/tunnelsmith/internal/upstream"
 )
 
 var (
@@ -19,7 +29,10 @@ var (
 	date    = "unknown"
 )
 
-const defaultConfigPath = "/etc/tunnelsmith/config.toml"
+const (
+	defaultConfigPath = "/etc/tunnelsmith/config.toml"
+	shutdownTimeout   = 30 * time.Second
+)
 
 func main() {
 	if err := run(os.Args[1:], os.Stdout, os.Stderr); err != nil {
@@ -80,8 +93,60 @@ func run(args []string, stdout, stderr *os.File) error {
 		return nil
 	}
 
-	logger.Info("phase 1 stops here; proxy listeners are wired up in phase 2")
+	// Phase 2: hardcode the first upstream. Phase 3 introduces the pool.
+	first := cfg.Upstreams[0]
+	dialTimeout := time.Duration(cfg.Failure.TimeoutMS) * time.Millisecond
+	up, err := upstream.New(first, dialTimeout)
+	if err != nil {
+		return fmt.Errorf("build upstream %q: %w", first.ID, err)
+	}
+	logger.Info("upstream selected (phase 2: first only)",
+		"upstream_id", up.ID(),
+		"upstream_kind", string(up.Kind()),
+		"dial_timeout_ms", cfg.Failure.TimeoutMS,
+	)
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	httpSrv := listener.NewHTTP(cfg.Listener.HTTP, up, logger)
+	socksSrv, err := listener.NewSOCKS(cfg.Listener.SOCKS, up, logger)
+	if err != nil {
+		return fmt.Errorf("build socks listener: %w", err)
+	}
+
+	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() error { return httpSrv.Serve(gctx) })
+	g.Go(func() error { return socksSrv.Serve(gctx) })
+
+	// Wait for either ctx cancellation (signal) or a listener error.
+	<-gctx.Done()
+	logger.Info("shutdown initiated", "reason", contextReason(gctx))
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer shutdownCancel()
+
+	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+		logger.Warn("http shutdown error", "err", err)
+	}
+	if err := socksSrv.Shutdown(shutdownCtx); err != nil {
+		logger.Warn("socks shutdown error", "err", err)
+	}
+
+	if err := g.Wait(); err != nil && !errors.Is(err, context.Canceled) {
+		return fmt.Errorf("listener exited: %w", err)
+	}
+	logger.Info("shutdown complete")
 	return nil
+}
+
+// contextReason renders the cause of a cancelled context as a string the
+// log line can hand the operator without leaking internals.
+func contextReason(ctx context.Context) string {
+	if err := ctx.Err(); err != nil {
+		return err.Error()
+	}
+	return "unknown"
 }
 
 // newLogger builds the structured JSON logger. Level is read from the
