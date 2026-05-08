@@ -404,7 +404,9 @@ func TestTimeDecayDriftsScoresTowardZero(t *testing.T) {
 }
 
 // TestPerHostIndependence confirms a penalty against host A does not affect
-// host B's view of the same upstream.
+// host B's view of the same upstream. One RecordFailure is enough to make
+// hostA's u1 score negative; hostB has no entry yet, which is the actual
+// independence claim under test.
 func TestPerHostIndependence(t *testing.T) {
 	t.Parallel()
 	up1 := alwaysOK("u1")
@@ -412,25 +414,19 @@ func TestPerHostIndependence(t *testing.T) {
 	sb := buildScoreboard(t, []*fakeUpstream{up1, up2}, scoreboard.Config{}, nil, 1)
 	defer sb.Stop()
 
-	// Penalize u1 hard for hostA only.
-	sb.RecordFailure("hostA", "u1", failure.KindRefused, 0)
-	sb.RecordFailure("hostA", "u1", failure.KindRefused, 0)
-	// Wait past debounce window and apply a third penalty so the score
-	// drops below zero conclusively. Use the underlying clock... actually
-	// without an injected clock, just rely on real time.
-	time.Sleep(150 * time.Millisecond)
 	sb.RecordFailure("hostA", "u1", failure.KindRefused, 0)
 
 	snapA := snapshotByID(sb, "hostA")
 	if e, ok := snapA["u1"]; !ok {
 		t.Fatal("hostA has no entry for u1")
 	} else if e.Score >= 0 {
-		t.Errorf("hostA u1 score = %v, want < 0 after penalties", e.Score)
+		t.Errorf("hostA u1 score = %v, want < 0 after one refused penalty", e.Score)
 	}
-	// hostB has no entry for u1, so its view is unpenalized.
+	// hostB has no entry for u1, so its view is unpenalized. This is the
+	// independence claim: per-(host, upstream) state, not per-upstream.
 	snapB := snapshotByID(sb, "hostB")
 	if _, ok := snapB["u1"]; ok {
-		t.Error("hostB should have no entry for u1 yet (no failures recorded)")
+		t.Error("hostB should have no entry for u1 (no failures recorded)")
 	}
 }
 
