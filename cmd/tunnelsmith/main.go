@@ -1,6 +1,8 @@
 // Command tunnelsmith is the per-destination egress router. The HTTP and
-// SOCKS5 listeners dial through a static priority pool with a per-request
-// retry cap; Phase 4 adds the per-host scoreboard on top of that pool.
+// SOCKS5 listeners dial through a per-(host, upstream) scoreboard that
+// wraps a static priority pool: the pool keeps the configured upstream
+// list, the scoreboard layers per-host scoring, cooldowns, time decay,
+// cascade-failure handling, and recovery probing on top.
 package main
 
 import (
@@ -19,6 +21,7 @@ import (
 
 	"github.com/pacnpal/tunnelsmith/internal/config"
 	"github.com/pacnpal/tunnelsmith/internal/listener"
+	"github.com/pacnpal/tunnelsmith/internal/scoreboard"
 	"github.com/pacnpal/tunnelsmith/internal/upstream"
 )
 
@@ -111,14 +114,30 @@ func run(args []string, stdout, stderr *os.File) error {
 		"dial_timeout_ms", cfg.Failure.TimeoutMS,
 	)
 
+	sb, err := scoreboard.New(pool, scoreboard.FromConfig(cfg.Failure.Scoring, cfg.Failure.Status),
+		scoreboard.WithLogger(logger),
+	)
+	if err != nil {
+		return fmt.Errorf("build scoreboard: %w", err)
+	}
+	logger.Info("scoreboard built",
+		"probe_chance", cfg.Failure.Scoring.ProbeChance,
+		"decay_interval_ms", cfg.Failure.Scoring.DecayInterval.Duration().Milliseconds(),
+		"cascade_ttl_ms", cfg.Failure.Scoring.CascadeTTL.Duration().Milliseconds(),
+		"debounce_window_ms", cfg.Failure.Scoring.DebounceWindow.Duration().Milliseconds(),
+	)
+
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	httpSrv, err := listener.NewHTTP(cfg.Listener.HTTP, pool, logger)
+	sb.Start(ctx)
+	defer sb.Stop()
+
+	httpSrv, err := listener.NewHTTP(cfg.Listener.HTTP, sb, logger)
 	if err != nil {
 		return fmt.Errorf("build http listener: %w", err)
 	}
-	socksSrv, err := listener.NewSOCKS(cfg.Listener.SOCKS, pool, logger)
+	socksSrv, err := listener.NewSOCKS(cfg.Listener.SOCKS, sb, logger)
 	if err != nil {
 		return fmt.Errorf("build socks listener: %w", err)
 	}

@@ -1,9 +1,8 @@
 // Package listener owns the HTTP and SOCKS5 entry points. Each listener
-// receives a client connection, asks an upstream.Pool to dial through to
-// the destination, and pumps bytes between the two. The pool tries each
-// upstream in priority order and retries on hard failure up to the
-// configured cap; Phase 4 layers per-host scoring on top of the same
-// iteration.
+// receives a client connection, asks the scoreboard to dial through to the
+// destination, and pumps bytes between the two. The scoreboard wraps the
+// priority pool with per-(host, upstream) scoring; before Phase 4 the
+// listeners drove the pool directly.
 package listener
 
 import (
@@ -19,23 +18,22 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pacnpal/tunnelsmith/internal/upstream"
+	"github.com/pacnpal/tunnelsmith/internal/scoreboard"
 )
 
 // HTTPServer accepts HTTP CONNECT and plain-HTTP forward-proxy traffic.
 type HTTPServer struct {
 	addr   string
-	pool   *upstream.Pool
+	sb     *scoreboard.Scoreboard
 	logger *slog.Logger
 
 	server *http.Server
 
 	// transport is shared across all forward-proxy requests so the
 	// per-Transport allocation and bookkeeping happens once at boot, not
-	// on every request. DisableKeepAlives stays true: with the priority
-	// pool deciding upstreams per dial and Phase 4 about to layer scoring
-	// on top, reusing TCP connections would pin requests to whichever
-	// upstream served the cold dial. Phase 4 revisits this trade-off.
+	// on every request. DisableKeepAlives stays true: the scoreboard
+	// decides upstreams per dial, and reusing a TCP connection would pin
+	// the request to whichever upstream served the cold dial.
 	transport *http.Transport
 
 	// ready closes once Serve has finished binding the listener (or
@@ -56,26 +54,26 @@ type HTTPServer struct {
 // line without sharing mutable state across goroutines on the Transport.
 type chosenIDCtxKey struct{}
 
-// NewHTTP builds an HTTP listener that routes everything through pool.
-// The pool must be non-nil; passing nil returns a clear error so callers
+// NewHTTP builds an HTTP listener that routes everything through sb. The
+// scoreboard must be non-nil; passing nil returns a clear error so callers
 // see the contract violation at construction time instead of a nil-deref
 // on the first request. Mirrors NewSOCKS's signature for symmetry.
-func NewHTTP(addr string, pool *upstream.Pool, logger *slog.Logger) (*HTTPServer, error) {
-	if pool == nil {
-		return nil, errors.New("listener.NewHTTP: pool is nil")
+func NewHTTP(addr string, sb *scoreboard.Scoreboard, logger *slog.Logger) (*HTTPServer, error) {
+	if sb == nil {
+		return nil, errors.New("listener.NewHTTP: scoreboard is nil")
 	}
 	if logger == nil {
 		logger = slog.Default()
 	}
 	h := &HTTPServer{
 		addr:    addr,
-		pool:    pool,
+		sb:      sb,
 		logger:  logger.With("listener", "http"),
 		ready:   make(chan struct{}),
 		tunnels: make(map[*tunnel]struct{}),
 	}
 	h.transport = &http.Transport{
-		DialContext:       h.dialThroughPool,
+		DialContext:       h.dialThroughScoreboard,
 		DisableKeepAlives: true,
 	}
 	h.server = &http.Server{
@@ -86,12 +84,12 @@ func NewHTTP(addr string, pool *upstream.Pool, logger *slog.Logger) (*HTTPServer
 	return h, nil
 }
 
-// dialThroughPool is the Transport's DialContext. The pool picks an
-// upstream and returns the conn; if a *string is stashed in ctx under
-// chosenIDCtxKey, the chosen upstream id is written there for the caller's
-// log line.
-func (h *HTTPServer) dialThroughPool(ctx context.Context, network, addr string) (net.Conn, error) {
-	conn, id, err := h.pool.DialFor(ctx, network, addr)
+// dialThroughScoreboard is the Transport's DialContext. The scoreboard
+// picks an upstream and returns the conn; if a *string is stashed in ctx
+// under chosenIDCtxKey, the chosen upstream id is written there for the
+// caller's log line.
+func (h *HTTPServer) dialThroughScoreboard(ctx context.Context, network, addr string) (net.Conn, error) {
+	conn, id, err := h.sb.DialFor(ctx, network, addr)
 	if err == nil {
 		if box, ok := ctx.Value(chosenIDCtxKey{}).(*string); ok {
 			*box = id
@@ -191,7 +189,7 @@ func (h *HTTPServer) handle(w http.ResponseWriter, r *http.Request) {
 func (h *HTTPServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	host := r.Host
-	upConn, upID, err := h.pool.DialFor(r.Context(), "tcp", host)
+	upConn, upID, err := h.sb.DialFor(r.Context(), "tcp", host)
 	if err != nil {
 		h.logger.Warn("connect dial failed", "host", host, "err", err)
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)

@@ -81,6 +81,20 @@ func (p *Pool) IDs() []string {
 	return out
 }
 
+// Entries returns a copy of the pool's priority-sorted entries. The
+// scoreboard reads this to drive per-host selection without mutating the
+// pool's internal slice. The returned slice is independent: mutating it
+// does not affect the pool.
+func (p *Pool) Entries() []PoolEntry {
+	out := make([]PoolEntry, len(p.entries))
+	copy(out, p.entries)
+	return out
+}
+
+// RetryCap returns the per-request dial-attempt cap the pool was built
+// with. The scoreboard uses this when bounding its own dial loop.
+func (p *Pool) RetryCap() int { return p.retryCap }
+
 // DialFor opens a connection to addr through the highest-priority upstream
 // whose Dial returns a usable conn. On every failure DialFor advances to the
 // next upstream and tries again, up to retryCap total attempts. On full

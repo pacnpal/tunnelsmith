@@ -12,6 +12,10 @@ Tunnelsmith sits in front of apps as an HTTP and SOCKS5 proxy. For each request,
 
 This is the gap between HAProxy (no per-host memory), Squid (static rules, no learning), and `scrapy-rotating-proxies` (Scrapy-only, alive/dead per proxy globally).
 
+## How it works
+
+Each request goes through the scoreboard's `DialFor`. The scoreboard picks the best non-cooled upstream for the host, dials, and either records success and returns the conn or records the failure (penalty + cooldown for that pair) and advances. Retries are capped per request; if every retry fails, the host enters cascade cooling and subsequent requests fail fast for a short TTL instead of stampeding the pool. A small probe chance occasionally picks a non-top candidate so previously penalized upstreams get a chance to recover. Time decay drifts old scores toward zero so the scoreboard responds to current conditions rather than yesterday's. See [`docs/architecture.md`](docs/architecture.md) for the full design.
+
 ## Quick start
 
 The binary boots an HTTP CONNECT plus forward proxy on `:8080` and a SOCKS5 listener on `:1080`. The pool tries upstreams in priority order and retries on hard failure up to `failure.max_retries_per_request` (default 5). [`deploy/tunnelsmith.example.toml`](deploy/tunnelsmith.example.toml) ships an unreachable SOCKS5 entry first and `direct` as the fallback, so each curl below exercises the retry path. Image builds run in CI per ADR-001; locally, run the binary directly:

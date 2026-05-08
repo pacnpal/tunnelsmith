@@ -13,15 +13,16 @@ import (
 
 	socks5 "github.com/armon/go-socks5"
 
-	"github.com/pacnpal/tunnelsmith/internal/upstream"
+	"github.com/pacnpal/tunnelsmith/internal/scoreboard"
 )
 
-// SOCKSServer is a SOCKS5 listener that hands every CONNECT to the upstream
-// pool. The pool walks priority order and retries on hard failure up to the
-// configured cap before surfacing an aggregated error to the SOCKS5 library.
+// SOCKSServer is a SOCKS5 listener that hands every CONNECT to the
+// scoreboard. The scoreboard walks the configured upstreams in score order,
+// retries on hard failure up to the configured cap, and surfaces an
+// aggregated error to the SOCKS5 library when nothing succeeds.
 type SOCKSServer struct {
 	addr   string
-	pool   *upstream.Pool
+	sb     *scoreboard.Scoreboard
 	logger *slog.Logger
 
 	server *socks5.Server
@@ -44,19 +45,19 @@ type SOCKSServer struct {
 	conns   map[net.Conn]struct{}
 }
 
-// NewSOCKS builds a SOCKS5 listener that dials through pool.
-// The pool must be non-nil; passing nil returns a clear error rather
-// than letting the socks5 dial callback nil-deref on the first conn.
-func NewSOCKS(addr string, pool *upstream.Pool, logger *slog.Logger) (*SOCKSServer, error) {
-	if pool == nil {
-		return nil, errors.New("listener.NewSOCKS: pool is nil")
+// NewSOCKS builds a SOCKS5 listener that dials through sb. The scoreboard
+// must be non-nil; passing nil returns a clear error rather than letting
+// the socks5 dial callback nil-deref on the first conn.
+func NewSOCKS(addr string, sb *scoreboard.Scoreboard, logger *slog.Logger) (*SOCKSServer, error) {
+	if sb == nil {
+		return nil, errors.New("listener.NewSOCKS: scoreboard is nil")
 	}
 	if logger == nil {
 		logger = slog.Default()
 	}
 	s := &SOCKSServer{
 		addr:   addr,
-		pool:   pool,
+		sb:     sb,
 		logger: logger.With("listener", "socks5"),
 		ready:  make(chan struct{}),
 		conns:  make(map[net.Conn]struct{}),
@@ -68,7 +69,7 @@ func NewSOCKS(addr string, pool *upstream.Pool, logger *slog.Logger) (*SOCKSServ
 		// value, which we log via slog below.
 		Logger: log.New(io.Discard, "", 0),
 		Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			conn, _, err := pool.DialFor(ctx, network, addr)
+			conn, _, err := sb.DialFor(ctx, network, addr)
 			return conn, err
 		},
 	})
