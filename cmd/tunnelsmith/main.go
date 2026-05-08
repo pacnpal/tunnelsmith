@@ -1,7 +1,6 @@
-// Command tunnelsmith is the per-destination egress router. Phase 2 wires
-// up the HTTP and SOCKS5 listeners against a single hardcoded upstream
-// (the first one in config). Phase 3 introduces a priority pool, Phase 4
-// introduces the per-host scoreboard.
+// Command tunnelsmith is the per-destination egress router. The HTTP and
+// SOCKS5 listeners dial through a static priority pool with a per-request
+// retry cap; Phase 4 adds the per-host scoreboard on top of that pool.
 package main
 
 import (
@@ -93,24 +92,30 @@ func run(args []string, stdout, stderr *os.File) error {
 		return nil
 	}
 
-	// Phase 2: hardcode the first upstream. Phase 3 introduces the pool.
-	first := cfg.Upstreams[0]
 	dialTimeout := time.Duration(cfg.Failure.TimeoutMS) * time.Millisecond
-	up, err := upstream.New(first, dialTimeout)
-	if err != nil {
-		return fmt.Errorf("build upstream %q: %w", first.ID, err)
+	entries := make([]upstream.PoolEntry, 0, len(cfg.Upstreams))
+	for _, uc := range cfg.Upstreams {
+		up, err := upstream.New(uc, dialTimeout)
+		if err != nil {
+			return fmt.Errorf("build upstream %q: %w", uc.ID, err)
+		}
+		entries = append(entries, upstream.PoolEntry{Up: up, Priority: uc.Priority})
 	}
-	logger.Info("upstream selected (phase 2: first only)",
-		"upstream_id", up.ID(),
-		"upstream_kind", string(up.Kind()),
+	pool, err := upstream.NewPool(entries, cfg.Failure.MaxRetriesPerRequest, logger)
+	if err != nil {
+		return fmt.Errorf("build upstream pool: %w", err)
+	}
+	logger.Info("upstream pool built",
+		"upstreams", pool.IDs(),
+		"retry_cap", cfg.Failure.MaxRetriesPerRequest,
 		"dial_timeout_ms", cfg.Failure.TimeoutMS,
 	)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	httpSrv := listener.NewHTTP(cfg.Listener.HTTP, up, logger)
-	socksSrv, err := listener.NewSOCKS(cfg.Listener.SOCKS, up, logger)
+	httpSrv := listener.NewHTTP(cfg.Listener.HTTP, pool, logger)
+	socksSrv, err := listener.NewSOCKS(cfg.Listener.SOCKS, pool, logger)
 	if err != nil {
 		return fmt.Errorf("build socks listener: %w", err)
 	}

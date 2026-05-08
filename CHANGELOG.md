@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (Phase 3)
+
+- `internal/upstream` package: `Pool` type with priority-ordered fallback and a per-request retry cap. `NewPool` validates inputs and stably sorts entries by `Priority`; `DialFor(ctx, network, addr)` walks the list, returns the first conn that opens, and on full failure surfaces `errors.Join` of every per-attempt error with each upstream id prefixed.
+- `internal/failure` package: `IsConnectionRefused` and `IsTimeout` classifiers. Walk wrapped errors via `errors.Is` / `errors.As` so they hold up against the `*net.OpError` wrappers `net.Dial` produces and against the `net.Error` interface that timeout errors implement.
+- `cmd/tunnelsmith` now builds the full pool from every `[[upstream]]` block and wires both listeners through it. Each dial attempt emits a structured slog line with `upstream_id`, `host`, `outcome`, `latency_ms`, and `attempt`; the listener's existing `connect closed` and `forward done` lines pick up an `upstream_id` field naming the upstream that served the request.
+- `deploy/tunnelsmith.example.toml` now ships an unreachable SOCKS5 upstream at priority 10 plus `direct` at priority 20 so the CI integration step exercises the retry path end-to-end. `examples/tunnelsmith.toml` has an explanatory note describing the priority pool semantics.
+
 ### Added (Phase 2)
 
 - `internal/upstream` package: `Upstream` interface plus `direct`, `http` (CONNECT), and `socks5` implementations. The factory `New(cfg, timeout)` returns the right impl for each `[[upstream]]` block.

@@ -1,8 +1,9 @@
 // Package listener owns the HTTP and SOCKS5 entry points. Each listener
-// receives a client connection, asks an upstream.Upstream to dial through
-// to the destination, and pumps bytes between the two. Phase 2 hardcodes
-// "use the first upstream"; Phase 3 introduces a priority pool and Phase 4
-// layers the per-host scoreboard on top.
+// receives a client connection, asks an upstream.Pool to dial through to
+// the destination, and pumps bytes between the two. The pool tries each
+// upstream in priority order and retries on hard failure up to the
+// configured cap; Phase 4 layers per-host scoring on top of the same
+// iteration.
 package listener
 
 import (
@@ -22,9 +23,9 @@ import (
 
 // HTTPServer accepts HTTP CONNECT and plain-HTTP forward-proxy traffic.
 type HTTPServer struct {
-	addr     string
-	upstream upstream.Upstream
-	logger   *slog.Logger
+	addr   string
+	pool   *upstream.Pool
+	logger *slog.Logger
 
 	server *http.Server
 
@@ -41,17 +42,17 @@ type HTTPServer struct {
 	tunnels   map[*tunnel]struct{}
 }
 
-// NewHTTP builds an HTTP listener that routes everything through up.
-func NewHTTP(addr string, up upstream.Upstream, logger *slog.Logger) *HTTPServer {
+// NewHTTP builds an HTTP listener that routes everything through pool.
+func NewHTTP(addr string, pool *upstream.Pool, logger *slog.Logger) *HTTPServer {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	h := &HTTPServer{
-		addr:     addr,
-		upstream: up,
-		logger:   logger.With("listener", "http", "upstream_id", up.ID()),
-		ready:    make(chan struct{}),
-		tunnels:  make(map[*tunnel]struct{}),
+		addr:    addr,
+		pool:    pool,
+		logger:  logger.With("listener", "http"),
+		ready:   make(chan struct{}),
+		tunnels: make(map[*tunnel]struct{}),
 	}
 	h.server = &http.Server{
 		Addr:              addr,
@@ -152,7 +153,7 @@ func (h *HTTPServer) handle(w http.ResponseWriter, r *http.Request) {
 func (h *HTTPServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	host := r.Host
-	upConn, err := h.upstream.Dial(r.Context(), "tcp", host)
+	upConn, upID, err := h.pool.DialFor(r.Context(), "tcp", host)
 	if err != nil {
 		h.logger.Warn("connect dial failed", "host", host, "err", err)
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
@@ -189,6 +190,7 @@ func (h *HTTPServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	h.logger.Info("connect closed",
 		"host", host,
+		"upstream_id", upID,
 		"latency_ms", time.Since(start).Milliseconds(),
 	)
 }
@@ -201,11 +203,16 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
 	// Build a one-shot Transport that opens its TCP connection through
-	// our upstream. Reusing connections across requests is fine here
-	// because the listener processes one client connection at a time.
+	// the pool. Reusing connections across requests is fine here because
+	// the listener processes one client connection at a time. The closure
+	// captures the upstream id of whichever upstream served the request
+	// so the post-roundtrip log line can name it.
+	var chosenID string
 	tr := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return h.upstream.Dial(ctx, network, addr)
+			conn, id, err := h.pool.DialFor(ctx, network, addr)
+			chosenID = id
+			return conn, err
 		},
 		DisableKeepAlives: true,
 	}
@@ -239,6 +246,7 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 
 	h.logger.Info("forward done",
 		"url", r.URL.String(),
+		"upstream_id", chosenID,
 		"status", resp.StatusCode,
 		"latency_ms", time.Since(start).Milliseconds(),
 	)

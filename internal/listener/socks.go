@@ -15,13 +15,13 @@ import (
 	"github.com/pacnpal/tunnelsmith/internal/upstream"
 )
 
-// SOCKSServer is a SOCKS5 listener that hands every connection to a single
-// upstream. The Phase 2 contract is "use the first configured upstream";
-// later phases swap that out for the scoreboard-driven Pool.
+// SOCKSServer is a SOCKS5 listener that hands every CONNECT to the upstream
+// pool. The pool walks priority order and retries on hard failure up to the
+// configured cap before surfacing an aggregated error to the SOCKS5 library.
 type SOCKSServer struct {
-	addr     string
-	upstream upstream.Upstream
-	logger   *slog.Logger
+	addr   string
+	pool   *upstream.Pool
+	logger *slog.Logger
 
 	server *socks5.Server
 
@@ -38,16 +38,16 @@ type SOCKSServer struct {
 	done   bool
 }
 
-// NewSOCKS builds a SOCKS5 listener that dials through up.
-func NewSOCKS(addr string, up upstream.Upstream, logger *slog.Logger) (*SOCKSServer, error) {
+// NewSOCKS builds a SOCKS5 listener that dials through pool.
+func NewSOCKS(addr string, pool *upstream.Pool, logger *slog.Logger) (*SOCKSServer, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	s := &SOCKSServer{
-		addr:     addr,
-		upstream: up,
-		logger:   logger.With("listener", "socks5", "upstream_id", up.ID()),
-		ready:    make(chan struct{}),
+		addr:   addr,
+		pool:   pool,
+		logger: logger.With("listener", "socks5"),
+		ready:  make(chan struct{}),
 	}
 	srv, err := socks5.New(&socks5.Config{
 		// armon/go-socks5 logs to stdout by default. Route into a discard
@@ -56,7 +56,8 @@ func NewSOCKS(addr string, up upstream.Upstream, logger *slog.Logger) (*SOCKSSer
 		// value, which we log via slog below.
 		Logger: log.New(io.Discard, "", 0),
 		Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return up.Dial(ctx, network, addr)
+			conn, _, err := pool.DialFor(ctx, network, addr)
+			return conn, err
 		},
 	})
 	if err != nil {
