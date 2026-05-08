@@ -76,18 +76,21 @@ func TestIsTimeout(t *testing.T) {
 		}
 	})
 
-	t.Run("net dial timeout", func(t *testing.T) {
+	t.Run("net.Error with Timeout()=true", func(t *testing.T) {
 		t.Parallel()
-		// 192.0.2.1 is TEST-NET-1; nothing routes there, so the dial
-		// hits the dialer's hard timeout instead of refusing.
-		d := &net.Dialer{Timeout: 50 * time.Millisecond}
-		c, err := d.Dial("tcp", "192.0.2.1:65000")
-		if err == nil {
-			_ = c.Close()
-			t.Skip("dial unexpectedly succeeded; environment is too clever for this test")
-		}
+		// Earlier versions of this test dialed 192.0.2.1 (TEST-NET-1)
+		// expecting a hard timeout, but some networks reply with
+		// "network unreachable" before the dialer's deadline fires,
+		// making the test flaky. A synthetic net.Error exercises the
+		// errors.As branch deterministically.
+		err := &syntheticTimeoutError{}
 		if !failure.IsTimeout(err) {
-			t.Fatalf("IsTimeout(net dial timeout %v) = false, want true", err)
+			t.Fatalf("IsTimeout(synthetic timeout) = false, want true")
+		}
+		// Wrapped via fmt.Errorf %w should still classify.
+		wrapped := fmt.Errorf("dial: %w", err)
+		if !failure.IsTimeout(wrapped) {
+			t.Fatalf("IsTimeout(wrapped synthetic timeout) = false, want true")
 		}
 	})
 
@@ -112,3 +115,11 @@ func TestIsTimeout(t *testing.T) {
 		}
 	})
 }
+
+// syntheticTimeoutError implements net.Error with Timeout() == true so
+// IsTimeout's errors.As branch can be exercised without a network call.
+type syntheticTimeoutError struct{}
+
+func (syntheticTimeoutError) Error() string   { return "synthetic i/o timeout" }
+func (syntheticTimeoutError) Timeout() bool   { return true }
+func (syntheticTimeoutError) Temporary() bool { return true }
