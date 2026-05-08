@@ -18,15 +18,45 @@ import (
 	"golang.org/x/net/proxy"
 
 	"github.com/pacnpal/tunnelsmith/internal/config"
+	"github.com/pacnpal/tunnelsmith/internal/failure"
 	"github.com/pacnpal/tunnelsmith/internal/listener"
+	"github.com/pacnpal/tunnelsmith/internal/scoreboard"
 	"github.com/pacnpal/tunnelsmith/internal/upstream"
 )
 
-// directPool returns a single-upstream pool that dials directly. Most
-// listener tests use it so the test stays focused on listener behavior
-// rather than pool retry mechanics; the retry path has its own tests in
-// internal/upstream and a dedicated listener-level test below.
-func directPool(t *testing.T) *upstream.Pool {
+// scoreboardFor wraps pool in a Scoreboard with conservative defaults so the
+// listener tests get the production dial path (Scoreboard.DialFor) rather
+// than touching Pool.DialFor directly. The scoreboard's probe chance is
+// zero so per-test outcomes do not depend on the random source; cascade
+// TTL is also zero for the same reason.
+func scoreboardFor(t *testing.T, pool *upstream.Pool) *scoreboard.Scoreboard {
+	t.Helper()
+	cfg := scoreboard.Config{
+		KindPolicy: map[failure.Kind]scoreboard.Policy{
+			failure.KindRefused: {Penalty: 3, Cooldown: 30 * time.Second},
+			failure.KindTimeout: {Penalty: 2, Cooldown: 15 * time.Second},
+		},
+		SuccessWeight:  1,
+		ScoreCap:       10,
+		ProbeChance:    0,
+		DecayInterval:  5 * time.Minute,
+		DecayStep:      0.5,
+		CascadeTTL:     0,
+		DebounceWindow: 100 * time.Millisecond,
+	}
+	sb, err := scoreboard.New(pool, cfg, scoreboard.WithLogger(quietLogger()))
+	if err != nil {
+		t.Fatalf("build scoreboard: %v", err)
+	}
+	t.Cleanup(sb.Stop)
+	return sb
+}
+
+// directScoreboard returns a single-upstream scoreboard that dials directly.
+// Most listener tests use it so the test stays focused on listener behavior
+// rather than scoreboard mechanics; the retry path has its own tests in
+// internal/scoreboard and dedicated listener-level tests below.
+func directScoreboard(t *testing.T) *scoreboard.Scoreboard {
 	t.Helper()
 	up, err := upstream.New(config.UpstreamConfig{ID: "direct", Kind: config.KindDirect}, 5*time.Second)
 	if err != nil {
@@ -40,7 +70,7 @@ func directPool(t *testing.T) *upstream.Pool {
 	if err != nil {
 		t.Fatalf("build pool: %v", err)
 	}
-	return pool
+	return scoreboardFor(t, pool)
 }
 
 // quietLogger discards log output so tests do not spam stderr. Tests check
@@ -54,7 +84,7 @@ func quietLogger() *slog.Logger {
 // shutdown completes.
 func startHTTPListener(t *testing.T) (*listener.HTTPServer, *url.URL) {
 	t.Helper()
-	srv, err := listener.NewHTTP("127.0.0.1:0", directPool(t), quietLogger())
+	srv, err := listener.NewHTTP("127.0.0.1:0", directScoreboard(t), quietLogger())
 	if err != nil {
 		t.Fatalf("build http listener: %v", err)
 	}
@@ -93,7 +123,7 @@ func startHTTPListener(t *testing.T) (*listener.HTTPServer, *url.URL) {
 // startSOCKSListener mirrors startHTTPListener for the SOCKS5 path.
 func startSOCKSListener(t *testing.T) *listener.SOCKSServer {
 	t.Helper()
-	srv, err := listener.NewSOCKS("127.0.0.1:0", directPool(t), quietLogger())
+	srv, err := listener.NewSOCKS("127.0.0.1:0", directScoreboard(t), quietLogger())
 	if err != nil {
 		t.Fatalf("build socks listener: %v", err)
 	}
@@ -179,8 +209,8 @@ func TestHTTPForwardProxyFallsBackThroughPool(t *testing.T) {
 	}))
 	t.Cleanup(dest.Close)
 
-	pool := poolWithUnreachableThenDirect(t)
-	srv, err := listener.NewHTTP("127.0.0.1:0", pool, quietLogger())
+	sb := scoreboardFor(t, poolWithUnreachableThenDirect(t))
+	srv, err := listener.NewHTTP("127.0.0.1:0", sb, quietLogger())
 	if err != nil {
 		t.Fatalf("build http listener: %v", err)
 	}
@@ -230,8 +260,8 @@ func TestSOCKS5FallsBackThroughPool(t *testing.T) {
 	}))
 	t.Cleanup(dest.Close)
 
-	pool := poolWithUnreachableThenDirect(t)
-	srv, err := listener.NewSOCKS("127.0.0.1:0", pool, quietLogger())
+	sb := scoreboardFor(t, poolWithUnreachableThenDirect(t))
+	srv, err := listener.NewSOCKS("127.0.0.1:0", sb, quietLogger())
 	if err != nil {
 		t.Fatalf("build socks listener: %v", err)
 	}
@@ -277,29 +307,31 @@ func TestSOCKS5FallsBackThroughPool(t *testing.T) {
 	}
 }
 
-// TestNewHTTPErrorsOnNilPool locks in the constructor's nil-pool guard.
-// Without it, the first request would nil-deref inside dialThroughPool.
-func TestNewHTTPErrorsOnNilPool(t *testing.T) {
+// TestNewHTTPErrorsOnNilScoreboard locks in the constructor's nil-scoreboard
+// guard. Without it, the first request would nil-deref inside
+// dialThroughScoreboard.
+func TestNewHTTPErrorsOnNilScoreboard(t *testing.T) {
 	t.Parallel()
 	srv, err := listener.NewHTTP("127.0.0.1:0", nil, quietLogger())
 	if err == nil {
-		t.Fatal("NewHTTP(nil pool) returned nil error")
+		t.Fatal("NewHTTP(nil scoreboard) returned nil error")
 	}
 	if srv != nil {
-		t.Fatalf("NewHTTP(nil pool) returned non-nil server alongside error: %v", srv)
+		t.Fatalf("NewHTTP(nil scoreboard) returned non-nil server alongside error: %v", srv)
 	}
 }
 
-// TestNewSOCKSErrorsOnNilPool locks in the constructor's nil-pool guard.
-// Without it, the socks5 Dial callback would nil-deref on the first conn.
-func TestNewSOCKSErrorsOnNilPool(t *testing.T) {
+// TestNewSOCKSErrorsOnNilScoreboard locks in the constructor's
+// nil-scoreboard guard. Without it, the socks5 Dial callback would
+// nil-deref on the first conn.
+func TestNewSOCKSErrorsOnNilScoreboard(t *testing.T) {
 	t.Parallel()
 	srv, err := listener.NewSOCKS("127.0.0.1:0", nil, quietLogger())
 	if err == nil {
-		t.Fatal("NewSOCKS(nil pool) returned nil error")
+		t.Fatal("NewSOCKS(nil scoreboard) returned nil error")
 	}
 	if srv != nil {
-		t.Fatalf("NewSOCKS(nil pool) returned non-nil server alongside error: %v", srv)
+		t.Fatalf("NewSOCKS(nil scoreboard) returned non-nil server alongside error: %v", srv)
 	}
 }
 
@@ -479,7 +511,7 @@ func TestHTTPConnectPipelinedBytesReachUpstream(t *testing.T) {
 		}
 	}()
 
-	srv, err := listener.NewHTTP("127.0.0.1:0", directPool(t), quietLogger())
+	srv, err := listener.NewHTTP("127.0.0.1:0", directScoreboard(t), quietLogger())
 	if err != nil {
 		t.Fatalf("build http listener: %v", err)
 	}
@@ -568,7 +600,7 @@ func TestHTTPConnectShutdownDrains(t *testing.T) {
 		}
 	}()
 
-	srv, err := listener.NewHTTP("127.0.0.1:0", directPool(t), quietLogger())
+	srv, err := listener.NewHTTP("127.0.0.1:0", directScoreboard(t), quietLogger())
 	if err != nil {
 		t.Fatalf("build http listener: %v", err)
 	}
