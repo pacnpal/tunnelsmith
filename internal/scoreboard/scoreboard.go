@@ -299,6 +299,16 @@ func (s *Scoreboard) Stop() {
 
 func (s *Scoreboard) decayLoop(ctx context.Context, done chan struct{}) {
 	defer close(done)
+	defer func() {
+		// Clear the lifecycle fields when the goroutine exits. Stop may
+		// have already cleared them (in which case this is a no-op);
+		// when the parent ctx is cancelled externally without Stop, this
+		// makes a future Start callable instead of a permanent no-op.
+		s.decayMu.Lock()
+		s.decayCancel = nil
+		s.decayDone = nil
+		s.decayMu.Unlock()
+	}()
 	t := time.NewTicker(s.cfg.DecayInterval)
 	defer t.Stop()
 	for {
@@ -321,6 +331,7 @@ func (s *Scoreboard) decayTick() {
 		return
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	for _, perUpstream := range s.entries {
 		for _, e := range perUpstream {
 			switch {
@@ -337,7 +348,6 @@ func (s *Scoreboard) decayTick() {
 			}
 		}
 	}
-	s.mu.Unlock()
 }
 
 // Pick returns the best non-cooled non-tried upstream for host. With
