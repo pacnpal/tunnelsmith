@@ -33,13 +33,16 @@ type statusRule struct {
 
 // Detection is the return shape for a positive Detect call. Kind names the
 // failure shape so the scoreboard can apply the right penalty and cooldown.
-// RetryAfter is non-zero only when the matching rule honors Retry-After AND
-// the response carried a parsable Retry-After value AND the value names a
-// non-negative duration. Otherwise it is zero, and the scoreboard falls back
-// to the kind's configured cooldown.
+//
+// CooldownOverride is non-nil only when the matching rule honors
+// Retry-After AND the response carried a parsable Retry-After value. When
+// non-nil, it is the parsed duration the destination asked Tunnelsmith to
+// wait, including the legitimate "Retry-After: 0" case which is honored
+// verbatim ("retry immediately"). nil means the scoreboard should fall
+// back to the kind's configured cooldown.
 type Detection struct {
-	Kind       Kind
-	RetryAfter time.Duration
+	Kind             Kind
+	CooldownOverride *time.Duration
 }
 
 // statusKinds is the fixed map from HTTP status code to failure.Kind. The
@@ -107,7 +110,7 @@ func (d *StatusDetector) Detect(status int, header http.Header) (Detection, bool
 	if rule.honorRetryAfter && header != nil {
 		if v := header.Get("Retry-After"); v != "" {
 			if dur, parsed := ParseRetryAfter(v, d.now()); parsed {
-				out.RetryAfter = dur
+				out.CooldownOverride = &dur
 			}
 		}
 	}

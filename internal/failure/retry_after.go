@@ -14,9 +14,11 @@ import (
 // ANSI C asctime). net/http.ParseTime handles all three date shapes.
 //
 // Returns the duration the destination is asking the caller to wait. ok is
-// false when the value is empty, parses as neither shape, or names a date in
-// the past relative to now (which would otherwise produce a negative
-// duration). The resulting duration is clamped at zero on the lower bound.
+// false when the value is empty, parses as neither shape, names a negative
+// integer of seconds, or names a date in the past relative to now (which
+// would otherwise produce a negative duration). The returned duration is
+// non-negative when ok is true, including the legitimate "Retry-After: 0"
+// case which means "retry immediately".
 func ParseRetryAfter(value string, now time.Time) (time.Duration, bool) {
 	v := strings.TrimSpace(value)
 	if v == "" {

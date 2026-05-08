@@ -1,12 +1,14 @@
 package listener_test
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -518,6 +520,148 @@ func TestForwardCascadeWhenPickReportsCascade(t *testing.T) {
 	}
 	if got, _ := strconv.Atoi(resp.Header.Get("X-Tunnelsmith-Retries")); got != 0 {
 		t.Errorf("X-Tunnelsmith-Retries = %q, want 0 (no attempt fired)", resp.Header.Get("X-Tunnelsmith-Retries"))
+	}
+}
+
+// TestForwardHonorsRetryAfterZero pins down the bug Copilot flagged on
+// PR #13: Retry-After: 0 is a legal RFC 7231 §7.1.3 value meaning "retry
+// immediately". The detector and scoreboard must honor it as an explicit
+// zero cooldown, not fall back to the kind's configured default. The
+// resulting (host, upstream) entry has the penalty applied (score < 0)
+// but no cooldown extension.
+func TestForwardHonorsRetryAfterZero(t *testing.T) {
+	t.Parallel()
+	var hit atomic.Int64
+	dest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hit.Add(1) == 1 {
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		_, _ = io.WriteString(w, "ok")
+	}))
+	t.Cleanup(dest.Close)
+
+	pool := directPoolWith(t, "a", "b")
+	sb := scoreboardFor(t, pool)
+	_, proxyURL := startForwardListener(t, sb, failure.NewStatusDetector(config.DefaultStatusRules), 5)
+	client := proxyClient(t, proxyURL)
+
+	resp, err := client.Get(dest.URL)
+	if err != nil {
+		t.Fatalf("client.Get: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	destURL, _ := url.Parse(dest.URL)
+	host := destURL.Hostname()
+	var penalized scoreboard.EntrySnapshot
+	var found bool
+	for _, e := range sb.Snapshot() {
+		if e.Host == host && e.Score < 0 {
+			penalized = e
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("no penalized entry for host; expected the 429-served upstream to be penalized")
+	}
+	// CooldownUntil zero (or in the past relative to now) means the
+	// upstream is immediately re-eligible. The default 429 cooldown is
+	// 120s; if Retry-After: 0 had been ignored, this entry would carry a
+	// far-future expiry instead.
+	if !penalized.CooldownUntil.IsZero() && penalized.CooldownUntil.After(time.Now()) {
+		t.Errorf("CooldownUntil = %v, want zero / past (Retry-After: 0 should honor 'retry immediately')",
+			penalized.CooldownUntil)
+	}
+}
+
+// TestForwardOversizeBodyRejected confirms the listener bounds the
+// request-body buffer it builds for retry replay. A request whose body
+// exceeds the cap is rejected without ever reaching the destination.
+//
+// The client may surface either a clean 413 response or a broken-pipe
+// write error depending on how the kernel schedules the close: when the
+// proxy responds 413 from the Content-Length pre-check and closes the
+// conn while the client is still streaming the body, Go's transport
+// races the response read against the body write and either side may
+// win. Both outcomes prove what the test cares about: the proxy did not
+// forward the oversize body to the destination.
+func TestForwardOversizeBodyRejected(t *testing.T) {
+	t.Parallel()
+	var destHits atomic.Int64
+	dest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		destHits.Add(1)
+		_, _ = io.WriteString(w, "should-not-reach")
+	}))
+	t.Cleanup(dest.Close)
+
+	pool := directPoolWith(t, "a")
+	sb := scoreboardFor(t, pool)
+	_, proxyURL := startForwardListener(t, sb, failure.NewStatusDetector(config.DefaultStatusRules), 5)
+	client := proxyClient(t, proxyURL)
+
+	const oversize = 9 << 20 // 9 MiB, just above the 8 MiB listener cap
+	body := bytes.Repeat([]byte("A"), oversize)
+	req, err := http.NewRequest(http.MethodPost, dest.URL, bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	resp, err := client.Do(req)
+	if err == nil {
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusRequestEntityTooLarge {
+			t.Errorf("status = %d, want 413", resp.StatusCode)
+		}
+	}
+	if destHits.Load() != 0 {
+		t.Errorf("destination got %d hits; oversize body should not have been forwarded", destHits.Load())
+	}
+}
+
+// TestForwardChunkedRequestBodyWorks confirms the listener forwards a
+// chunked-encoded request without tripping the transport's "request has
+// both Content-Length and Transfer-Encoding" rejection. The request
+// arrives with TransferEncoding=["chunked"]; newOutReq must clear that
+// when it switches to a buffered body with ContentLength.
+func TestForwardChunkedRequestBodyWorks(t *testing.T) {
+	t.Parallel()
+	dest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("dest read body: %v", err)
+		}
+		if string(body) != "chunked-payload" {
+			t.Errorf("dest body = %q, want %q", string(body), "chunked-payload")
+		}
+		_, _ = io.WriteString(w, "ok")
+	}))
+	t.Cleanup(dest.Close)
+
+	pool := directPoolWith(t, "a")
+	sb := scoreboardFor(t, pool)
+	_, proxyURL := startForwardListener(t, sb, failure.NewStatusDetector(config.DefaultStatusRules), 5)
+	client := proxyClient(t, proxyURL)
+
+	// Build a request whose Body is non-seekable so net/http has to send
+	// it chunked: ContentLength is unknown.
+	body := io.NopCloser(strings.NewReader("chunked-payload"))
+	req, err := http.NewRequest(http.MethodPost, dest.URL, body)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.ContentLength = -1 // -1 marks unknown length so the transport chunks
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("client.Do: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
 }
 

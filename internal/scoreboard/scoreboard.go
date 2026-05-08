@@ -492,12 +492,16 @@ func (s *Scoreboard) RecordSuccess(host, upstreamID string, latency time.Duratio
 }
 
 // RecordFailure applies a penalty + cooldown for (host, upstreamID, kind).
-// retryAfter, if > 0, replaces the kind's default cooldown. Identical
-// (host, upstream, kind) triples arriving within DebounceWindow collapse
-// into one penalty event; later calls are dropped silently. globalFailureCount
-// counts penalty events, not raw observations, so it stays consistent with
-// what the score actually changed by.
-func (s *Scoreboard) RecordFailure(host, upstreamID string, kind failure.Kind, retryAfter time.Duration) {
+// cooldownOverride, when non-nil, replaces the kind's default cooldown
+// from KindPolicy. A non-nil zero pointer is honored verbatim, supporting
+// the legitimate "Retry-After: 0" case that means "retry immediately".
+// nil means "use the kind's default cooldown".
+//
+// Identical (host, upstream, kind) triples arriving within DebounceWindow
+// collapse into one penalty event; later calls are dropped silently.
+// globalFailureCount counts penalty events, not raw observations, so it
+// stays consistent with what the score actually changed by.
+func (s *Scoreboard) RecordFailure(host, upstreamID string, kind failure.Kind, cooldownOverride *time.Duration) {
 	if !kind.Valid() {
 		return
 	}
@@ -507,8 +511,8 @@ func (s *Scoreboard) RecordFailure(host, upstreamID string, kind failure.Kind, r
 	}
 	policy := s.cfg.KindPolicy[kind]
 	cooldown := policy.Cooldown
-	if retryAfter > 0 {
-		cooldown = retryAfter
+	if cooldownOverride != nil {
+		cooldown = *cooldownOverride
 	}
 	s.mu.Lock()
 	e := s.getOrCreateLocked(host, upstreamID)
@@ -641,7 +645,7 @@ func (s *Scoreboard) DialFor(ctx context.Context, network, addr string) (net.Con
 		}
 		kind := failure.ClassifyDialError(dialErr)
 		if kind != "" {
-			s.RecordFailure(host, up.ID(), kind, 0)
+			s.RecordFailure(host, up.ID(), kind, nil)
 		}
 		s.logger.Warn("upstream dial",
 			"upstream_id", up.ID(),

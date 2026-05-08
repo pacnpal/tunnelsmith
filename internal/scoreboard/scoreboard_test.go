@@ -421,7 +421,7 @@ func TestPerHostIndependence(t *testing.T) {
 	sb := buildScoreboard(t, []*fakeUpstream{up1, up2}, scoreboard.Config{}, nil, 1)
 	defer sb.Stop()
 
-	sb.RecordFailure("hostA", "u1", failure.KindRefused, 0)
+	sb.RecordFailure("hostA", "u1", failure.KindRefused, nil)
 
 	snapA := snapshotByID(sb, "hostA")
 	if e, ok := snapA["u1"]; !ok {
@@ -451,7 +451,7 @@ func TestCooldownExpiry(t *testing.T) {
 	defer sb.Stop()
 
 	// Record a failure: cooldown of 10s lands.
-	sb.RecordFailure("example.com", "u1", failure.KindRefused, 0)
+	sb.RecordFailure("example.com", "u1", failure.KindRefused, nil)
 	snap := snapshotByID(sb, "example.com")
 	if e, ok := snap["u1"]; !ok {
 		t.Fatal("no entry for u1 after RecordFailure")
@@ -493,7 +493,7 @@ func TestFailureDebounce(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			sb.RecordFailure("example.com", "u1", failure.KindRefused, 0)
+			sb.RecordFailure("example.com", "u1", failure.KindRefused, nil)
 		}()
 	}
 	close(start)

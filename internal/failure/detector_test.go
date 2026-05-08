@@ -38,8 +38,8 @@ func TestDetectKnownStatusCodes(t *testing.T) {
 		if got.Kind != tc.wantKind {
 			t.Errorf("Detect(%d).Kind = %q, want %q", tc.status, got.Kind, tc.wantKind)
 		}
-		if got.RetryAfter != 0 {
-			t.Errorf("Detect(%d) without Retry-After header set RetryAfter = %v, want 0", tc.status, got.RetryAfter)
+		if got.CooldownOverride != nil {
+			t.Errorf("Detect(%d) without Retry-After header set CooldownOverride = %v, want nil", tc.status, *got.CooldownOverride)
 		}
 	}
 }
@@ -69,8 +69,29 @@ func TestDetectHonorsRetryAfterSeconds(t *testing.T) {
 	if got.Kind != failure.KindRateLimit {
 		t.Fatalf("Detect(429).Kind = %q, want %q", got.Kind, failure.KindRateLimit)
 	}
-	if got.RetryAfter != 30*time.Second {
-		t.Fatalf("Detect(429) RetryAfter = %v, want 30s", got.RetryAfter)
+	if got.CooldownOverride == nil || *got.CooldownOverride != 30*time.Second {
+		t.Fatalf("Detect(429) CooldownOverride = %v, want 30s", got.CooldownOverride)
+	}
+}
+
+func TestDetectHonorsRetryAfterZero(t *testing.T) {
+	t.Parallel()
+	// Retry-After: 0 is a legal value per RFC 7231 §7.1.3 meaning "retry
+	// immediately". The detector must surface a non-nil zero override so
+	// the scoreboard can distinguish it from "header absent or unparsable"
+	// and not fall back to the kind's default cooldown.
+	d := failure.NewStatusDetector(defaultRules())
+	header := http.Header{}
+	header.Set("Retry-After", "0")
+	got, ok := d.Detect(429, header)
+	if !ok {
+		t.Fatalf("Detect(429) ok=false, want true")
+	}
+	if got.CooldownOverride == nil {
+		t.Fatal("Detect(429) CooldownOverride = nil, want non-nil zero (Retry-After: 0 is honored)")
+	}
+	if *got.CooldownOverride != 0 {
+		t.Fatalf("Detect(429) CooldownOverride = %v, want 0", *got.CooldownOverride)
 	}
 }
 
@@ -85,8 +106,8 @@ func TestDetectHonorsRetryAfterHTTPDate(t *testing.T) {
 	if !ok {
 		t.Fatalf("Detect(429) ok=false, want true")
 	}
-	if got.RetryAfter != time.Minute {
-		t.Fatalf("Detect(429) RetryAfter = %v, want 60s", got.RetryAfter)
+	if got.CooldownOverride == nil || *got.CooldownOverride != time.Minute {
+		t.Fatalf("Detect(429) CooldownOverride = %v, want 60s", got.CooldownOverride)
 	}
 }
 
@@ -102,8 +123,8 @@ func TestDetectIgnoresRetryAfterWhenRuleDisablesIt(t *testing.T) {
 	if !ok {
 		t.Fatalf("Detect(403) ok=false, want true")
 	}
-	if got.RetryAfter != 0 {
-		t.Errorf("Detect(403) RetryAfter = %v, want 0 (rule does not honor Retry-After)", got.RetryAfter)
+	if got.CooldownOverride != nil {
+		t.Errorf("Detect(403) CooldownOverride = %v, want nil (rule does not honor Retry-After)", *got.CooldownOverride)
 	}
 }
 
@@ -117,8 +138,8 @@ func TestDetectIgnoresUnparsableRetryAfter(t *testing.T) {
 	if !ok {
 		t.Fatalf("Detect(429) ok=false, want true")
 	}
-	if got.RetryAfter != 0 {
-		t.Errorf("Detect(429) RetryAfter = %v, want 0 (header value did not parse)", got.RetryAfter)
+	if got.CooldownOverride != nil {
+		t.Errorf("Detect(429) CooldownOverride = %v, want nil (header value did not parse)", *got.CooldownOverride)
 	}
 }
 

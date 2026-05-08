@@ -294,13 +294,41 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 		host = hostOnly(r.Host)
 	}
 
-	bodyBytes, err := io.ReadAll(r.Body)
+	// Buffer the request body so the retry loop can replay it on each
+	// attempt. Cap the buffer so a client cannot exhaust the proxy's
+	// memory by streaming an unbounded body through a forward request:
+	// 8 MiB is comfortably larger than any homelab traffic Tunnelsmith
+	// is meant to carry while still bounded. Bodies above the cap get a
+	// 413; they cannot be safely retried without spooling to disk, which
+	// is out of scope for v1.
+	//
+	// When the client declared Content-Length, reject early without
+	// reading any body bytes: the alternative is to drain the oversize
+	// body just to send a 413, which defeats the memory bound.
+	if r.ContentLength > maxBufferedRequestBody {
+		h.logger.Warn("forward body too large for retry buffer (declared)",
+			"host", host,
+			"declared_bytes", r.ContentLength,
+			"cap_bytes", maxBufferedRequestBody,
+		)
+		http.Error(w, "Request Entity Too Large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	bodyBytes, oversize, err := readBoundedBody(r.Body, maxBufferedRequestBody)
 	if err != nil {
 		h.logger.Warn("forward read body failed", "host", host, "err", err)
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		return
 	}
 	_ = r.Body.Close()
+	if oversize {
+		h.logger.Warn("forward body too large for retry buffer (streamed)",
+			"host", host,
+			"cap_bytes", maxBufferedRequestBody,
+		)
+		http.Error(w, "Request Entity Too Large", http.StatusRequestEntityTooLarge)
+		return
+	}
 
 	tried := make(map[string]bool, h.retryCap)
 	var (
@@ -349,7 +377,7 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 			}
 			kind := failure.ClassifyDialError(rtErr)
 			if kind != "" {
-				h.sb.RecordFailure(host, up.ID(), kind, 0)
+				h.sb.RecordFailure(host, up.ID(), kind, nil)
 			}
 			tried[up.ID()] = true
 			retries++
@@ -366,16 +394,20 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 
 		det, isFail := h.detector.Detect(resp.StatusCode, resp.Header)
 		if isFail {
-			h.sb.RecordFailure(host, up.ID(), det.Kind, det.RetryAfter)
+			h.sb.RecordFailure(host, up.ID(), det.Kind, det.CooldownOverride)
 			drainAndClose(resp.Body)
 			tried[up.ID()] = true
 			retries++
+			retryAfterMS := int64(-1)
+			if det.CooldownOverride != nil {
+				retryAfterMS = det.CooldownOverride.Milliseconds()
+			}
 			h.logger.Warn("forward status failure",
 				"host", host,
 				"upstream_id", up.ID(),
 				"status", resp.StatusCode,
 				"kind", string(det.Kind),
-				"retry_after_ms", det.RetryAfter.Milliseconds(),
+				"retry_after_ms", retryAfterMS,
 				"latency_ms", latency.Milliseconds(),
 				"attempt", attempt+1,
 			)
@@ -417,9 +449,18 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 // bytes so retries replay the same payload. GetBody is set as well; the
 // stdlib transport calls GetBody on internal retries (e.g. an HTTP/1
 // connection that the server closed mid-request) and on 307/308 redirects.
+//
+// TransferEncoding and Trailer are cleared on the outbound request: when
+// the inbound request was chunked, r.Clone preserves
+// TransferEncoding=["chunked"], which would race ContentLength on the
+// outbound side and surface a "request has both Content-Length and
+// Transfer-Encoding" error from the transport. The buffered body has a
+// known length, so chunked framing is not needed on the way out.
 func (h *HTTPServer) newOutReq(r *http.Request, body []byte) *http.Request {
 	out := r.Clone(r.Context())
 	out.RequestURI = ""
+	out.TransferEncoding = nil
+	out.Trailer = nil
 	if len(body) > 0 {
 		out.Body = io.NopCloser(bytes.NewReader(body))
 		out.ContentLength = int64(len(body))
@@ -457,14 +498,45 @@ func (h *HTTPServer) writeForwardSuccess(w http.ResponseWriter, resp *http.Respo
 	}
 }
 
-// drainAndClose drains and closes a response body that the listener intends
-// to discard. Draining lets the underlying transport reuse the conn for
-// keep-alive instead of closing it; the body cap is bounded so a malicious
-// or buggy upstream cannot make Tunnelsmith block here forever.
+// drainAndClose drains and closes a response body that the listener
+// intends to discard. The drain is bounded at 64 KiB so a malicious or
+// buggy upstream cannot make Tunnelsmith block here forever; that means
+// keep-alive reuse is best-effort: bodies that fit within the cap let
+// the transport return the conn to its pool, larger bodies cause the
+// transport to close the conn rather than reuse it. The trade-off is
+// the right one for v1 (predictable memory and tail latency over
+// occasional conn reuse on large discarded bodies).
 func drainAndClose(body io.ReadCloser) {
 	const maxDrain = 64 << 10 // 64 KiB
 	_, _ = io.Copy(io.Discard, io.LimitReader(body, maxDrain))
 	_ = body.Close()
+}
+
+// maxBufferedRequestBody caps how much of an inbound request body the
+// listener buffers for retry replay. 8 MiB covers homelab traffic
+// (Sonarr, browsers, scrapers) with plenty of margin and bounds the
+// memory a single request can pin. Requests above this size get a 413;
+// adding a streaming or disk-spool fallback for larger bodies is a
+// post-v1 question.
+const maxBufferedRequestBody = 8 << 20 // 8 MiB
+
+// readBoundedBody reads body up to limit+1 bytes. If the result is
+// strictly larger than limit, the body is reported as oversize and the
+// returned slice contains the prefix that was read (the rest of body is
+// not drained: the caller is expected to respond and bail). Errors
+// propagate as-is; an EOF inside Read is not an error.
+func readBoundedBody(body io.Reader, limit int64) ([]byte, bool, error) {
+	if body == nil {
+		return nil, false, nil
+	}
+	buf, err := io.ReadAll(io.LimitReader(body, limit+1))
+	if err != nil {
+		return nil, false, err
+	}
+	if int64(len(buf)) > limit {
+		return buf, true, nil
+	}
+	return buf, false, nil
 }
 
 // hostOnly returns the host portion of a host:port pair. Falls back to the
