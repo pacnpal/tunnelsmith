@@ -57,7 +57,12 @@ type HTTPServer struct {
 type chosenIDCtxKey struct{}
 
 // NewHTTP builds an HTTP listener that routes everything through pool.
+// The pool must be non-nil; passing nil is a programmer error and panics
+// here rather than leaving a nil-deref to fire on the first request.
 func NewHTTP(addr string, pool *upstream.Pool, logger *slog.Logger) *HTTPServer {
+	if pool == nil {
+		panic("listener.NewHTTP: pool is nil")
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}

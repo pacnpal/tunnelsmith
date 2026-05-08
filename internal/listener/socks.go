@@ -44,7 +44,12 @@ type SOCKSServer struct {
 }
 
 // NewSOCKS builds a SOCKS5 listener that dials through pool.
+// The pool must be non-nil; passing nil returns a clear error rather
+// than letting the socks5 dial callback nil-deref on the first conn.
 func NewSOCKS(addr string, pool *upstream.Pool, logger *slog.Logger) (*SOCKSServer, error) {
+	if pool == nil {
+		return nil, errors.New("listener.NewSOCKS: pool is nil")
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}

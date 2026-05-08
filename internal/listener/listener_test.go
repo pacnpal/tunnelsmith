@@ -270,6 +270,31 @@ func TestSOCKS5FallsBackThroughPool(t *testing.T) {
 	}
 }
 
+// TestNewHTTPPanicsOnNilPool locks in the constructor's nil-pool guard.
+// Without it, the first request would nil-deref inside dialThroughPool.
+func TestNewHTTPPanicsOnNilPool(t *testing.T) {
+	t.Parallel()
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("NewHTTP(nil pool) did not panic")
+		}
+	}()
+	_ = listener.NewHTTP("127.0.0.1:0", nil, quietLogger())
+}
+
+// TestNewSOCKSErrorsOnNilPool locks in the constructor's nil-pool guard.
+// Without it, the socks5 Dial callback would nil-deref on the first conn.
+func TestNewSOCKSErrorsOnNilPool(t *testing.T) {
+	t.Parallel()
+	srv, err := listener.NewSOCKS("127.0.0.1:0", nil, quietLogger())
+	if err == nil {
+		t.Fatal("NewSOCKS(nil pool) returned nil error")
+	}
+	if srv != nil {
+		t.Fatalf("NewSOCKS(nil pool) returned non-nil server alongside error: %v", srv)
+	}
+}
+
 // TestSOCKS5ShutdownForcesIdleConns confirms Shutdown does not hang on a
 // client that opened a TCP conn but never sent the SOCKS5 handshake. The
 // listener must force-close active conns when its context expires before
