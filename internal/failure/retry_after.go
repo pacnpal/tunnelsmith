@@ -1,11 +1,18 @@
 package failure
 
 import (
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// maxRetryAfterSeconds caps the seconds form at the largest value
+// time.Duration (an int64 nanoseconds) can represent without wrapping
+// negative. ~292 years; anything beyond is rejected as unparsable so the
+// "non-negative when ok=true" contract holds.
+const maxRetryAfterSeconds = int64(math.MaxInt64) / int64(time.Second)
 
 // ParseRetryAfter parses an RFC 7231 §7.1.3 Retry-After header value relative
 // to the supplied clock reading. The grammar admits two shapes: a
@@ -30,7 +37,11 @@ func ParseRetryAfter(value string, now time.Time) (time.Duration, bool) {
 	// overflow and read as unparsable. Forcing 64 bits keeps the parser
 	// portable across builds.
 	if secs, err := strconv.ParseInt(v, 10, 64); err == nil {
-		if secs < 0 {
+		if secs < 0 || secs > maxRetryAfterSeconds {
+			// Negative is nonsense per RFC 7231 §7.1.3. Above the cap
+			// would overflow time.Duration's int64 nanoseconds and
+			// surface as a silently-negative Duration; the doc contract
+			// promises non-negative when ok=true, so refuse instead.
 			return 0, false
 		}
 		return time.Duration(secs) * time.Second, true

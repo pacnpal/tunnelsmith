@@ -87,6 +87,23 @@ func TestParseRetryAfterRejectsGarbage(t *testing.T) {
 	}
 }
 
+// TestParseRetryAfterRejectsOverflowingSeconds covers the seconds form
+// above the cap that would wrap time.Duration negative. A "non-negative
+// when ok=true" contract requires us to refuse rather than emit a
+// silently-negative duration.
+func TestParseRetryAfterRejectsOverflowingSeconds(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC)
+	// 9_223_372_037 seconds is one above math.MaxInt64 / time.Second's
+	// integer-division floor, so the multiplication wraps when not
+	// capped. Use it explicitly so the test does not rely on the precise
+	// cap value (which is computed in retry_after.go).
+	in := "9223372037"
+	if d, ok := failure.ParseRetryAfter(in, now); ok {
+		t.Errorf("ParseRetryAfter(%q) ok=true, want false (would overflow time.Duration; got %v)", in, d)
+	}
+}
+
 func TestParseRetryAfterPastDateReturnsFalse(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC)
