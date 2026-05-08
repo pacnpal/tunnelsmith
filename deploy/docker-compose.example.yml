@@ -1,0 +1,28 @@
+# Minimal Tunnelsmith stack with a single direct upstream. Useful for
+# local sanity checking and as the starting point CI uses to exercise
+# the listeners.
+#
+# Bring it up (in CI; do not run on a developer host per ADR-001):
+#   docker compose -f deploy/docker-compose.example.yml up -d
+#
+# Then through the HTTP CONNECT proxy:
+#   curl --proxy http://localhost:8080 https://example.com
+#
+# Or through SOCKS5:
+#   curl --socks5-hostname localhost:1080 https://example.com
+#
+# Both should return the upstream content unchanged. The listeners
+# route through "direct", which uses the host's default route.
+
+services:
+  tunnelsmith:
+    image: tunnelsmith:ci
+    container_name: tunnelsmith
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+      - "1080:1080"
+    volumes:
+      - ./tunnelsmith.example.toml:/etc/tunnelsmith/config.toml:ro
+    command:
+      - --config=/etc/tunnelsmith/config.toml

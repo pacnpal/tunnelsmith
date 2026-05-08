@@ -1,0 +1,12 @@
+# Minimal Tunnelsmith config used by deploy/docker-compose.example.yml.
+# One direct upstream; both listeners forward to it. Phase 3 will turn
+# this into a real priority pool with retries.
+
+[listener]
+http  = ":8080"
+socks = ":1080"
+
+[[upstream]]
+id       = "direct"
+kind     = "direct"
+priority = 10

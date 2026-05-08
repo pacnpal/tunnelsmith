@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (Phase 2)
+
+- `internal/upstream` package: `Upstream` interface plus `direct`, `http` (CONNECT), and `socks5` implementations. The factory `New(cfg, timeout)` returns the right impl for each `[[upstream]]` block.
+- `internal/listener` package: HTTP CONNECT plus forward proxy listener and SOCKS5 listener. Both expose `Ready()` for bind-completion signalling and `Shutdown(ctx)` for graceful drain bounded by the caller's context.
+- `cmd/tunnelsmith` now starts both listeners against the first configured upstream (Phase 2 contract; the priority pool lands in Phase 3) and shuts them down cleanly on SIGINT or SIGTERM.
+- `deploy/docker-compose.example.yml` and `deploy/tunnelsmith.example.toml`: minimal stack for CI integration testing of the listeners.
+- README "Quick start" with `curl --proxy` and `curl --socks5-hostname` examples.
+- Dependencies: `github.com/armon/go-socks5 v0.0.0-20160902184237-e75332964ef5` (last commit on `master`, no tagged releases), `golang.org/x/net v0.35.0` (last release with `go 1.18` directive, compatible with this project's `go 1.22`), `golang.org/x/sync v0.10.0` for `errgroup`.
+
 ### Added (Phase 1)
 
 - `internal/config` package: TOML loader with defaults and validation. Rejects bad input with file-prefixed error messages and surfaces unknown keys as warnings rather than failing closed.
