@@ -61,7 +61,7 @@ Three things to notice:
 
 `RecordFailure(host, upstream_id, kind, retry_after)` looks up the kind's policy (penalty + cooldown), subtracts penalty from score (clamped at `-score_cap`), bumps `cooldown_until` to `now + cooldown` (or `now + retry_after` when the caller passed one, used for HTTP 429 with a `Retry-After` header in Phase 5), sets `last_seen`, and increments `global_failure_count`.
 
-Phase 4 fires only `KindRefused` and `KindTimeout` from the dial path. The scoreboard is wired for `KindRateLimit`, `KindForbidden`, `KindLegalBlock`, and `KindBodyMatch` so Phase 5 (status-code rules) and Phase 8 (body regex) can plug in without changing the core.
+Phase 4 fires only `KindRefused` and `KindTimeout` from the dial path. Phase 5 fires `KindRateLimit`, `KindForbidden`, and `KindLegalBlock` from the plain-HTTP listener: when the response status matches a configured `[[failure.status]]` rule, the listener calls `RecordFailure` with the matching kind plus the parsed `Retry-After` value (when the rule honors it) and rotates to the next upstream within the same retry budget. `KindBodyMatch` stays unwired until Phase 8.
 
 ## Failure debounce
 
@@ -98,10 +98,22 @@ A single `sync.RWMutex` guards the entries map and the cascade map. Pick takes t
 
 The debounce map and the random source each have their own dedicated mutex so they do not block the main read path.
 
+## Where status detection lives
+
+Status detection is on the listener side, not the scoreboard side. `internal/failure.StatusDetector` reads `[[failure.status]]` once at boot and holds a `code -> Kind` map for the supported codes (429, 403, 451). The plain-HTTP forward path drives a pick-dial-detect loop:
+
+1. Pick an upstream. On cascade or pool exhaustion, fall through to a 502 with `X-Tunnelsmith-Cascade`.
+2. RoundTrip through the upstream's pinned `http.Transport`.
+3. If the dial / transport returned an error, classify via `failure.ClassifyDialError` and `RecordFailure` (Refused or Timeout). Mark tried, retry.
+4. If a response came back, ask the detector. On a positive match, drain the body, `RecordFailure` with the matched Kind plus any honored `Retry-After`, mark tried, retry.
+5. On a non-match (the common path), `RecordSuccess` and write the response back to the client with `X-Tunnelsmith-Upstream` and `X-Tunnelsmith-Retries`.
+
+`failure.max_retries_per_request` caps total attempts per request, so dial failures and status failures share the budget. Each retried response is drained via `io.LimitReader` so a malicious or misbehaving upstream cannot make Tunnelsmith block forever waiting for body bytes it does not need.
+
+CONNECT and SOCKS5 paths skip steps 4 and 5 entirely - the listener cannot inspect a TLS tunnel or a SOCKS byte stream. They use `Scoreboard.DialFor` directly, which runs the dial-only loop.
+
 ## What is not here yet
 
-- HTTP status code inspection (Phase 5).
-- Honoring `Retry-After` (Phase 5; the API hook is already in `RecordFailure`).
 - Body-regex detection (Phase 8).
 - Per-host rules (`[[rule]]`) for `force` and `prefer` overrides (Phase 8).
 - Scoreboard persistence to disk (Phase 7).
