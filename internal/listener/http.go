@@ -341,6 +341,7 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 	}
 	bodyBytes, oversize, err := readBoundedBody(r.Body, maxBufferedRequestBody)
 	if err != nil {
+		_ = r.Body.Close()
 		h.logger.Warn("forward read body failed", "host", host, "err", err)
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		return
