@@ -54,7 +54,10 @@ func quietLogger() *slog.Logger {
 // shutdown completes.
 func startHTTPListener(t *testing.T) (*listener.HTTPServer, *url.URL) {
 	t.Helper()
-	srv := listener.NewHTTP("127.0.0.1:0", directPool(t), quietLogger())
+	srv, err := listener.NewHTTP("127.0.0.1:0", directPool(t), quietLogger())
+	if err != nil {
+		t.Fatalf("build http listener: %v", err)
+	}
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(context.Background()) }()
@@ -177,7 +180,10 @@ func TestHTTPForwardProxyFallsBackThroughPool(t *testing.T) {
 	t.Cleanup(dest.Close)
 
 	pool := poolWithUnreachableThenDirect(t)
-	srv := listener.NewHTTP("127.0.0.1:0", pool, quietLogger())
+	srv, err := listener.NewHTTP("127.0.0.1:0", pool, quietLogger())
+	if err != nil {
+		t.Fatalf("build http listener: %v", err)
+	}
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(context.Background()) }()
@@ -271,16 +277,17 @@ func TestSOCKS5FallsBackThroughPool(t *testing.T) {
 	}
 }
 
-// TestNewHTTPPanicsOnNilPool locks in the constructor's nil-pool guard.
+// TestNewHTTPErrorsOnNilPool locks in the constructor's nil-pool guard.
 // Without it, the first request would nil-deref inside dialThroughPool.
-func TestNewHTTPPanicsOnNilPool(t *testing.T) {
+func TestNewHTTPErrorsOnNilPool(t *testing.T) {
 	t.Parallel()
-	defer func() {
-		if r := recover(); r == nil {
-			t.Fatal("NewHTTP(nil pool) did not panic")
-		}
-	}()
-	_ = listener.NewHTTP("127.0.0.1:0", nil, quietLogger())
+	srv, err := listener.NewHTTP("127.0.0.1:0", nil, quietLogger())
+	if err == nil {
+		t.Fatal("NewHTTP(nil pool) returned nil error")
+	}
+	if srv != nil {
+		t.Fatalf("NewHTTP(nil pool) returned non-nil server alongside error: %v", srv)
+	}
 }
 
 // TestNewSOCKSErrorsOnNilPool locks in the constructor's nil-pool guard.
@@ -472,7 +479,10 @@ func TestHTTPConnectPipelinedBytesReachUpstream(t *testing.T) {
 		}
 	}()
 
-	srv := listener.NewHTTP("127.0.0.1:0", directPool(t), quietLogger())
+	srv, err := listener.NewHTTP("127.0.0.1:0", directPool(t), quietLogger())
+	if err != nil {
+		t.Fatalf("build http listener: %v", err)
+	}
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(context.Background()) }()
 	select {
@@ -558,7 +568,10 @@ func TestHTTPConnectShutdownDrains(t *testing.T) {
 		}
 	}()
 
-	srv := listener.NewHTTP("127.0.0.1:0", directPool(t), quietLogger())
+	srv, err := listener.NewHTTP("127.0.0.1:0", directPool(t), quietLogger())
+	if err != nil {
+		t.Fatalf("build http listener: %v", err)
+	}
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(context.Background()) }()
 	select {

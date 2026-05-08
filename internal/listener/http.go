@@ -57,11 +57,12 @@ type HTTPServer struct {
 type chosenIDCtxKey struct{}
 
 // NewHTTP builds an HTTP listener that routes everything through pool.
-// The pool must be non-nil; passing nil is a programmer error and panics
-// here rather than leaving a nil-deref to fire on the first request.
-func NewHTTP(addr string, pool *upstream.Pool, logger *slog.Logger) *HTTPServer {
+// The pool must be non-nil; passing nil returns a clear error so callers
+// see the contract violation at construction time instead of a nil-deref
+// on the first request. Mirrors NewSOCKS's signature for symmetry.
+func NewHTTP(addr string, pool *upstream.Pool, logger *slog.Logger) (*HTTPServer, error) {
 	if pool == nil {
-		panic("listener.NewHTTP: pool is nil")
+		return nil, errors.New("listener.NewHTTP: pool is nil")
 	}
 	if logger == nil {
 		logger = slog.Default()
@@ -82,7 +83,7 @@ func NewHTTP(addr string, pool *upstream.Pool, logger *slog.Logger) *HTTPServer 
 		Handler:           http.HandlerFunc(h.handle),
 		ReadHeaderTimeout: 30 * time.Second,
 	}
-	return h
+	return h, nil
 }
 
 // dialThroughPool is the Transport's DialContext. The pool picks an

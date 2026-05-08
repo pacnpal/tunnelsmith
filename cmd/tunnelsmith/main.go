@@ -114,7 +114,10 @@ func run(args []string, stdout, stderr *os.File) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	httpSrv := listener.NewHTTP(cfg.Listener.HTTP, pool, logger)
+	httpSrv, err := listener.NewHTTP(cfg.Listener.HTTP, pool, logger)
+	if err != nil {
+		return fmt.Errorf("build http listener: %w", err)
+	}
 	socksSrv, err := listener.NewSOCKS(cfg.Listener.SOCKS, pool, logger)
 	if err != nil {
 		return fmt.Errorf("build socks listener: %w", err)
