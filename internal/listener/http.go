@@ -500,11 +500,20 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 // outbound side and surface a "request has both Content-Length and
 // Transfer-Encoding" error from the transport. The buffered body has a
 // known length, so chunked framing is not needed on the way out.
+//
+// Host is pinned to URL.Host so the outbound Host header matches the dial
+// target. Clients can legally send a forward-proxy request whose Host
+// header disagrees with the absolute URL (e.g. GET http://a.example/...
+// HTTP/1.1\r\nHost: b.example); without this normalization the transport
+// would dial a.example but advertise b.example, which misroutes virtual
+// hosts at the destination and lets the cascade key (URL.Hostname) drift
+// from what the origin actually serves.
 func (h *HTTPServer) newOutReq(r *http.Request, body []byte) *http.Request {
 	out := r.Clone(r.Context())
 	out.RequestURI = ""
 	out.TransferEncoding = nil
 	out.Trailer = nil
+	out.Host = out.URL.Host
 	if len(body) > 0 {
 		out.Body = io.NopCloser(bytes.NewReader(body))
 		out.ContentLength = int64(len(body))
