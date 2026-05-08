@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (Phase 1)
+
+- `internal/config` package: TOML loader with defaults and validation. Rejects bad input with file-prefixed error messages and surfaces unknown keys as warnings rather than failing closed.
+- `Config`, `ListenerConfig`, `CacheConfig`, `UpstreamConfig`, `FailureConfig`, `StatusRule`, `RuleConfig` types matching the proposal's TOML schema. `Duration` wrapper so `time.Duration` round-trips through TOML.
+- Defaults for listener addresses, cache TTLs, failure timeouts, retry caps, and the recommended 429 / 403 / 451 status rules.
+- `cmd/tunnelsmith` flags: `--config` (path to TOML), `--print-config` (load and reprint resolved TOML), `--version`.
+- Structured JSON logging via `log/slog`; level configurable through `TUNNELSMITH_LOG_LEVEL`.
+- Dependency: `github.com/BurntSushi/toml v1.6.0`.
+- `examples/tunnelsmith.toml` rewritten as a complete commented v1 example.
+- `docs/configuration.md` documents every key, type, default, and validation rule.
+- README "Configuration" section pointing to the example and the docs.
+
 ### Added (Phase 0)
 
 - Initial repository scaffolding: directory layout, Go module, version-printing CLI in `cmd/tunnelsmith`.
