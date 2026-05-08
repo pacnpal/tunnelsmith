@@ -125,6 +125,7 @@ func TestHTTPForwardProxy(t *testing.T) {
 		Timeout:   5 * time.Second,
 		Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)},
 	}
+	t.Cleanup(client.CloseIdleConnections)
 
 	resp, err := client.Get(dest.URL)
 	if err != nil {
@@ -158,6 +159,7 @@ func TestHTTPConnectTunnel(t *testing.T) {
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // test server uses a self-signed cert
 		},
 	}
+	t.Cleanup(client.CloseIdleConnections)
 
 	resp, err := client.Get(dest.URL)
 	if err != nil {
@@ -194,6 +196,7 @@ func TestSOCKS5Tunnel(t *testing.T) {
 			},
 		},
 	}
+	t.Cleanup(client.CloseIdleConnections)
 
 	resp, err := client.Get(dest.URL)
 	if err != nil {
