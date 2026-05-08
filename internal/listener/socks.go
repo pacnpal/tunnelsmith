@@ -36,6 +36,11 @@ type SOCKSServer struct {
 	wg     sync.WaitGroup
 	doneMu sync.Mutex
 	done   bool
+
+	// connsMu guards conns. Active client conns are tracked so Shutdown
+	// can force-close them when its context expires before wg drains.
+	connsMu sync.Mutex
+	conns   map[net.Conn]struct{}
 }
 
 // NewSOCKS builds a SOCKS5 listener that dials through pool.
@@ -48,6 +53,7 @@ func NewSOCKS(addr string, pool *upstream.Pool, logger *slog.Logger) (*SOCKSServ
 		pool:   pool,
 		logger: logger.With("listener", "socks5"),
 		ready:  make(chan struct{}),
+		conns:  make(map[net.Conn]struct{}),
 	}
 	srv, err := socks5.New(&socks5.Config{
 		// armon/go-socks5 logs to stdout by default. Route into a discard
@@ -108,14 +114,38 @@ func (s *SOCKSServer) Serve(ctx context.Context) error {
 			return fmt.Errorf("socks accept: %w", err)
 		}
 		s.wg.Add(1)
+		s.registerConn(conn)
 		go func(c net.Conn) {
 			defer s.wg.Done()
+			defer s.unregisterConn(c)
 			defer func() { _ = c.Close() }()
 			if err := s.server.ServeConn(c); err != nil {
 				s.logger.Debug("socks5 conn ended", "err", err, "remote", c.RemoteAddr().String())
 			}
 		}(conn)
 	}
+}
+
+func (s *SOCKSServer) registerConn(c net.Conn) {
+	s.connsMu.Lock()
+	s.conns[c] = struct{}{}
+	s.connsMu.Unlock()
+}
+
+func (s *SOCKSServer) unregisterConn(c net.Conn) {
+	s.connsMu.Lock()
+	delete(s.conns, c)
+	s.connsMu.Unlock()
+}
+
+func (s *SOCKSServer) snapshotConns() []net.Conn {
+	s.connsMu.Lock()
+	defer s.connsMu.Unlock()
+	out := make([]net.Conn, 0, len(s.conns))
+	for c := range s.conns {
+		out = append(out, c)
+	}
+	return out
 }
 
 // Shutdown closes the listener (so Serve returns) and waits for in-flight
@@ -146,6 +176,14 @@ func (s *SOCKSServer) Shutdown(ctx context.Context) error {
 	case <-done:
 		return closeErr
 	case <-ctx.Done():
+		// Context expired with conns still active. Force-close every
+		// tracked client conn so each handler goroutine unblocks from
+		// ServeConn and decrements wg, which lets Shutdown return
+		// instead of leaving a goroutine leak behind.
+		for _, c := range s.snapshotConns() {
+			_ = c.Close()
+		}
+		<-done
 		if closeErr == nil {
 			return ctx.Err()
 		}

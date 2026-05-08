@@ -270,6 +270,47 @@ func TestSOCKS5FallsBackThroughPool(t *testing.T) {
 	}
 }
 
+// TestSOCKS5ShutdownForcesIdleConns confirms Shutdown does not hang on a
+// client that opened a TCP conn but never sent the SOCKS5 handshake. The
+// listener must force-close active conns when its context expires before
+// the WaitGroup drains.
+func TestSOCKS5ShutdownForcesIdleConns(t *testing.T) {
+	t.Parallel()
+
+	srv := startSOCKSListener(t)
+
+	// Raw TCP conn to the SOCKS port. Do not send any SOCKS bytes: the
+	// library's ServeConn will block on the method-selection read and
+	// the handler goroutine will never finish on its own.
+	idle, err := net.Dial("tcp", srv.Addr().String())
+	if err != nil {
+		t.Fatalf("dial socks: %v", err)
+	}
+	defer func() { _ = idle.Close() }()
+
+	// Brief pause so Serve picks up the conn and registers it before
+	// Shutdown takes a snapshot.
+	time.Sleep(50 * time.Millisecond)
+
+	shutdownStart := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		t.Logf("Shutdown returned %v (acceptable; the property is that it returned)", err)
+	}
+	elapsed := time.Since(shutdownStart)
+	if elapsed > 2*time.Second {
+		t.Fatalf("Shutdown took %s; expected to return well under 2s after force-close", elapsed)
+	}
+
+	// The idle conn should now read EOF or a closed-conn error.
+	_ = idle.SetReadDeadline(time.Now().Add(1 * time.Second))
+	buf := make([]byte, 16)
+	if _, err := idle.Read(buf); err == nil {
+		t.Fatal("expected idle conn read to fail after Shutdown, got nil err")
+	}
+}
+
 func TestHTTPForwardProxy(t *testing.T) {
 	t.Parallel()
 	dest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
