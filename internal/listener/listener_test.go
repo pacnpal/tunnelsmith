@@ -1,6 +1,7 @@
 package listener_test
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -313,9 +314,16 @@ func TestSOCKS5ShutdownForcesIdleConns(t *testing.T) {
 	}
 	defer func() { _ = idle.Close() }()
 
-	// Brief pause so Serve picks up the conn and registers it before
-	// Shutdown takes a snapshot.
-	time.Sleep(50 * time.Millisecond)
+	// Poll the listener until it has registered the conn, so the test
+	// does not race Accept on slow runners. 2s gives plenty of headroom
+	// without making green runs slower in any meaningful way.
+	deadline := time.Now().Add(2 * time.Second)
+	for srv.ActiveConns() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("listener did not register idle conn within 2s")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 
 	shutdownStart := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
@@ -489,43 +497,33 @@ func TestHTTPConnectPipelinedBytesReachUpstream(t *testing.T) {
 	// so net/http's bufio.Reader sees the trailing payload while parsing
 	// the request line and headers.
 	const payload = "PIPELINED-AFTER-CONNECT"
-	req := "CONNECT " + dest.Addr().String() + " HTTP/1.1\r\nHost: " + dest.Addr().String() + "\r\n\r\n" + payload
-	if _, err := clientConn.Write([]byte(req)); err != nil {
+	connectReq := "CONNECT " + dest.Addr().String() + " HTTP/1.1\r\nHost: " + dest.Addr().String() + "\r\n\r\n"
+	if _, err := clientConn.Write([]byte(connectReq + payload)); err != nil {
 		t.Fatalf("write CONNECT + payload: %v", err)
 	}
 
-	// Read CONNECT 200.
-	buf := make([]byte, 1024)
-	_ = clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	n, err := clientConn.Read(buf)
+	// Parse the CONNECT response with http.ReadResponse so partial TCP
+	// reads do not break the assertion. The bufio.Reader keeps any
+	// post-headers bytes it pulled while parsing, so the io.ReadFull
+	// below picks up the echoed payload regardless of how the kernel
+	// split the response and the payload across reads.
+	_ = clientConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	br := bufio.NewReader(clientConn)
+	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
 	if err != nil {
 		t.Fatalf("read CONNECT response: %v", err)
 	}
-	if !strings.HasPrefix(string(buf[:n]), "HTTP/1.1 200") {
-		t.Fatalf("unexpected CONNECT response: %q", string(buf[:n]))
-	}
-	// CONNECT response can include the echoed payload in the same read on
-	// some systems; if it does, slice it off and read the rest below.
-	got := ""
-	if idx := strings.Index(string(buf[:n]), "\r\n\r\n"); idx >= 0 {
-		got = string(buf[:n][idx+4:])
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("CONNECT status = %d, want 200", resp.StatusCode)
 	}
 
-	// Read until we have the full echoed payload back.
-	deadline := time.Now().Add(3 * time.Second)
-	for len(got) < len(payload) && time.Now().Before(deadline) {
-		_ = clientConn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-		n, err := clientConn.Read(buf)
-		if n > 0 {
-			got += string(buf[:n])
-		}
-		if err != nil && !errors.Is(err, io.EOF) {
-			break
-		}
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(br, got); err != nil {
+		t.Fatalf("read echoed payload: %v", err)
 	}
-
-	if got != payload {
-		t.Fatalf("echoed payload = %q, want %q (the listener dropped pipelined bytes from the hijack buffer)", got, payload)
+	if string(got) != payload {
+		t.Fatalf("echoed payload = %q, want %q (the listener dropped pipelined bytes from the hijack buffer)", string(got), payload)
 	}
 }
 

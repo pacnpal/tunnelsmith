@@ -131,6 +131,15 @@ func (s *SOCKSServer) Serve(ctx context.Context) error {
 	}
 }
 
+// ActiveConns reports the number of accepted client conns currently being
+// served. Exposed for operability and to let tests poll for "Serve has
+// observed and registered the new conn" without a fixed sleep.
+func (s *SOCKSServer) ActiveConns() int {
+	s.connsMu.Lock()
+	defer s.connsMu.Unlock()
+	return len(s.conns)
+}
+
 func (s *SOCKSServer) registerConn(c net.Conn) {
 	s.connsMu.Lock()
 	s.conns[c] = struct{}{}

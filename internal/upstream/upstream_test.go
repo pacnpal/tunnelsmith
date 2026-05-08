@@ -322,9 +322,19 @@ func TestHTTPUpstreamRejectsUDPNetwork(t *testing.T) {
 
 func TestHTTPUpstreamDialErrorWraps(t *testing.T) {
 	t.Parallel()
-	// Address that fails to resolve. The dial should error out with the
-	// upstream id wrapped into the message.
-	up, err := upstream.New(config.UpstreamConfig{ID: "h", Kind: config.KindHTTP, Addr: "127.0.0.1:1"}, 200*time.Millisecond)
+	// Bind a free local port and immediately close it. Dialing that
+	// address is a guaranteed connection-refused, where hardcoding a
+	// "probably unused" port like 127.0.0.1:1 is not portable: some
+	// systems run a service there and the dial would proceed past the
+	// proxy connect step.
+	closed, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen closed: %v", err)
+	}
+	closedAddr := closed.Addr().String()
+	_ = closed.Close()
+
+	up, err := upstream.New(config.UpstreamConfig{ID: "h", Kind: config.KindHTTP, Addr: closedAddr}, 200*time.Millisecond)
 	if err != nil {
 		t.Fatalf("New http: %v", err)
 	}
