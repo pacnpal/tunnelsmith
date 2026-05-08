@@ -335,6 +335,7 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 			"declared_bytes", r.ContentLength,
 			"cap_bytes", maxBufferedRequestBody,
 		)
+		_ = r.Body.Close()
 		http.Error(w, "Request Entity Too Large", http.StatusRequestEntityTooLarge)
 		return
 	}
