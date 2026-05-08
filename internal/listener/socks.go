@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"time"
 
 	socks5 "github.com/armon/go-socks5"
 
@@ -192,12 +193,21 @@ func (s *SOCKSServer) Shutdown(ctx context.Context) error {
 	case <-ctx.Done():
 		// Context expired with conns still active. Force-close every
 		// tracked client conn so each handler goroutine unblocks from
-		// ServeConn and decrements wg, which lets Shutdown return
-		// instead of leaving a goroutine leak behind.
+		// ServeConn and decrements wg.
 		for _, c := range s.snapshotConns() {
 			_ = c.Close()
 		}
-		<-done
+		// Give force-closed handlers a brief, bounded chance to drain
+		// so wg can settle for a clean return. If anything is still
+		// stuck after the grace window, return the ctx error rather
+		// than waiting forever; the alternative (an unbounded <-done
+		// here) would let a non-cooperating handler hang Shutdown
+		// even though the caller's context already expired.
+		const forceCloseGrace = time.Second
+		select {
+		case <-done:
+		case <-time.After(forceCloseGrace):
+		}
 		if closeErr == nil {
 			return ctx.Err()
 		}
