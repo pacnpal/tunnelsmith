@@ -557,17 +557,39 @@ func stripTunnelsmithHeaders(h http.Header) {
 }
 
 // drainAndClose drains and closes a response body that the listener
-// intends to discard. The drain is bounded at 64 KiB so a malicious or
-// buggy upstream cannot make Tunnelsmith block here forever; that means
-// keep-alive reuse is best-effort: bodies that fit within the cap let
-// the transport return the conn to its pool, larger bodies cause the
-// transport to close the conn rather than reuse it. The trade-off is
-// the right one for v1 (predictable memory and tail latency over
-// occasional conn reuse on large discarded bodies).
+// intends to discard. The drain is bounded two ways: by bytes (64 KiB
+// via io.LimitReader) and by time (drainTimeout via a goroutine plus
+// timer). A misbehaving upstream that ships a status line plus headers
+// and then stalls on body bytes would otherwise block the retry loop
+// here indefinitely, since LimitReader caps bytes but not wall time.
+// On timeout the body is closed (which interrupts the in-flight read in
+// the helper goroutine) and the goroutine is awaited so it does not
+// leak. Either path means keep-alive reuse is best-effort: bodies that
+// fit within the cap and arrive before the timeout let the transport
+// return the conn to its pool; anything else makes the transport close
+// the conn instead.
 func drainAndClose(body io.ReadCloser) {
-	const maxDrain = 64 << 10 // 64 KiB
-	_, _ = io.Copy(io.Discard, io.LimitReader(body, maxDrain))
-	_ = body.Close()
+	const (
+		maxDrain     = 64 << 10 // 64 KiB
+		drainTimeout = 250 * time.Millisecond
+	)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = io.Copy(io.Discard, io.LimitReader(body, maxDrain))
+	}()
+	timer := time.NewTimer(drainTimeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		_ = body.Close()
+	case <-timer.C:
+		// Close interrupts the in-flight Read inside the goroutine; wait
+		// for the goroutine to observe the close and exit so we never
+		// return with a live drain still running.
+		_ = body.Close()
+		<-done
+	}
 }
 
 // maxBufferedRequestBody caps how much of an inbound request body the
