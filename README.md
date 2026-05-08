@@ -12,11 +12,19 @@ Tunnelsmith sits in front of apps as an HTTP and SOCKS5 proxy. For each request,
 
 This is the gap between HAProxy (no per-host memory), Squid (static rules, no learning), and `scrapy-rotating-proxies` (Scrapy-only, alive/dead per proxy globally).
 
+## Configuration
+
+Tunnelsmith reads a TOML config from `--config` (default `/etc/tunnelsmith/config.toml`). A complete commented example is at [`examples/tunnelsmith.toml`](examples/tunnelsmith.toml). Every key is documented in [`docs/configuration.md`](docs/configuration.md).
+
+`tunnelsmith --config <path> --print-config` loads, applies defaults, and prints the resolved config. Use it to confirm what the binary actually sees.
+
+`TUNNELSMITH_LOG_LEVEL` (`debug` | `info` | `warn` | `error`, default `info`) controls log verbosity. Logs are JSON, one line per event.
+
 ## Documentation
 
-- [`docs/architecture.md`](docs/architecture.md): how the scoreboard works
 - [`docs/configuration.md`](docs/configuration.md): every config key explained
-- [`docs/deployment.md`](docs/deployment.md): running Tunnelsmith with Mullvad and other upstreams
+- [`docs/architecture.md`](docs/architecture.md): how the scoreboard works (Phase 4)
+- [`docs/deployment.md`](docs/deployment.md): running Tunnelsmith with Mullvad and other upstreams (Phase 6)
 - [`docs/decisions.md`](docs/decisions.md): architecture decision records
 
 ## License

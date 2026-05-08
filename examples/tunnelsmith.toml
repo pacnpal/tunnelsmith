@@ -1,2 +1,115 @@
-# Phase 1 will fill this in with a complete, commented example config.
-# Until then this file exists so the Dockerfile has something to copy.
+# Tunnelsmith example configuration.
+#
+# Every field shown here is optional unless noted. Omitted fields fall
+# back to the defaults listed in docs/configuration.md and as // default
+# comments in internal/config/config.go.
+#
+# This file documents the v1 schema. The proxy listeners themselves do
+# not start in Phase 1; the binary loads, validates, and (with
+# --print-config) reprints the config, then exits.
+
+# --------------------------------------------------------------------
+# Listeners. Both default to all-interfaces on standard local ports.
+# --------------------------------------------------------------------
+[listener]
+http  = ":8080"   # HTTP CONNECT and forward proxy
+socks = ":1080"   # SOCKS5
+
+# --------------------------------------------------------------------
+# Decision cache.
+# --------------------------------------------------------------------
+[cache]
+# How long a successful (host, upstream) decision stays cached.
+ttl = "15m"
+
+# How long a host stays in cascade-failure cooldown after every
+# upstream has been tried and failed. Phase 4 wires this up.
+negative_ttl = "1m"
+
+# Optional file path for persisting the scoreboard across restarts.
+# Must be absolute when set. Empty means in-memory only.
+# persist_path = "/data/tunnelsmith/decisions.db"
+
+# --------------------------------------------------------------------
+# Upstreams. At least one is required. Lower priority wins on tie.
+# Every upstream needs a unique id.
+# --------------------------------------------------------------------
+
+# kind = "direct" sends traffic out the host's default route. No addr.
+[[upstream]]
+id       = "direct"
+kind     = "direct"
+priority = 10
+
+# kind = "socks5" needs an addr in host:port form. The Mullvad SOCKS5
+# mesh is reachable from inside any Mullvad WireGuard tunnel.
+[[upstream]]
+id       = "mullvad-se-got"
+kind     = "socks5"
+addr     = "se-got-wg-001.relays.mullvad.net:1080"
+priority = 20
+
+[[upstream]]
+id       = "mullvad-nl-ams"
+kind     = "socks5"
+addr     = "nl-ams-wg-001.relays.mullvad.net:1080"
+priority = 21
+
+# kind = "http" forwards through an HTTP CONNECT proxy. Use this when
+# you have a Gluetun container exposing port 8888.
+[[upstream]]
+id       = "proton-nl"
+kind     = "http"
+addr     = "gluetun-proton-nl:8888"
+priority = 30
+
+# --------------------------------------------------------------------
+# Failure detection. Phase 4 starts using these to penalize upstreams.
+# --------------------------------------------------------------------
+[failure]
+# Treat ECONNREFUSED as a hard failure signal. Always on for now.
+connection_refused = true
+
+# Per-attempt connect/read timeout in milliseconds.
+timeout_ms = 8000
+
+# Body-regex matches indicate a "your region is blocked" page that
+# returns HTTP 200. Phase 8 enables this end to end.
+body_regex = ["content.?not.?available.?in.?your.?region"]
+
+# Cap on per-request retries through the upstream pool. Protects the
+# pool from amplifying a real outage into a stampede.
+max_retries_per_request = 5
+
+# HTTP status codes that count as failures. Each entry says how much
+# score to subtract and how long to cool that upstream down for the
+# host. Defaults are filled in for 429, 403, and 451 if omitted.
+
+[[failure.status]]
+code              = 429   # rate limited - try a different IP now
+penalty           = 4
+cooldown          = "120s"
+honor_retry_after = true  # use Retry-After header if present
+
+[[failure.status]]
+code     = 403   # forbidden - usually a long-lived IP/region block
+penalty  = 6
+cooldown = "30m"
+
+[[failure.status]]
+code     = 451   # legal geo-block - wrong exit country for this host
+penalty  = 8
+cooldown = "6h"
+
+# --------------------------------------------------------------------
+# Per-host rules. Optional. Phase 8 enables them in the router.
+# host_glob uses path.Match semantics: "*" matches a single component.
+# --------------------------------------------------------------------
+[[rule]]
+host_glob = "*.itch.io"
+prefer    = ["direct", "mullvad-se-got"]
+
+[[rule]]
+host_glob = "*.bbc.co.uk"
+prefer    = ["mullvad-nl-ams"]
+force     = true   # do not fall back to other upstreams on failure
