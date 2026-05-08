@@ -569,6 +569,72 @@ func snapshotByID(sb *scoreboard.Scoreboard, host string) map[string]scoreboard.
 	return out
 }
 
+// TestDialForSkipsScoringOnCallerCancellation confirms the dial path does
+// not penalize an upstream when the caller's context cut the dial short.
+// Both Canceled (client hung up) and DeadlineExceeded (caller's request
+// deadline) must skip RecordFailure: the failure reflects the caller
+// bailing, not the upstream being unable to reach the host.
+func TestDialForSkipsScoringOnCallerCancellation(t *testing.T) {
+	t.Parallel()
+
+	t.Run("context.Canceled", func(t *testing.T) {
+		t.Parallel()
+		up := alwaysOK("u1") // dial body never runs because ctx is already done
+		sb := buildScoreboard(t, []*fakeUpstream{up}, scoreboard.Config{}, nil, 1)
+		defer sb.Stop()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		conn, _, err := sb.DialFor(ctx, "tcp", "example.com:443")
+		if conn != nil {
+			_ = conn.Close()
+		}
+		if err == nil {
+			t.Fatal("DialFor with cancelled ctx returned nil err")
+		}
+		// Pre-cancellation case: Pick is never called, so no entry exists.
+		// What matters is no penalty was recorded.
+		snap := snapshotByID(sb, "example.com")
+		if e, ok := snap["u1"]; ok && e.Score < 0 {
+			t.Errorf("u1 score = %v, want >= 0 (no penalty for caller cancellation)", e.Score)
+		}
+	})
+
+	t.Run("context.DeadlineExceeded mid-dial", func(t *testing.T) {
+		t.Parallel()
+		// Dial blocks until ctx fires, then returns ctx.Err(). Mirrors
+		// what the real *net.Dialer does when ctx.Deadline elapses.
+		up := newFakeUpstream("u1", func() (net.Conn, error) {
+			panic("unreachable") // ctx-aware Dial returns before behavior runs
+		})
+		// Patch the fake to honor ctx.
+		up.behavior = func() (net.Conn, error) {
+			// Sleep long enough for the deadline to fire.
+			time.Sleep(50 * time.Millisecond)
+			return nil, context.DeadlineExceeded
+		}
+		sb := buildScoreboard(t, []*fakeUpstream{up}, scoreboard.Config{}, nil, 1)
+		defer sb.Stop()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+		defer cancel()
+		conn, _, err := sb.DialFor(ctx, "tcp", "example.com:443")
+		if conn != nil {
+			_ = conn.Close()
+		}
+		if err == nil {
+			t.Fatal("DialFor with deadline-exceeded ctx returned nil err")
+		}
+		snap := snapshotByID(sb, "example.com")
+		if e, ok := snap["u1"]; ok && e.Score < 0 {
+			t.Errorf("u1 score = %v, want >= 0 (no penalty for caller deadline)", e.Score)
+		}
+		if e, ok := snap["u1"]; ok && e.GlobalFailure > 0 {
+			t.Errorf("u1 globalFailure = %d, want 0", e.GlobalFailure)
+		}
+	})
+}
+
 // TestSnapshotIsStable is a small sanity check that Snapshot returns a
 // stable list (not a map iteration order test, just that the call works
 // after a few records).

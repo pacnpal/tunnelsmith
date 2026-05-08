@@ -603,11 +603,14 @@ func (s *Scoreboard) DialFor(ctx context.Context, network, addr string) (net.Con
 			)
 			return conn, up.ID(), nil
 		}
-		// Skip recording when the caller's context was cancelled mid-dial.
-		// The dial result reflects "client bailed" rather than "this exit
-		// could not reach the host", so penalizing the upstream would be
-		// wrong.
-		if errors.Is(dialErr, context.Canceled) {
+		// Skip recording when the caller's context cut the dial short.
+		// Either Canceled (client hung up) or DeadlineExceeded (the
+		// caller's request deadline elapsed) reflects "bailed", not
+		// "upstream could not reach the host", so penalizing the upstream
+		// would be wrong. Checking ctx.Err() catches both shapes; the
+		// parent context's state is the authoritative signal regardless
+		// of how the dial error wraps it.
+		if ctxErr := ctx.Err(); ctxErr != nil {
 			attemptErrs = append(attemptErrs, fmt.Errorf("%s: %w", up.ID(), dialErr))
 			return nil, "", errors.Join(attemptErrs...)
 		}
