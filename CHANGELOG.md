@@ -11,6 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Bumped `golang.org/x/net` from v0.35.0 to v0.38.0 to absorb the fixes for GHSA-qxp5-gwg8-xv66 (HTTP proxy bypass via IPv6 Zone IDs, directly relevant) and GHSA-vvgc-356p-c3xw (XSS in `html`). Project `go` directive moves from `1.22` to `1.23.0` as a knock-on; CI and Dockerfile follow. See ADR-002 for the rationale.
 
+### Fixed (review remediation, PRs #6 / #7 / #8)
+
+- `internal/config`: defaults no longer overwrite user-provided zero or false values. `connection_refused = false`, `priority = 0`, `failure.timeout_ms = 0`, and `failure.max_retries_per_request = 0` are kept verbatim so the user's intent reaches `Validate`. `UpstreamConfig.Priority` moves to `*int`; use `PriorityValue()` to read the resolved priority.
+- `internal/config`: shared `validatePort` helper drops the duplicated host:port port validation in `validateAddr` and `validateUpstreamAddr`.
+- Documentation cleanups: dropped two dead pointers to the gitignored `tunnelsmith-proposal.md` (package comment, configuration docs); clarified `examples/tunnelsmith.toml`'s `host_glob` comment so it does not imply `*` matches a single dot-separated label.
+- `internal/listener` (HTTP): `handleConnect` now drains the `bufio.Reader` returned by Hijack before tunneling, so bytes a client pipelines after the CONNECT request line (typical: the TLS ClientHello) reach the upstream instead of being lost.
+- `internal/listener` (HTTP): forward-proxy requests share one `http.Transport` instead of building one per request. Per-request "which upstream served you" logging still works via a context-stashed `*string`. The misleading "one connection at a time" comment is gone.
+- `internal/listener` (SOCKS5): `Shutdown` force-closes tracked client conns when its context expires before the WaitGroup drains, fixing a goroutine leak / hang against idle clients.
+- `internal/listener` (HTTP / SOCKS5): both constructors fail fast on `nil` pools instead of letting the first request nil-deref.
+- `internal/upstream`: pool failure logs now include `kind` ("refused" / "timeout" / "other"), use `"err", err` for slog instead of `err.Error()`, and a pre-canceled context returns a clear "context canceled before any upstream was tried" error rather than counting itself as one attempt.
+- `internal/failure`: timeout test no longer dials `192.0.2.1` (TEST-NET-1); a synthetic `net.Error` exercises the classifier deterministically.
+- `internal/upstream`: new test file covers `New()` per-kind selection, input validation, CONNECT handshake success / non-2xx / buffered-bytes paths, network-kind validation, context-bounded dial behavior, and a real SOCKS5 round-trip.
+
 ### Added (Phase 3)
 
 - `internal/upstream` package: `Pool` type with priority-ordered fallback and a per-request retry cap. `NewPool` validates inputs and stably sorts entries by `Priority`; `DialFor(ctx, network, addr)` walks the list, returns the first conn that opens, and on full failure surfaces `errors.Join` of every per-attempt error with each upstream id prefixed.
