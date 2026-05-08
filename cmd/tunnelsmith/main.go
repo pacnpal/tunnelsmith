@@ -20,6 +20,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/pacnpal/tunnelsmith/internal/config"
+	"github.com/pacnpal/tunnelsmith/internal/failure"
 	"github.com/pacnpal/tunnelsmith/internal/listener"
 	"github.com/pacnpal/tunnelsmith/internal/scoreboard"
 	"github.com/pacnpal/tunnelsmith/internal/upstream"
@@ -133,7 +134,8 @@ func run(args []string, stdout, stderr *os.File) error {
 	sb.Start(ctx)
 	defer sb.Stop()
 
-	httpSrv, err := listener.NewHTTP(cfg.Listener.HTTP, sb, logger)
+	detector := failure.NewStatusDetector(cfg.Failure.Status)
+	httpSrv, err := listener.NewHTTP(cfg.Listener.HTTP, sb, detector, cfg.Failure.MaxRetriesPerRequest, logger)
 	if err != nil {
 		return fmt.Errorf("build http listener: %w", err)
 	}

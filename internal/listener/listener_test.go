@@ -33,8 +33,11 @@ func scoreboardFor(t *testing.T, pool *upstream.Pool) *scoreboard.Scoreboard {
 	t.Helper()
 	cfg := scoreboard.Config{
 		KindPolicy: map[failure.Kind]scoreboard.Policy{
-			failure.KindRefused: {Penalty: 3, Cooldown: 30 * time.Second},
-			failure.KindTimeout: {Penalty: 2, Cooldown: 15 * time.Second},
+			failure.KindRefused:    {Penalty: 3, Cooldown: 30 * time.Second},
+			failure.KindTimeout:    {Penalty: 2, Cooldown: 15 * time.Second},
+			failure.KindRateLimit:  {Penalty: 4, Cooldown: 120 * time.Second},
+			failure.KindForbidden:  {Penalty: 6, Cooldown: 30 * time.Minute},
+			failure.KindLegalBlock: {Penalty: 8, Cooldown: 6 * time.Hour},
 		},
 		SuccessWeight:  1,
 		ScoreCap:       10,
@@ -79,12 +82,20 @@ func quietLogger() *slog.Logger {
 	return slog.New(slog.NewJSONHandler(io.Discard, nil))
 }
 
+// defaultDetector returns a StatusDetector seeded with the proposal's
+// recommended 429/403/451 rules. Listener tests that do not exercise
+// status-code behavior still need a non-nil detector so the forward path
+// runs the detection step (which is a no-op for 2xx responses).
+func defaultDetector() *failure.StatusDetector {
+	return failure.NewStatusDetector(config.DefaultStatusRules)
+}
+
 // startHTTPListener binds the HTTP listener to a free port and returns it
 // plus a cleanup hook. Serve runs in a goroutine; cleanup blocks until
 // shutdown completes.
 func startHTTPListener(t *testing.T) (*listener.HTTPServer, *url.URL) {
 	t.Helper()
-	srv, err := listener.NewHTTP("127.0.0.1:0", directScoreboard(t), quietLogger())
+	srv, err := listener.NewHTTP("127.0.0.1:0", directScoreboard(t), defaultDetector(), 5, quietLogger())
 	if err != nil {
 		t.Fatalf("build http listener: %v", err)
 	}
@@ -210,7 +221,7 @@ func TestHTTPForwardProxyFallsBackThroughPool(t *testing.T) {
 	t.Cleanup(dest.Close)
 
 	sb := scoreboardFor(t, poolWithUnreachableThenDirect(t))
-	srv, err := listener.NewHTTP("127.0.0.1:0", sb, quietLogger())
+	srv, err := listener.NewHTTP("127.0.0.1:0", sb, defaultDetector(), 5, quietLogger())
 	if err != nil {
 		t.Fatalf("build http listener: %v", err)
 	}
@@ -308,16 +319,30 @@ func TestSOCKS5FallsBackThroughPool(t *testing.T) {
 }
 
 // TestNewHTTPErrorsOnNilScoreboard locks in the constructor's nil-scoreboard
-// guard. Without it, the first request would nil-deref inside
-// dialThroughScoreboard.
+// guard. Without it, the forward retry loop would nil-deref on the first
+// request.
 func TestNewHTTPErrorsOnNilScoreboard(t *testing.T) {
 	t.Parallel()
-	srv, err := listener.NewHTTP("127.0.0.1:0", nil, quietLogger())
+	srv, err := listener.NewHTTP("127.0.0.1:0", nil, defaultDetector(), 5, quietLogger())
 	if err == nil {
 		t.Fatal("NewHTTP(nil scoreboard) returned nil error")
 	}
 	if srv != nil {
 		t.Fatalf("NewHTTP(nil scoreboard) returned non-nil server alongside error: %v", srv)
+	}
+}
+
+// TestNewHTTPErrorsOnZeroRetryCap locks in the constructor's retryCap guard.
+// A retryCap of zero would mean the forward loop never runs, surfacing as a
+// 502 on every plain-HTTP request without an obvious cause.
+func TestNewHTTPErrorsOnZeroRetryCap(t *testing.T) {
+	t.Parallel()
+	srv, err := listener.NewHTTP("127.0.0.1:0", directScoreboard(t), defaultDetector(), 0, quietLogger())
+	if err == nil {
+		t.Fatal("NewHTTP(retryCap=0) returned nil error")
+	}
+	if srv != nil {
+		t.Fatalf("NewHTTP(retryCap=0) returned non-nil server alongside error: %v", srv)
 	}
 }
 
@@ -511,7 +536,7 @@ func TestHTTPConnectPipelinedBytesReachUpstream(t *testing.T) {
 		}
 	}()
 
-	srv, err := listener.NewHTTP("127.0.0.1:0", directScoreboard(t), quietLogger())
+	srv, err := listener.NewHTTP("127.0.0.1:0", directScoreboard(t), defaultDetector(), 5, quietLogger())
 	if err != nil {
 		t.Fatalf("build http listener: %v", err)
 	}
@@ -600,7 +625,7 @@ func TestHTTPConnectShutdownDrains(t *testing.T) {
 		}
 	}()
 
-	srv, err := listener.NewHTTP("127.0.0.1:0", directScoreboard(t), quietLogger())
+	srv, err := listener.NewHTTP("127.0.0.1:0", directScoreboard(t), defaultDetector(), 5, quietLogger())
 	if err != nil {
 		t.Fatalf("build http listener: %v", err)
 	}
