@@ -24,7 +24,12 @@ func ParseRetryAfter(value string, now time.Time) (time.Duration, bool) {
 	if v == "" {
 		return 0, false
 	}
-	if secs, err := strconv.Atoi(v); err == nil {
+	// ParseInt with explicit bitSize=64 instead of strconv.Atoi: the latter
+	// parses into platform-dependent int, which is 32-bit on 32-bit
+	// platforms. A valid Retry-After value larger than int32 would there
+	// overflow and read as unparsable. Forcing 64 bits keeps the parser
+	// portable across builds.
+	if secs, err := strconv.ParseInt(v, 10, 64); err == nil {
 		if secs < 0 {
 			return 0, false
 		}

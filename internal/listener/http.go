@@ -288,6 +288,15 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "absolute URL required for forward proxy", http.StatusBadRequest)
 		return
 	}
+	// Restrict to http/https. Unsupported schemes (ftp://, gopher://, etc.)
+	// would make every RoundTrip fail deterministically, burning the retry
+	// budget and incorrectly tripping cascade for the host. Reject up front
+	// so the scoreboard does not blame any upstream for a request the
+	// listener cannot serve.
+	if scheme := strings.ToLower(r.URL.Scheme); scheme != "http" && scheme != "https" {
+		http.Error(w, "unsupported scheme: forward proxy supports http and https only", http.StatusBadRequest)
+		return
+	}
 	start := time.Now()
 	host := r.URL.Hostname()
 	if host == "" {

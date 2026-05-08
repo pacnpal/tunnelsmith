@@ -1,9 +1,11 @@
 package listener_test
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -663,6 +665,45 @@ func TestForwardChunkedRequestBodyWorks(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+}
+
+// TestForwardRejectsUnsupportedScheme covers Copilot's review on PR #13:
+// a forward request with a non-http(s) scheme would otherwise let
+// http.Transport.RoundTrip fail deterministically through every upstream,
+// burn the retry budget, and trip cascade for a host the listener never
+// could have served. The listener must reject up front.
+func TestForwardRejectsUnsupportedScheme(t *testing.T) {
+	t.Parallel()
+	pool := directPoolWith(t, "a")
+	sb := scoreboardFor(t, pool)
+	_, proxyURL := startForwardListener(t, sb, failure.NewStatusDetector(config.DefaultStatusRules), 5)
+
+	// Build the raw request manually so we can ship a non-http URL the
+	// stdlib client would otherwise refuse to send.
+	conn, err := net.Dial("tcp", proxyURL.Host)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	const req = "GET ftp://example.com/foo HTTP/1.1\r\nHost: example.com\r\n\r\n"
+	if _, err := conn.Write([]byte(req)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodGet})
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	// Cascade must NOT trip: the listener rejected before any dial fired.
+	if got := sb.CascadeUntil("example.com"); !got.IsZero() {
+		t.Errorf("CascadeUntil(example.com) = %v, want zero (no upstream was tried)", got)
 	}
 }
 

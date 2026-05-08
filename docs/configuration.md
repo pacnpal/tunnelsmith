@@ -133,7 +133,12 @@ Every id in `prefer` must match an `id` from a defined `[[upstream]]`.
 
 Status-code detection only runs on plain-HTTP forward-proxy requests. CONNECT tunnels are end-to-end TLS by design, so Tunnelsmith sees ciphertext after the 200 Connection Established line and cannot read status codes inside the tunnel. SOCKS5 is a byte stream from the protocol's first frame; nothing on that path is HTTP-shaped from Tunnelsmith's perspective.
 
-The same caveat applies to header injection. Plain-HTTP responses get `X-Tunnelsmith-Upstream` (which upstream served the request) and `X-Tunnelsmith-Retries` (count of failed attempts before success). Cascade-failure 502s carry `X-Tunnelsmith-Cascade` with the host. CONNECT and SOCKS5 paths cannot inject anything because Tunnelsmith does not own the response framing on those paths.
+The same caveat applies to header injection, with the precise rule:
+
+- Plain-HTTP responses that an upstream served (any status the detector did not flag as a failure: 2xx, 3xx, 4xx-other, 5xx) carry `X-Tunnelsmith-Upstream` (which upstream served the request) and `X-Tunnelsmith-Retries` (count of failed attempts before success).
+- Cascade-failure 502s (the listener exhausted every upstream for the request) carry `X-Tunnelsmith-Cascade` with the host plus `X-Tunnelsmith-Retries`. They do not carry `X-Tunnelsmith-Upstream`: no upstream served, so there is nothing to attribute.
+- Listener-generated errors that do not even reach the dial loop (e.g. the 400 for a non-absolute or non-http(s) URL) carry no Tunnelsmith headers at all.
+- CONNECT and SOCKS5 paths inject nothing, because Tunnelsmith does not own the response framing on those paths.
 
 Practical consequence: a client that issues an HTTPS request through Tunnelsmith via CONNECT goes through the dial-loop part of the scoreboard (refused, timeout) but not the status part. If you want a host's HTTP and HTTPS traffic to share rate-limit cycling, send the HTTP traffic as a forward-proxy request (no CONNECT) and the HTTPS traffic via CONNECT to a destination that returns 429 over TLS - the HTTP side will rotate exits, the HTTPS side will not, until Phase 8 ships the body-regex hook for response-side inspection.
 
