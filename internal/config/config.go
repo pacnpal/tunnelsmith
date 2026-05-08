@@ -122,7 +122,7 @@ type StatusRule struct {
 // "value == zero", so a user-provided 0 reaches Validate (and rightly fails)
 // instead of being silently replaced by the default.
 type FailureConfig struct {
-	ConnectionRefused    bool         `toml:"connection_refused"`      // default: true (always on for Phase 1; opt-out lands in Phase 5)
+	ConnectionRefused    bool         `toml:"connection_refused"`      // default: true; user can opt out by setting connection_refused = false
 	TimeoutMS            int          `toml:"timeout_ms"`              // default: 8000
 	BodyRegex            []string     `toml:"body_regex"`              // default: []
 	MaxRetriesPerRequest int          `toml:"max_retries_per_request"` // default: 5

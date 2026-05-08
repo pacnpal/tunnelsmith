@@ -100,7 +100,8 @@ func (p *Pool) DialFor(ctx context.Context, network, addr string) (net.Conn, str
 
 	var (
 		attemptErrs []error
-		attempts    int // count of dials that actually fired
+		attempts    int  // count of dials that actually fired
+		canceledMid bool // ctx canceled between attempts after at least one dial
 	)
 	for i := 0; i < limit; i++ {
 		if err := ctx.Err(); err != nil {
@@ -115,6 +116,7 @@ func (p *Pool) DialFor(ctx context.Context, network, addr string) (net.Conn, str
 			// aggregated trail and stop iterating. The marker does not
 			// count as an attempt: attempts tracks dials that fired.
 			attemptErrs = append(attemptErrs, fmt.Errorf("context canceled after %d attempt(s): %w", attempts, err))
+			canceledMid = true
 			break
 		}
 		entry := p.entries[i]
@@ -144,6 +146,15 @@ func (p *Pool) DialFor(ctx context.Context, network, addr string) (net.Conn, str
 		attemptErrs = append(attemptErrs, fmt.Errorf("%s: %w", entry.Up.ID(), err))
 	}
 
+	if canceledMid {
+		// Distinguish "we ran out of upstreams" from "the caller bailed
+		// while we still had options". Operators reading the log line
+		// or wrapped error need to see which one happened.
+		return nil, "", fmt.Errorf(
+			"pool: dial canceled after %d attempt(s) (cap=%d, pool=%d): %w",
+			attempts, p.retryCap, len(p.entries), errors.Join(attemptErrs...),
+		)
+	}
 	return nil, "", fmt.Errorf(
 		"pool: all upstreams failed after %d attempt(s) (cap=%d, pool=%d): %w",
 		attempts, p.retryCap, len(p.entries), errors.Join(attemptErrs...),
