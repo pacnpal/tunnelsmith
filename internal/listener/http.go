@@ -307,14 +307,12 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 	}
 	start := time.Now()
 	host := r.URL.Hostname()
-	if host == "" {
-		host = hostOnly(r.Host)
-	}
 	// IsAbs is true for malformed absolute-form URIs like "http:/path"
-	// where the scheme is set but the host is missing. Without this guard
-	// such requests would key into the scoreboard with an empty host
-	// string and trip cascade for "" once the loop exhausts. Reject up
-	// front so the scoreboard never sees an empty key.
+	// where the scheme is set but the URL host is missing. Even if a Host:
+	// header is present, outbound RoundTrip still fails deterministically
+	// because req.URL.Host is empty. Reject up front so the scoreboard
+	// does not burn retries or trip cascade for a host the listener cannot
+	// actually serve.
 	if host == "" {
 		http.Error(w, "request URL missing host", http.StatusBadRequest)
 		return

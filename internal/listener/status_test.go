@@ -867,10 +867,11 @@ func TestForwardRejectsEmptyHost(t *testing.T) {
 	}
 	defer func() { _ = conn.Close() }()
 
-	// Request line that parses as IsAbs() = true with an empty host. A
-	// stdlib http.Client will not generate one of these, so we have to
-	// hand-roll the bytes.
-	const req = "GET http:/path HTTP/1.1\r\nHost: \r\n\r\n"
+	// Request line that parses as IsAbs() = true with an empty URL host.
+	// Host: is set to prove the listener rejects based on URL host
+	// absence rather than falling back to Host and entering the retry
+	// loop with a request RoundTrip cannot serve.
+	const req = "GET http:/path HTTP/1.1\r\nHost: example.com\r\n\r\n"
 	if _, err := conn.Write([]byte(req)); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -887,6 +888,11 @@ func TestForwardRejectsEmptyHost(t *testing.T) {
 	// Empty-string cascade key must NOT have been tripped.
 	if got := sb.CascadeUntil(""); !got.IsZero() {
 		t.Errorf("CascadeUntil(\"\") = %v, want zero (no upstream was tried)", got)
+	}
+	// Host-header key must also stay clean: malformed URL host must be
+	// rejected before any attempt can trip cascade for example.com.
+	if got := sb.CascadeUntil("example.com"); !got.IsZero() {
+		t.Errorf("CascadeUntil(example.com) = %v, want zero (no upstream was tried)", got)
 	}
 }
 

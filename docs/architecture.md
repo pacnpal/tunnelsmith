@@ -108,7 +108,7 @@ Status detection is on the listener side, not the scoreboard side. `internal/fai
 4. If a response came back, ask the detector. On a positive match, drain the body, `RecordFailure` with the matched Kind plus any honored `Retry-After`, mark tried, retry.
 5. On a non-match (the common path), `RecordSuccess` and write the response back to the client with `X-Tunnelsmith-Upstream` and `X-Tunnelsmith-Retries`.
 
-`failure.max_retries_per_request` caps total attempts per request, so dial failures and status failures share the budget. Each retried response is drained via `io.LimitReader` so a malicious or misbehaving upstream cannot make Tunnelsmith block forever waiting for body bytes it does not need.
+`failure.max_retries_per_request` caps total attempts per request, so dial failures and status failures share the budget. Each retried response drain is bounded two ways: `io.LimitReader` caps bytes (64 KiB), and `drainAndClose` caps wall time (250 ms) before closing the body, so a stalled upstream cannot block retries indefinitely.
 
 CONNECT and SOCKS5 paths skip steps 4 and 5 entirely - the listener cannot inspect a TLS tunnel or a SOCKS byte stream. They use `Scoreboard.DialFor` directly, which runs the dial-only loop.
 
