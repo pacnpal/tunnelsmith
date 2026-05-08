@@ -657,7 +657,7 @@ func (s *Scoreboard) DialFor(ctx context.Context, network, addr string) (net.Con
 	}
 
 	// Out of retries. Trip cascade and surface the aggregated error.
-	s.tripCascade(host)
+	s.TripCascade(host)
 	return nil, "", fmt.Errorf(
 		"scoreboard: all upstreams failed after %d attempt(s) (cap=%d, pool=%d): %w",
 		attempts, retryCap, candidateCount, errors.Join(attemptErrs...),

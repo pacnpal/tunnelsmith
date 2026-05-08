@@ -26,10 +26,15 @@ func (s *Scoreboard) cascadeActive(host string, now time.Time) bool {
 	return ok && until.After(now)
 }
 
-// tripCascade marks host as in cascade for cfg.CascadeTTL starting from the
+// TripCascade marks host as in cascade for cfg.CascadeTTL starting from the
 // current clock. A CascadeTTL of zero or less makes this a no-op so callers
 // can disable the feature entirely without an extra config branch.
-func (s *Scoreboard) tripCascade(host string) {
+//
+// Exported so listeners that drive their own retry loop (the plain-HTTP
+// path now layers status-code retries on top of the dial loop) can mark
+// cascade after exhausting every upstream for one request. DialFor calls
+// it on the dial-only path; both call sites converge on the same state.
+func (s *Scoreboard) TripCascade(host string) {
 	if s.cfg.CascadeTTL <= 0 {
 		return
 	}
