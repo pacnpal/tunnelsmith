@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (Phase 4)
+
+- `internal/scoreboard` package: per-(host, upstream) scoreboard with score, cooldowns, time decay, cascade-failure handling with negative TTL, recovery probing, failure debounce, and an injectable random source. `Scoreboard.DialFor` is the listener-side dial entry point; it walks Pick → Dial → Record in a loop bounded by the pool's retry cap and trips cascade for the host on full failure.
+- `internal/failure`: `Kind` enum (`KindRefused`, `KindTimeout`, `KindRateLimit`, `KindForbidden`, `KindLegalBlock`, `KindBodyMatch`) plus `ClassifyDialError`, which prefers `KindTimeout` over `KindRefused` when an error satisfies both.
+- `internal/config`: new `[failure.scoring]` section with per-kind penalty / cooldown for refused and timeout, `success_weight`, `score_cap`, `probe_chance`, `decay_interval`, `decay_step`, `cascade_ttl`, and `debounce_window`. Defaults match the proposal; per-key IsDefined defaulting lets users override one knob without restating the rest.
+- `internal/upstream`: `Pool.Entries()` and `Pool.RetryCap()` accessors so the scoreboard can read the configured pool without mutating it.
+- `internal/listener`: HTTP and SOCKS5 listener constructors now take a `*scoreboard.Scoreboard` instead of a `*upstream.Pool`. The pool is still the source of truth for what upstreams exist; the scoreboard wraps it. `Pool.DialFor` stays as a lower-level routine for the upstream package's own unit tests.
+- `cmd/tunnelsmith` builds the scoreboard from `cfg.Failure.Scoring` and starts the decay goroutine for the lifetime of the process; the scoreboard log line on startup names the active probe chance, decay interval, cascade TTL, and debounce window.
+- `docs/architecture.md`: scoreboard design (placeholder is gone). Covers Pick, RecordSuccess, RecordFailure, debounce, cascade, decay, locking, and what is deliberately not in Phase 4 yet.
+- `docs/configuration.md`: `[failure.scoring]` table with every key, default, and validation rule.
+- `examples/tunnelsmith.toml`: commented `[failure.scoring]` block showing the defaults.
+- README "How it works" subsection summarizing the dial path and linking to the architecture doc.
+
 ### Security
 
 - Bumped `golang.org/x/net` from v0.35.0 to v0.38.0 to absorb the fixes for GHSA-qxp5-gwg8-xv66 (HTTP proxy bypass via IPv6 Zone IDs, directly relevant) and GHSA-vvgc-356p-c3xw (XSS in `html`). Project `go` directive moves from `1.22` to `1.23.0` as a knock-on; CI and Dockerfile follow. See ADR-002 for the rationale.

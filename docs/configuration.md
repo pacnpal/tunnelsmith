@@ -97,6 +97,26 @@ Rule fields:
 
 5xx, 4xx-other, and 2xx codes are deliberately not in the default list: 5xx is usually a transient destination problem rather than an upstream issue, generic 4xx is request-shaped, and 2xx is success unless a body-regex says otherwise.
 
+### `[failure.scoring]`
+
+Knobs for the per-(host, upstream) scoreboard introduced in Phase 4. Sensible defaults match the proposal; override individual keys without restating the rest of the section.
+
+| key                | type     | default | notes |
+|--------------------|----------|---------|-------|
+| `refused_penalty`  | float    | `3`     | score subtracted on `KindRefused` |
+| `refused_cooldown` | duration | `30s`   | how long the (host, upstream) pair sits out after a refused dial |
+| `timeout_penalty`  | float    | `2`     | score subtracted on `KindTimeout` |
+| `timeout_cooldown` | duration | `15s`   | how long the (host, upstream) pair sits out after a timed-out dial |
+| `success_weight`   | float    | `1`     | score added on each success; must be > 0 |
+| `score_cap`        | float    | `10`    | absolute cap on `\|score\|` so a long-running winner cannot accumulate so much that one bad minute cannot dethrone it; must be > 0 |
+| `probe_chance`     | float    | `0.05`  | per-Pick probability of picking a non-top eligible candidate so a penalized upstream gets a chance to recover; must be in `[0,1]` |
+| `decay_interval`   | duration | `5m`    | how often the decay goroutine ticks; must be > 0 |
+| `decay_step`       | float    | `0.5`   | absolute amount each entry's score moves toward zero per tick |
+| `cascade_ttl`      | duration | `30s`   | negative TTL for a host where every upstream just failed; subsequent requests within the TTL get an immediate cascade error without burning through the pool |
+| `debounce_window`  | duration | `100ms` | identical `(host, upstream, kind)` failures arriving within this window collapse into one penalty event |
+
+The rate-limit, forbidden, and legal-block kinds get their penalty and cooldown from `[[failure.status]]` entries (Phase 5 wires them through the listener). Body-match policy lands in Phase 8.
+
 ## `[[rule]]`
 
 Optional per-host overrides. Phase 8 enables them in the router; Phase 1 just validates them.

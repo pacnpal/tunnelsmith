@@ -110,6 +110,48 @@ penalty  = 8
 cooldown = "6h"
 
 # --------------------------------------------------------------------
+# Scoreboard tuning. These are the per-(host, upstream) scoring knobs
+# the Phase 4 router uses. The defaults below match what Tunnelsmith
+# applies when this section is omitted entirely; the block is shown
+# here so you can see what is configurable. Override individual keys
+# without restating the rest of the section.
+# --------------------------------------------------------------------
+[failure.scoring]
+# Penalty subtracted from score on each kind of failure, and the
+# (host, upstream) cooldown applied for that kind.
+refused_penalty  = 3
+refused_cooldown = "30s"
+timeout_penalty  = 2
+timeout_cooldown = "15s"
+
+# Score climbs by success_weight on each successful dial, capped at
+# score_cap. Negative scores are clamped at -score_cap.
+success_weight = 1
+score_cap      = 10
+
+# Probability of picking a non-top eligible candidate on any given
+# Pick so a previously penalized upstream gets a chance to recover.
+# Set to 0 to disable probing.
+probe_chance = 0.05
+
+# Time decay drifts every entry's score toward zero by decay_step
+# every decay_interval. Default takes a +10 capped winner about 100
+# minutes to drift to zero with no new traffic.
+decay_interval = "5m"
+decay_step     = 0.5
+
+# Cascade cooling: if every upstream fails for a host on the same
+# request, the host is held in negative TTL for cascade_ttl so
+# subsequent requests fail fast instead of burning through the pool
+# again. A single success clears it early.
+cascade_ttl = "30s"
+
+# Failure debounce: identical (host, upstream, kind) failures arriving
+# within debounce_window collapse into one penalty event. Stops
+# concurrent client requests from over-penalizing one rate-limit event.
+debounce_window = "100ms"
+
+# --------------------------------------------------------------------
 # Per-host rules. Optional. Phase 8 enables them in the router.
 # host_glob uses path.Match semantics: "*" matches any sequence of
 # non-"/" characters. Hostnames have no "/", so "*" can span multiple
