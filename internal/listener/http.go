@@ -368,7 +368,7 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 				"attempt", attempt+1,
 				"err", err,
 			)
-			return
+			panic(http.ErrAbortHandler)
 		}
 		up, pickErr := h.sb.Pick(host, tried)
 		if pickErr != nil {
@@ -399,7 +399,7 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 					"attempt", attempt+1,
 					"err", ctxErr,
 				)
-				return
+				panic(http.ErrAbortHandler)
 			}
 			// RoundTrip errors come in two flavors:
 			//   1. dial-level (refused, timeout) - the upstream could not
