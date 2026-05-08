@@ -84,3 +84,41 @@ jobs:
             DATE=${{ github.event.head_commit.timestamp }}
       - name: run image and print version
         run: docker run --rm tunnelsmith:ci --version
+
+      - name: integration - bring up compose stack
+        run: docker compose -f deploy/docker-compose.example.yml up -d
+
+      - name: integration - wait for listeners
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if (echo > /dev/tcp/127.0.0.1/8080) 2>/dev/null \
+              && (echo > /dev/tcp/127.0.0.1/1080) 2>/dev/null; then
+              echo "listeners up after ${i} attempts"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "listeners did not come up in 30s" >&2
+          docker compose -f deploy/docker-compose.example.yml logs tunnelsmith
+          exit 1
+
+      - name: integration - HTTP CONNECT proxy works
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --max-time 30 \
+            --proxy http://127.0.0.1:8080 https://example.com -o /dev/null
+
+      - name: integration - SOCKS5 proxy works
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --max-time 30 \
+            --socks5-hostname 127.0.0.1:1080 https://example.com -o /dev/null
+
+      - name: integration - tunnelsmith logs (always)
+        if: always()
+        run: docker compose -f deploy/docker-compose.example.yml logs tunnelsmith
+
+      - name: integration - tear down
+        if: always()
+        run: docker compose -f deploy/docker-compose.example.yml down --volumes

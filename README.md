@@ -12,6 +12,24 @@ Tunnelsmith sits in front of apps as an HTTP and SOCKS5 proxy. For each request,
 
 This is the gap between HAProxy (no per-host memory), Squid (static rules, no learning), and `scrapy-rotating-proxies` (Scrapy-only, alive/dead per proxy globally).
 
+## Quick start
+
+The Phase 2 binary boots an HTTP CONNECT plus forward proxy on `:8080` and a SOCKS5 listener on `:1080`. With the minimal `direct` upstream in [`deploy/tunnelsmith.example.toml`](deploy/tunnelsmith.example.toml), both listeners route through the host's default route. Image builds run in CI per ADR-001; locally, run the binary directly:
+
+```sh
+make build
+./bin/tunnelsmith --config deploy/tunnelsmith.example.toml
+```
+
+In another shell:
+
+```sh
+curl --proxy http://localhost:8080 https://example.com
+curl --socks5-hostname localhost:1080 https://example.com
+```
+
+CI uses [`deploy/docker-compose.example.yml`](deploy/docker-compose.example.yml) to exercise the same path against the built image.
+
 ## Configuration
 
 Tunnelsmith reads a TOML config from `--config` (default `/etc/tunnelsmith/config.toml`). A complete commented example is at [`examples/tunnelsmith.toml`](examples/tunnelsmith.toml). Every key is documented in [`docs/configuration.md`](docs/configuration.md).
