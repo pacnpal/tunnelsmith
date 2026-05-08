@@ -110,9 +110,98 @@ kind = "direct"
 	if got := len(cfg.Failure.Status); got != len(DefaultStatusRules) {
 		t.Errorf("len(Failure.Status) default = %d, want %d", got, len(DefaultStatusRules))
 	}
-	if cfg.Upstreams[0].Priority != 100 {
-		t.Errorf("Upstreams[0].Priority default = %d, want 100", cfg.Upstreams[0].Priority)
+	if cfg.Upstreams[0].Priority == nil {
+		t.Fatal("Upstreams[0].Priority is nil; applyDefaults should populate it")
 	}
+	if got := *cfg.Upstreams[0].Priority; got != 100 {
+		t.Errorf("Upstreams[0].Priority default = %d, want 100", got)
+	}
+}
+
+// TestExplicitZeroAndFalseSurviveDefaults locks in the bug fix from PR #6
+// review feedback: applyDefaults must not silently overwrite user-provided
+// false / 0 values. The earlier "value == zero" defaulting hid an explicit
+// connection_refused = false, an upstream priority = 0, and explicit zeros
+// for the failure timeout/retry caps that should reach Validate.
+func TestExplicitZeroAndFalseSurviveDefaults(t *testing.T) {
+	t.Parallel()
+
+	t.Run("connection_refused = false is honored", func(t *testing.T) {
+		t.Parallel()
+		const src = `
+[failure]
+connection_refused = false
+
+[[upstream]]
+id   = "d"
+kind = "direct"
+`
+		cfg, err := Parse([]byte(src), "cr.toml")
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		if cfg.Failure.ConnectionRefused {
+			t.Error("ConnectionRefused was overwritten to true; user said false")
+		}
+	})
+
+	t.Run("priority = 0 is honored", func(t *testing.T) {
+		t.Parallel()
+		const src = `
+[[upstream]]
+id       = "d"
+kind     = "direct"
+priority = 0
+`
+		cfg, err := Parse([]byte(src), "p0.toml")
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		if cfg.Upstreams[0].Priority == nil {
+			t.Fatal("Priority is nil; user wrote 0")
+		}
+		if got := *cfg.Upstreams[0].Priority; got != 0 {
+			t.Errorf("Priority = %d, want 0", got)
+		}
+	})
+
+	t.Run("timeout_ms = 0 fails validation instead of being silently defaulted", func(t *testing.T) {
+		t.Parallel()
+		const src = `
+[failure]
+timeout_ms = 0
+
+[[upstream]]
+id   = "d"
+kind = "direct"
+`
+		_, err := Parse([]byte(src), "t0.toml")
+		if err == nil {
+			t.Fatal("expected validation error for timeout_ms = 0, got nil")
+		}
+		if !strings.Contains(err.Error(), "timeout_ms must be > 0") {
+			t.Errorf("error = %q, want one mentioning timeout_ms must be > 0", err.Error())
+		}
+	})
+
+	t.Run("max_retries_per_request = 0 fails validation", func(t *testing.T) {
+		t.Parallel()
+		const src = `
+[failure]
+max_retries_per_request = 0
+
+[[upstream]]
+id   = "d"
+kind = "direct"
+`
+		_, err := Parse([]byte(src), "r0.toml")
+		if err == nil {
+			t.Fatal("expected validation error for max_retries_per_request = 0, got nil")
+		}
+		if !strings.Contains(err.Error(), "max_retries_per_request must be >= 1") {
+			t.Errorf("error = %q, want one mentioning max_retries_per_request", err.Error())
+		}
+	})
 }
 
 func TestValidationFailures(t *testing.T) {

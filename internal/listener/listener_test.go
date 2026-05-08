@@ -1,6 +1,7 @@
 package listener_test
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -53,7 +54,10 @@ func quietLogger() *slog.Logger {
 // shutdown completes.
 func startHTTPListener(t *testing.T) (*listener.HTTPServer, *url.URL) {
 	t.Helper()
-	srv := listener.NewHTTP("127.0.0.1:0", directPool(t), quietLogger())
+	srv, err := listener.NewHTTP("127.0.0.1:0", directPool(t), quietLogger())
+	if err != nil {
+		t.Fatalf("build http listener: %v", err)
+	}
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(context.Background()) }()
@@ -176,7 +180,10 @@ func TestHTTPForwardProxyFallsBackThroughPool(t *testing.T) {
 	t.Cleanup(dest.Close)
 
 	pool := poolWithUnreachableThenDirect(t)
-	srv := listener.NewHTTP("127.0.0.1:0", pool, quietLogger())
+	srv, err := listener.NewHTTP("127.0.0.1:0", pool, quietLogger())
+	if err != nil {
+		t.Fatalf("build http listener: %v", err)
+	}
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(context.Background()) }()
@@ -267,6 +274,80 @@ func TestSOCKS5FallsBackThroughPool(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if string(body) != "socks-via-fallback" {
 		t.Fatalf("body = %q, want %q", string(body), "socks-via-fallback")
+	}
+}
+
+// TestNewHTTPErrorsOnNilPool locks in the constructor's nil-pool guard.
+// Without it, the first request would nil-deref inside dialThroughPool.
+func TestNewHTTPErrorsOnNilPool(t *testing.T) {
+	t.Parallel()
+	srv, err := listener.NewHTTP("127.0.0.1:0", nil, quietLogger())
+	if err == nil {
+		t.Fatal("NewHTTP(nil pool) returned nil error")
+	}
+	if srv != nil {
+		t.Fatalf("NewHTTP(nil pool) returned non-nil server alongside error: %v", srv)
+	}
+}
+
+// TestNewSOCKSErrorsOnNilPool locks in the constructor's nil-pool guard.
+// Without it, the socks5 Dial callback would nil-deref on the first conn.
+func TestNewSOCKSErrorsOnNilPool(t *testing.T) {
+	t.Parallel()
+	srv, err := listener.NewSOCKS("127.0.0.1:0", nil, quietLogger())
+	if err == nil {
+		t.Fatal("NewSOCKS(nil pool) returned nil error")
+	}
+	if srv != nil {
+		t.Fatalf("NewSOCKS(nil pool) returned non-nil server alongside error: %v", srv)
+	}
+}
+
+// TestSOCKS5ShutdownForcesIdleConns confirms Shutdown does not hang on a
+// client that opened a TCP conn but never sent the SOCKS5 handshake. The
+// listener must force-close active conns when its context expires before
+// the WaitGroup drains.
+func TestSOCKS5ShutdownForcesIdleConns(t *testing.T) {
+	t.Parallel()
+
+	srv := startSOCKSListener(t)
+
+	// Raw TCP conn to the SOCKS port. Do not send any SOCKS bytes: the
+	// library's ServeConn will block on the method-selection read and
+	// the handler goroutine will never finish on its own.
+	idle, err := net.Dial("tcp", srv.Addr().String())
+	if err != nil {
+		t.Fatalf("dial socks: %v", err)
+	}
+	defer func() { _ = idle.Close() }()
+
+	// Poll the listener until it has registered the conn, so the test
+	// does not race Accept on slow runners. 2s gives plenty of headroom
+	// without making green runs slower in any meaningful way.
+	deadline := time.Now().Add(2 * time.Second)
+	for srv.ActiveConns() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("listener did not register idle conn within 2s")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	shutdownStart := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		t.Logf("Shutdown returned %v (acceptable; the property is that it returned)", err)
+	}
+	elapsed := time.Since(shutdownStart)
+	if elapsed > 2*time.Second {
+		t.Fatalf("Shutdown took %s; expected to return well under 2s after force-close", elapsed)
+	}
+
+	// The idle conn should now read EOF or a closed-conn error.
+	_ = idle.SetReadDeadline(time.Now().Add(1 * time.Second))
+	buf := make([]byte, 16)
+	if _, err := idle.Read(buf); err == nil {
+		t.Fatal("expected idle conn read to fail after Shutdown, got nil err")
 	}
 }
 
@@ -370,6 +451,92 @@ func TestSOCKS5Tunnel(t *testing.T) {
 	}
 }
 
+// TestHTTPConnectPipelinedBytesReachUpstream confirms the listener forwards
+// bytes that arrive in the same TCP segment as the CONNECT request. net/http
+// reads ahead while parsing headers and buffers anything after the trailing
+// \r\n\r\n in the hijack's bufio.Reader. If the listener tunneled directly
+// from the raw clientConn, those buffered bytes would be lost and the
+// upstream would see a truncated stream.
+func TestHTTPConnectPipelinedBytesReachUpstream(t *testing.T) {
+	t.Parallel()
+
+	// Echo destination: sends back whatever the client wrote.
+	dest, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen dest: %v", err)
+	}
+	t.Cleanup(func() { _ = dest.Close() })
+	go func() {
+		for {
+			c, err := dest.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer func() { _ = c.Close() }()
+				_, _ = io.Copy(c, c)
+			}(c)
+		}
+	}()
+
+	srv, err := listener.NewHTTP("127.0.0.1:0", directPool(t), quietLogger())
+	if err != nil {
+		t.Fatalf("build http listener: %v", err)
+	}
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve(context.Background()) }()
+	select {
+	case <-srv.Ready():
+	case <-time.After(2 * time.Second):
+		t.Fatal("http listener did not bind in time")
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+		<-serveErr
+	})
+
+	clientConn, err := net.Dial("tcp", srv.Addr().String())
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer func() { _ = clientConn.Close() }()
+
+	// Send the CONNECT request and a pipelined payload in a single Write
+	// so net/http's bufio.Reader sees the trailing payload while parsing
+	// the request line and headers.
+	const payload = "PIPELINED-AFTER-CONNECT"
+	connectReq := "CONNECT " + dest.Addr().String() + " HTTP/1.1\r\nHost: " + dest.Addr().String() + "\r\n\r\n"
+	if _, err := clientConn.Write([]byte(connectReq + payload)); err != nil {
+		t.Fatalf("write CONNECT + payload: %v", err)
+	}
+
+	// Parse the CONNECT response with http.ReadResponse so partial TCP
+	// reads do not break the assertion. The bufio.Reader keeps any
+	// post-headers bytes it pulled while parsing, so the io.ReadFull
+	// below picks up the echoed payload regardless of how the kernel
+	// split the response and the payload across reads.
+	_ = clientConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	br := bufio.NewReader(clientConn)
+	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		t.Fatalf("read CONNECT response: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("CONNECT status = %d, want 200", resp.StatusCode)
+	}
+
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(br, got); err != nil {
+		t.Fatalf("read echoed payload: %v", err)
+	}
+	if string(got) != payload {
+		t.Fatalf("echoed payload = %q, want %q (the listener dropped pipelined bytes from the hijack buffer)", string(got), payload)
+	}
+}
+
 // TestHTTPConnectShutdownDrains opens a CONNECT tunnel that the destination
 // holds open, calls Shutdown with a short timeout, and confirms the
 // listener forces the tunnel closed within the timeout instead of hanging.
@@ -401,7 +568,10 @@ func TestHTTPConnectShutdownDrains(t *testing.T) {
 		}
 	}()
 
-	srv := listener.NewHTTP("127.0.0.1:0", directPool(t), quietLogger())
+	srv, err := listener.NewHTTP("127.0.0.1:0", directPool(t), quietLogger())
+	if err != nil {
+		t.Fatalf("build http listener: %v", err)
+	}
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(context.Background()) }()
 	select {

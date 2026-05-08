@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"time"
 
 	socks5 "github.com/armon/go-socks5"
 
@@ -36,10 +37,20 @@ type SOCKSServer struct {
 	wg     sync.WaitGroup
 	doneMu sync.Mutex
 	done   bool
+
+	// connsMu guards conns. Active client conns are tracked so Shutdown
+	// can force-close them when its context expires before wg drains.
+	connsMu sync.Mutex
+	conns   map[net.Conn]struct{}
 }
 
 // NewSOCKS builds a SOCKS5 listener that dials through pool.
+// The pool must be non-nil; passing nil returns a clear error rather
+// than letting the socks5 dial callback nil-deref on the first conn.
 func NewSOCKS(addr string, pool *upstream.Pool, logger *slog.Logger) (*SOCKSServer, error) {
+	if pool == nil {
+		return nil, errors.New("listener.NewSOCKS: pool is nil")
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -48,6 +59,7 @@ func NewSOCKS(addr string, pool *upstream.Pool, logger *slog.Logger) (*SOCKSServ
 		pool:   pool,
 		logger: logger.With("listener", "socks5"),
 		ready:  make(chan struct{}),
+		conns:  make(map[net.Conn]struct{}),
 	}
 	srv, err := socks5.New(&socks5.Config{
 		// armon/go-socks5 logs to stdout by default. Route into a discard
@@ -108,14 +120,47 @@ func (s *SOCKSServer) Serve(ctx context.Context) error {
 			return fmt.Errorf("socks accept: %w", err)
 		}
 		s.wg.Add(1)
+		s.registerConn(conn)
 		go func(c net.Conn) {
 			defer s.wg.Done()
+			defer s.unregisterConn(c)
 			defer func() { _ = c.Close() }()
 			if err := s.server.ServeConn(c); err != nil {
 				s.logger.Debug("socks5 conn ended", "err", err, "remote", c.RemoteAddr().String())
 			}
 		}(conn)
 	}
+}
+
+// ActiveConns reports the number of accepted client conns currently being
+// served. Exposed for operability and to let tests poll for "Serve has
+// observed and registered the new conn" without a fixed sleep.
+func (s *SOCKSServer) ActiveConns() int {
+	s.connsMu.Lock()
+	defer s.connsMu.Unlock()
+	return len(s.conns)
+}
+
+func (s *SOCKSServer) registerConn(c net.Conn) {
+	s.connsMu.Lock()
+	s.conns[c] = struct{}{}
+	s.connsMu.Unlock()
+}
+
+func (s *SOCKSServer) unregisterConn(c net.Conn) {
+	s.connsMu.Lock()
+	delete(s.conns, c)
+	s.connsMu.Unlock()
+}
+
+func (s *SOCKSServer) snapshotConns() []net.Conn {
+	s.connsMu.Lock()
+	defer s.connsMu.Unlock()
+	out := make([]net.Conn, 0, len(s.conns))
+	for c := range s.conns {
+		out = append(out, c)
+	}
+	return out
 }
 
 // Shutdown closes the listener (so Serve returns) and waits for in-flight
@@ -146,6 +191,23 @@ func (s *SOCKSServer) Shutdown(ctx context.Context) error {
 	case <-done:
 		return closeErr
 	case <-ctx.Done():
+		// Context expired with conns still active. Force-close every
+		// tracked client conn so each handler goroutine unblocks from
+		// ServeConn and decrements wg.
+		for _, c := range s.snapshotConns() {
+			_ = c.Close()
+		}
+		// Give force-closed handlers a brief, bounded chance to drain
+		// so wg can settle for a clean return. If anything is still
+		// stuck after the grace window, return the ctx error rather
+		// than waiting forever; the alternative (an unbounded <-done
+		// here) would let a non-cooperating handler hang Shutdown
+		// even though the caller's context already expired.
+		const forceCloseGrace = time.Second
+		select {
+		case <-done:
+		case <-time.After(forceCloseGrace):
+		}
 		if closeErr == nil {
 			return ctx.Err()
 		}

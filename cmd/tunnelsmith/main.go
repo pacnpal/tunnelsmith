@@ -99,7 +99,7 @@ func run(args []string, stdout, stderr *os.File) error {
 		if err != nil {
 			return fmt.Errorf("build upstream %q: %w", uc.ID, err)
 		}
-		entries = append(entries, upstream.PoolEntry{Up: up, Priority: uc.Priority})
+		entries = append(entries, upstream.PoolEntry{Up: up, Priority: uc.PriorityValue()})
 	}
 	pool, err := upstream.NewPool(entries, cfg.Failure.MaxRetriesPerRequest, logger)
 	if err != nil {
@@ -114,7 +114,10 @@ func run(args []string, stdout, stderr *os.File) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	httpSrv := listener.NewHTTP(cfg.Listener.HTTP, pool, logger)
+	httpSrv, err := listener.NewHTTP(cfg.Listener.HTTP, pool, logger)
+	if err != nil {
+		return fmt.Errorf("build http listener: %w", err)
+	}
 	socksSrv, err := listener.NewSOCKS(cfg.Listener.SOCKS, pool, logger)
 	if err != nil {
 		return fmt.Errorf("build socks listener: %w", err)

@@ -1,7 +1,7 @@
 # Multi-stage build. This image is built only by the GitHub Actions
 # workflow; do not build it on a developer host. See ADR-001.
 
-ARG GO_VERSION=1.22
+ARG GO_VERSION=1.23
 
 FROM golang:${GO_VERSION}-alpine AS build
 WORKDIR /src

@@ -8,6 +8,8 @@ import (
 	"net"
 	"sort"
 	"time"
+
+	"github.com/pacnpal/tunnelsmith/internal/failure"
 )
 
 // PoolEntry pairs an Upstream with the priority that determines its place
@@ -96,23 +98,39 @@ func (p *Pool) DialFor(ctx context.Context, network, addr string) (net.Conn, str
 		limit = len(p.entries)
 	}
 
-	var attemptErrs []error
+	var (
+		attemptErrs []error
+		attempts    int  // count of dials that actually fired
+		canceledMid bool // ctx canceled between attempts after at least one dial
+	)
 	for i := 0; i < limit; i++ {
 		if err := ctx.Err(); err != nil {
-			attemptErrs = append(attemptErrs, fmt.Errorf("context canceled before attempt %d: %w", i+1, err))
+			if attempts == 0 {
+				// Context already done before the first dial. Don't
+				// pretend an attempt happened: surface the cancellation
+				// directly so operator logs and the returned error
+				// reflect reality.
+				return nil, "", fmt.Errorf("pool: context canceled before any upstream was tried: %w", err)
+			}
+			// Cancellation arrived between attempts. Note it on the
+			// aggregated trail and stop iterating. The marker does not
+			// count as an attempt: attempts tracks dials that fired.
+			attemptErrs = append(attemptErrs, fmt.Errorf("context canceled after %d attempt(s): %w", attempts, err))
+			canceledMid = true
 			break
 		}
 		entry := p.entries[i]
 		start := p.clock()
 		conn, err := entry.Up.Dial(ctx, network, addr)
 		latencyMS := p.clock().Sub(start).Milliseconds()
+		attempts++
 		if err == nil {
 			p.logger.Info("upstream dial",
 				"upstream_id", entry.Up.ID(),
 				"host", host,
 				"outcome", "success",
 				"latency_ms", latencyMS,
-				"attempt", i+1,
+				"attempt", attempts,
 			)
 			return conn, entry.Up.ID(), nil
 		}
@@ -121,16 +139,40 @@ func (p *Pool) DialFor(ctx context.Context, network, addr string) (net.Conn, str
 			"host", host,
 			"outcome", "failure",
 			"latency_ms", latencyMS,
-			"attempt", i+1,
-			"err", err.Error(),
+			"attempt", attempts,
+			"kind", classifyKind(err),
+			"err", err,
 		)
 		attemptErrs = append(attemptErrs, fmt.Errorf("%s: %w", entry.Up.ID(), err))
 	}
 
+	if canceledMid {
+		// Distinguish "we ran out of upstreams" from "the caller bailed
+		// while we still had options". Operators reading the log line
+		// or wrapped error need to see which one happened.
+		return nil, "", fmt.Errorf(
+			"pool: dial canceled after %d attempt(s) (cap=%d, pool=%d): %w",
+			attempts, p.retryCap, len(p.entries), errors.Join(attemptErrs...),
+		)
+	}
 	return nil, "", fmt.Errorf(
 		"pool: all upstreams failed after %d attempt(s) (cap=%d, pool=%d): %w",
-		len(attemptErrs), p.retryCap, len(p.entries), errors.Join(attemptErrs...),
+		attempts, p.retryCap, len(p.entries), errors.Join(attemptErrs...),
 	)
+}
+
+// classifyKind maps a dial error to the short tag the failure-log line
+// uses ("refused" / "timeout" / "other"). Phase 4 will key its scoreboard
+// off the same classification.
+func classifyKind(err error) string {
+	switch {
+	case failure.IsConnectionRefused(err):
+		return "refused"
+	case failure.IsTimeout(err):
+		return "timeout"
+	default:
+		return "other"
+	}
 }
 
 // hostOnly returns the host portion of a host:port pair. Falls back to the

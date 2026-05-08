@@ -7,6 +7,7 @@
 package listener
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -29,6 +30,14 @@ type HTTPServer struct {
 
 	server *http.Server
 
+	// transport is shared across all forward-proxy requests so the
+	// per-Transport allocation and bookkeeping happens once at boot, not
+	// on every request. DisableKeepAlives stays true: with the priority
+	// pool deciding upstreams per dial and Phase 4 about to layer scoring
+	// on top, reusing TCP connections would pin requests to whichever
+	// upstream served the cold dial. Phase 4 revisits this trade-off.
+	transport *http.Transport
+
 	// ready closes once Serve has finished binding the listener (or
 	// finished failing to bind). Callers waiting on Addr() block on this
 	// to avoid racing the bind. Channel receive after close forms a
@@ -42,8 +51,19 @@ type HTTPServer struct {
 	tunnels   map[*tunnel]struct{}
 }
 
+// chosenIDCtxKey carries a *string into the forward-proxy DialContext so
+// the dial callback can hand the upstream id back to the per-request log
+// line without sharing mutable state across goroutines on the Transport.
+type chosenIDCtxKey struct{}
+
 // NewHTTP builds an HTTP listener that routes everything through pool.
-func NewHTTP(addr string, pool *upstream.Pool, logger *slog.Logger) *HTTPServer {
+// The pool must be non-nil; passing nil returns a clear error so callers
+// see the contract violation at construction time instead of a nil-deref
+// on the first request. Mirrors NewSOCKS's signature for symmetry.
+func NewHTTP(addr string, pool *upstream.Pool, logger *slog.Logger) (*HTTPServer, error) {
+	if pool == nil {
+		return nil, errors.New("listener.NewHTTP: pool is nil")
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -54,12 +74,30 @@ func NewHTTP(addr string, pool *upstream.Pool, logger *slog.Logger) *HTTPServer 
 		ready:   make(chan struct{}),
 		tunnels: make(map[*tunnel]struct{}),
 	}
+	h.transport = &http.Transport{
+		DialContext:       h.dialThroughPool,
+		DisableKeepAlives: true,
+	}
 	h.server = &http.Server{
 		Addr:              addr,
 		Handler:           http.HandlerFunc(h.handle),
 		ReadHeaderTimeout: 30 * time.Second,
 	}
-	return h
+	return h, nil
+}
+
+// dialThroughPool is the Transport's DialContext. The pool picks an
+// upstream and returns the conn; if a *string is stashed in ctx under
+// chosenIDCtxKey, the chosen upstream id is written there for the caller's
+// log line.
+func (h *HTTPServer) dialThroughPool(ctx context.Context, network, addr string) (net.Conn, error) {
+	conn, id, err := h.pool.DialFor(ctx, network, addr)
+	if err == nil {
+		if box, ok := ctx.Value(chosenIDCtxKey{}).(*string); ok {
+			*box = id
+		}
+	}
+	return conn, err
 }
 
 // Ready returns a channel that closes once Serve has either bound the
@@ -184,7 +222,14 @@ func (h *HTTPServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	t := h.registerTunnel(clientConn, upConn)
+	// net/http may have buffered bytes past the CONNECT headers in
+	// brw.Reader: clients commonly pipeline a TLS ClientHello right after
+	// CONNECT. Reading from clientConn directly would skip those bytes and
+	// corrupt the tunnel. Wrap clientConn so the tunnel's read side pulls
+	// the buffered bytes first before falling through to the wire.
+	clientForTunnel := newHijackedConn(clientConn, brw.Reader)
+
+	t := h.registerTunnel(clientForTunnel, upConn)
 	defer h.unregisterTunnel(t)
 	t.run()
 
@@ -202,28 +247,17 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 	}
 	start := time.Now()
 
-	// Build a one-shot Transport that opens its TCP connection through
-	// the pool. Reusing connections across requests is fine here because
-	// the listener processes one client connection at a time. The closure
-	// captures the upstream id of whichever upstream served the request
-	// so the post-roundtrip log line can name it.
+	// Per-request *string box passed to the shared Transport's
+	// DialContext via the request context. Each in-flight request has
+	// its own box, so concurrent requests do not race on the chosen id.
 	var chosenID string
-	tr := &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			conn, id, err := h.pool.DialFor(ctx, network, addr)
-			chosenID = id
-			return conn, err
-		},
-		DisableKeepAlives: true,
-	}
-	defer tr.CloseIdleConnections()
-
-	outReq := r.Clone(r.Context())
+	ctx := context.WithValue(r.Context(), chosenIDCtxKey{}, &chosenID)
+	outReq := r.Clone(ctx)
 	outReq.RequestURI = ""
 	stripHopHeaders(outReq.Header)
 	stripProxyHeaders(outReq.Header)
 
-	resp, err := tr.RoundTrip(outReq)
+	resp, err := h.transport.RoundTrip(outReq)
 	if err != nil {
 		h.logger.Warn("forward roundtrip failed", "url", r.URL.String(), "err", err)
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
@@ -284,6 +318,23 @@ func stripProxyHeaders(h http.Header) {
 	h.Del("Proxy-Connection")
 	h.Del("Proxy-Authenticate")
 	h.Del("Proxy-Authorization")
+}
+
+// hijackedConn wraps the net.Conn returned by http.Hijacker.Hijack so that
+// reads pull from the bufio.Reader first. After Hijack, that reader may
+// already hold bytes the client sent after the CONNECT headers (typically
+// a pipelined TLS ClientHello); reading the conn directly would lose them.
+type hijackedConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func newHijackedConn(c net.Conn, r *bufio.Reader) *hijackedConn {
+	return &hijackedConn{Conn: c, r: r}
+}
+
+func (c *hijackedConn) Read(p []byte) (int, error) {
+	return c.r.Read(p)
 }
 
 // tunnel pairs a client conn with an upstream conn and pumps bytes both

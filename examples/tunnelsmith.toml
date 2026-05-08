@@ -111,7 +111,10 @@ cooldown = "6h"
 
 # --------------------------------------------------------------------
 # Per-host rules. Optional. Phase 8 enables them in the router.
-# host_glob uses path.Match semantics: "*" matches a single component.
+# host_glob uses path.Match semantics: "*" matches any sequence of
+# non-"/" characters. Hostnames have no "/", so "*" can span multiple
+# dot-separated labels: "*.bbc.co.uk" matches both "news.bbc.co.uk"
+# and "a.b.bbc.co.uk".
 # --------------------------------------------------------------------
 [[rule]]
 host_glob = "*.itch.io"

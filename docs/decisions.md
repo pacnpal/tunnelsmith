@@ -28,3 +28,31 @@ Talor flagged this during Phase 0 kickoff and asked that the image be produced e
 - Faster local iteration. No daemon needed for everyday work.
 - Image-related regressions are caught only in CI rather than at the developer's terminal. The trade-off is acceptable because the binary itself can be exercised locally without the image, and image-shaped issues (missing files, wrong base, ENTRYPOINT mistakes) tend to be rare and visible the first time CI runs after a relevant change.
 - Release verification for v1.0.0 (Phase 10) still pulls from GHCR, which technically requires a local daemon. That is a release sanity check, not a build-time loop, and is fine to revisit when Phase 10 starts.
+
+---
+
+## ADR-002: Bump Go directive to 1.23 to absorb golang.org/x/net security fixes
+
+**Date:** 2026-05-08
+**Status:** Accepted
+
+### Context
+
+GitHub Dependabot opened two moderate alerts against `main` for `golang.org/x/net v0.35.0`:
+
+- GHSA-qxp5-gwg8-xv66: HTTP proxy bypass via IPv6 Zone IDs (fixed in v0.36.0). Directly relevant: Tunnelsmith is an HTTP and SOCKS5 proxy.
+- GHSA-vvgc-356p-c3xw: cross-site scripting in `html` package (fixed in v0.38.0). Less directly relevant but the cleanest fix is to land both in one bump.
+
+The Phase 1 changelog pinned `golang.org/x/net v0.35.0` because v0.35.0 was the last release whose `go.mod` declared `go 1.18`, which kept the project's own `go 1.22` directive viable. Every release at v0.36.0 or later requires `go 1.23.0`, so picking up the security fixes forces the project's `go` directive up to 1.23.
+
+### Decision
+
+1. Bump `golang.org/x/net` from v0.35.0 to v0.38.0 (the lowest version that patches both alerts).
+2. Bump the project's `go` directive from `1.22` to `1.23.0` (the value `go mod tidy` settles on after the dependency bump).
+3. Bump `GO_VERSION` from `1.22` to `1.23` in `.github/workflows/ci.yml` and in the `Dockerfile` `ARG`.
+
+### Consequences
+
+- The host Go on contributor machines must be `>= 1.23`. Most modern installs are already there; CI is the only environment that we control.
+- Future bumps of `golang.org/x/net` should not require another Go bump in the short term. If a later vuln forces another, the trade-off (security patch vs. Go floor) stays the same and we follow this same path.
+- Supersedes the Phase 1 rationale that pinned x/net at v0.35.0 to keep `go 1.22`. That pin is no longer load-bearing.
