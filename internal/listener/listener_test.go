@@ -370,6 +370,99 @@ func TestSOCKS5Tunnel(t *testing.T) {
 	}
 }
 
+// TestHTTPConnectPipelinedBytesReachUpstream confirms the listener forwards
+// bytes that arrive in the same TCP segment as the CONNECT request. net/http
+// reads ahead while parsing headers and buffers anything after the trailing
+// \r\n\r\n in the hijack's bufio.Reader. If the listener tunneled directly
+// from the raw clientConn, those buffered bytes would be lost and the
+// upstream would see a truncated stream.
+func TestHTTPConnectPipelinedBytesReachUpstream(t *testing.T) {
+	t.Parallel()
+
+	// Echo destination: sends back whatever the client wrote.
+	dest, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen dest: %v", err)
+	}
+	t.Cleanup(func() { _ = dest.Close() })
+	go func() {
+		for {
+			c, err := dest.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer func() { _ = c.Close() }()
+				_, _ = io.Copy(c, c)
+			}(c)
+		}
+	}()
+
+	srv := listener.NewHTTP("127.0.0.1:0", directPool(t), quietLogger())
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve(context.Background()) }()
+	select {
+	case <-srv.Ready():
+	case <-time.After(2 * time.Second):
+		t.Fatal("http listener did not bind in time")
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+		<-serveErr
+	})
+
+	clientConn, err := net.Dial("tcp", srv.Addr().String())
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer func() { _ = clientConn.Close() }()
+
+	// Send the CONNECT request and a pipelined payload in a single Write
+	// so net/http's bufio.Reader sees the trailing payload while parsing
+	// the request line and headers.
+	const payload = "PIPELINED-AFTER-CONNECT"
+	req := "CONNECT " + dest.Addr().String() + " HTTP/1.1\r\nHost: " + dest.Addr().String() + "\r\n\r\n" + payload
+	if _, err := clientConn.Write([]byte(req)); err != nil {
+		t.Fatalf("write CONNECT + payload: %v", err)
+	}
+
+	// Read CONNECT 200.
+	buf := make([]byte, 1024)
+	_ = clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, err := clientConn.Read(buf)
+	if err != nil {
+		t.Fatalf("read CONNECT response: %v", err)
+	}
+	if !strings.HasPrefix(string(buf[:n]), "HTTP/1.1 200") {
+		t.Fatalf("unexpected CONNECT response: %q", string(buf[:n]))
+	}
+	// CONNECT response can include the echoed payload in the same read on
+	// some systems; if it does, slice it off and read the rest below.
+	got := ""
+	if idx := strings.Index(string(buf[:n]), "\r\n\r\n"); idx >= 0 {
+		got = string(buf[:n][idx+4:])
+	}
+
+	// Read until we have the full echoed payload back.
+	deadline := time.Now().Add(3 * time.Second)
+	for len(got) < len(payload) && time.Now().Before(deadline) {
+		_ = clientConn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		n, err := clientConn.Read(buf)
+		if n > 0 {
+			got += string(buf[:n])
+		}
+		if err != nil && !errors.Is(err, io.EOF) {
+			break
+		}
+	}
+
+	if got != payload {
+		t.Fatalf("echoed payload = %q, want %q (the listener dropped pipelined bytes from the hijack buffer)", got, payload)
+	}
+}
+
 // TestHTTPConnectShutdownDrains opens a CONNECT tunnel that the destination
 // holds open, calls Shutdown with a short timeout, and confirms the
 // listener forces the tunnel closed within the timeout instead of hanging.

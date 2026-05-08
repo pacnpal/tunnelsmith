@@ -7,6 +7,7 @@
 package listener
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -184,7 +185,14 @@ func (h *HTTPServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	t := h.registerTunnel(clientConn, upConn)
+	// net/http may have buffered bytes past the CONNECT headers in
+	// brw.Reader: clients commonly pipeline a TLS ClientHello right after
+	// CONNECT. Reading from clientConn directly would skip those bytes and
+	// corrupt the tunnel. Wrap clientConn so the tunnel's read side pulls
+	// the buffered bytes first before falling through to the wire.
+	clientForTunnel := newHijackedConn(clientConn, brw.Reader)
+
+	t := h.registerTunnel(clientForTunnel, upConn)
 	defer h.unregisterTunnel(t)
 	t.run()
 
@@ -284,6 +292,23 @@ func stripProxyHeaders(h http.Header) {
 	h.Del("Proxy-Connection")
 	h.Del("Proxy-Authenticate")
 	h.Del("Proxy-Authorization")
+}
+
+// hijackedConn wraps the net.Conn returned by http.Hijacker.Hijack so that
+// reads pull from the bufio.Reader first. After Hijack, that reader may
+// already hold bytes the client sent after the CONNECT headers (typically
+// a pipelined TLS ClientHello); reading the conn directly would lose them.
+type hijackedConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func newHijackedConn(c net.Conn, r *bufio.Reader) *hijackedConn {
+	return &hijackedConn{Conn: c, r: r}
+}
+
+func (c *hijackedConn) Read(p []byte) (int, error) {
+	return c.r.Read(p)
 }
 
 // tunnel pairs a client conn with an upstream conn and pumps bytes both
