@@ -628,16 +628,6 @@ func readBoundedBody(body io.Reader, limit int64) ([]byte, bool, error) {
 	return buf, false, nil
 }
 
-// hostOnly returns the host portion of a host:port pair. Falls back to the
-// whole input if SplitHostPort fails so logs and metrics still carry
-// something useful.
-func hostOnly(addr string) string {
-	if h, _, err := net.SplitHostPort(addr); err == nil {
-		return h
-	}
-	return addr
-}
-
 // hopHeaders are the connection-scoped headers RFC 7230 §6.1 says a proxy
 // must not forward.
 var hopHeaders = []string{

@@ -470,6 +470,53 @@ func TestCooldownExpiry(t *testing.T) {
 	}
 }
 
+// TestCooldownOverrideAuthoritative confirms a non-nil cooldownOverride
+// fully replaces any prior cooldownUntil rather than only extending it.
+// Two paths matter: a non-nil zero pointer (Retry-After: 0 = retry now)
+// must clear an active cooldown, and a non-nil shorter override must
+// shrink an active cooldown rather than be silently dropped. The
+// extend-only behavior still applies to nil overrides (default kind
+// cooldown), tested separately by TestCooldownExpiry.
+func TestCooldownOverrideAuthoritative(t *testing.T) {
+	t.Parallel()
+	up := alwaysOK("u1")
+	clock := newManualClock(time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC))
+	sb := buildScoreboard(t, []*fakeUpstream{up}, scoreboard.Config{
+		KindPolicy: map[failure.Kind]scoreboard.Policy{
+			failure.KindRateLimit: {Penalty: 1, Cooldown: 60 * time.Second},
+		},
+	}, clock, 1)
+	defer sb.Stop()
+
+	// Land a default 60s cooldown on u1.
+	sb.RecordFailure("example.com", "u1", failure.KindRateLimit, nil)
+	snap := snapshotByID(sb, "example.com")
+	e, ok := snap["u1"]
+	if !ok {
+		t.Fatal("no entry for u1 after first failure")
+	}
+	original := e.CooldownUntil
+	if !original.After(clock.Now()) {
+		t.Fatalf("first failure cooldownUntil = %v, want after now", original)
+	}
+
+	// Advance past the debounce window so the next RecordFailure is not
+	// folded into the previous one. 200ms is well above the default
+	// debounce (zero/short) used by buildScoreboard.
+	clock.Add(500 * time.Millisecond)
+
+	// Retry-After: 0 arrives. The destination explicitly says retry now.
+	zero := time.Duration(0)
+	sb.RecordFailure("example.com", "u1", failure.KindRateLimit, &zero)
+	snap = snapshotByID(sb, "example.com")
+	if e, ok = snap["u1"]; !ok {
+		t.Fatal("entry for u1 disappeared after second failure")
+	}
+	if !e.CooldownUntil.IsZero() {
+		t.Errorf("after Retry-After: 0 override, cooldownUntil = %v, want zero time", e.CooldownUntil)
+	}
+}
+
 // TestFailureDebounce confirms 10 concurrent identical RecordFailure calls
 // produce exactly one penalty event, not 10. Score after the burst should
 // be -policy.Penalty * 1, not -policy.Penalty * 10. globalFailureCount

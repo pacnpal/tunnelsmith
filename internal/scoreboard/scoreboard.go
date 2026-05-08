@@ -492,10 +492,13 @@ func (s *Scoreboard) RecordSuccess(host, upstreamID string, latency time.Duratio
 }
 
 // RecordFailure applies a penalty + cooldown for (host, upstreamID, kind).
-// cooldownOverride, when non-nil, replaces the kind's default cooldown
-// from KindPolicy. A non-nil zero pointer is honored verbatim, supporting
-// the legitimate "Retry-After: 0" case that means "retry immediately".
-// nil means "use the kind's default cooldown".
+// cooldownOverride, when non-nil, is authoritative: it replaces any
+// prior cooldownUntil rather than only extending it. A non-nil zero
+// pointer represents "Retry-After: 0", meaning the destination says
+// retry immediately, and clears any existing cooldownUntil. A nil
+// pointer falls back to the kind's default cooldown from KindPolicy
+// and only extends cooldownUntil (the same monotonic behavior earlier
+// failures used).
 //
 // Identical (host, upstream, kind) triples arriving within DebounceWindow
 // collapse into one penalty event; later calls are dropped silently.
@@ -510,8 +513,9 @@ func (s *Scoreboard) RecordFailure(host, upstreamID string, kind failure.Kind, c
 		return
 	}
 	policy := s.cfg.KindPolicy[kind]
+	overridden := cooldownOverride != nil
 	cooldown := policy.Cooldown
-	if cooldownOverride != nil {
+	if overridden {
 		cooldown = *cooldownOverride
 	}
 	s.mu.Lock()
@@ -520,7 +524,19 @@ func (s *Scoreboard) RecordFailure(host, upstreamID string, kind failure.Kind, c
 	if e.score < -s.cfg.ScoreCap {
 		e.score = -s.cfg.ScoreCap
 	}
-	if cooldown > 0 {
+	switch {
+	case overridden && cooldown > 0:
+		// Destination's explicit Retry-After wins over any prior
+		// cooldown, even if the prior was longer.
+		e.cooldownUntil = now.Add(cooldown)
+	case overridden:
+		// Retry-After: 0 means retry immediately; clear any prior
+		// cooldown so this upstream is eligible again.
+		e.cooldownUntil = time.Time{}
+	case cooldown > 0:
+		// No explicit override, fall back to extend-only behavior so
+		// later default-cooldown events cannot shorten an active
+		// cooldown.
 		until := now.Add(cooldown)
 		if until.After(e.cooldownUntil) {
 			e.cooldownUntil = until
