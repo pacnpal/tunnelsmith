@@ -399,13 +399,13 @@ func (s ScoringConfig) validate() error {
 		errs = append(errs, fmt.Errorf("failure.scoring.refused_penalty must be >= 0, got %v", s.RefusedPenalty))
 	}
 	if s.RefusedCooldown < 0 {
-		errs = append(errs, fmt.Errorf("failure.scoring.refused_cooldown must be >= 0"))
+		errs = append(errs, fmt.Errorf("failure.scoring.refused_cooldown must be >= 0, got %v", s.RefusedCooldown.Duration()))
 	}
 	if s.TimeoutPenalty < 0 {
 		errs = append(errs, fmt.Errorf("failure.scoring.timeout_penalty must be >= 0, got %v", s.TimeoutPenalty))
 	}
 	if s.TimeoutCooldown < 0 {
-		errs = append(errs, fmt.Errorf("failure.scoring.timeout_cooldown must be >= 0"))
+		errs = append(errs, fmt.Errorf("failure.scoring.timeout_cooldown must be >= 0, got %v", s.TimeoutCooldown.Duration()))
 	}
 	if s.SuccessWeight <= 0 {
 		errs = append(errs, fmt.Errorf("failure.scoring.success_weight must be > 0, got %v", s.SuccessWeight))
@@ -417,16 +417,16 @@ func (s ScoringConfig) validate() error {
 		errs = append(errs, fmt.Errorf("failure.scoring.probe_chance must be in [0,1], got %v", s.ProbeChance))
 	}
 	if s.DecayInterval <= 0 {
-		errs = append(errs, fmt.Errorf("failure.scoring.decay_interval must be > 0"))
+		errs = append(errs, fmt.Errorf("failure.scoring.decay_interval must be > 0, got %v", s.DecayInterval.Duration()))
 	}
 	if s.DecayStep < 0 {
 		errs = append(errs, fmt.Errorf("failure.scoring.decay_step must be >= 0, got %v", s.DecayStep))
 	}
 	if s.CascadeTTL < 0 {
-		errs = append(errs, fmt.Errorf("failure.scoring.cascade_ttl must be >= 0"))
+		errs = append(errs, fmt.Errorf("failure.scoring.cascade_ttl must be >= 0, got %v", s.CascadeTTL.Duration()))
 	}
 	if s.DebounceWindow < 0 {
-		errs = append(errs, fmt.Errorf("failure.scoring.debounce_window must be >= 0"))
+		errs = append(errs, fmt.Errorf("failure.scoring.debounce_window must be >= 0, got %v", s.DebounceWindow.Duration()))
 	}
 	return errors.Join(errs...)
 }

@@ -631,9 +631,12 @@ func (s *Scoreboard) DialFor(ctx context.Context, network, addr string) (net.Con
 		// "upstream could not reach the host", so penalizing the upstream
 		// would be wrong. Checking ctx.Err() catches both shapes; the
 		// parent context's state is the authoritative signal regardless
-		// of how the dial error wraps it.
+		// of how the dial error wraps it. Append an explicit "context
+		// canceled" marker so the aggregated error makes the cause
+		// readable instead of looking like a pure upstream failure.
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			attemptErrs = append(attemptErrs, fmt.Errorf("%s: %w", up.ID(), dialErr))
+			attemptErrs = append(attemptErrs, fmt.Errorf("context canceled after %d attempt(s): %w", attempts, ctxErr))
 			return nil, "", errors.Join(attemptErrs...)
 		}
 		kind := failure.ClassifyDialError(dialErr)

@@ -25,18 +25,25 @@ import (
 // invoked on each Dial; it returns either a fake conn (treated as success)
 // or an error (treated as failure). dialCount records how many times Dial
 // was called, useful for per-test "this upstream was tried N times"
-// assertions.
+// assertions. lastCtx records the most recent dial's context so behavior
+// callbacks can block on ctx.Done() when a test needs mid-dial cancellation.
 type fakeUpstream struct {
 	id        string
 	kind      config.UpstreamKind
 	behavior  func() (net.Conn, error)
 	dialCount atomic.Int64
+
+	ctxMu   sync.Mutex
+	lastCtx context.Context
 }
 
 func (f *fakeUpstream) ID() string                { return f.id }
 func (f *fakeUpstream) Kind() config.UpstreamKind { return f.kind }
 func (f *fakeUpstream) Dial(ctx context.Context, network, addr string) (net.Conn, error) {
 	f.dialCount.Add(1)
+	f.ctxMu.Lock()
+	f.lastCtx = ctx
+	f.ctxMu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -598,16 +605,17 @@ func TestDialForSkipsScoringOnCallerCancellation(t *testing.T) {
 
 	t.Run("context.DeadlineExceeded mid-dial", func(t *testing.T) {
 		t.Parallel()
-		// Dial blocks until ctx fires, then returns ctx.Err(). Mirrors
-		// what the real *net.Dialer does when ctx.Deadline elapses.
-		up := newFakeUpstream("u1", func() (net.Conn, error) {
-			panic("unreachable") // ctx-aware Dial returns before behavior runs
-		})
-		// Patch the fake to honor ctx.
+		// Fake Dial that blocks on ctx.Done() and returns ctx.Err() when
+		// the deadline fires. Mirrors what the real *net.Dialer surfaces
+		// when ctx.Deadline elapses while a dial is in flight. The fake's
+		// outer Dial method already checks ctx.Err() up front, but it is
+		// the per-attempt ctx that gets passed in, so the deadline must
+		// fire while behavior is running for the test to exercise the
+		// mid-dial cancellation branch in scoreboard.DialFor.
+		up := newFakeUpstream("u1", nil)
 		up.behavior = func() (net.Conn, error) {
-			// Sleep long enough for the deadline to fire.
-			time.Sleep(50 * time.Millisecond)
-			return nil, context.DeadlineExceeded
+			<-up.lastCtx.Done()
+			return nil, up.lastCtx.Err()
 		}
 		sb := buildScoreboard(t, []*fakeUpstream{up}, scoreboard.Config{}, nil, 1)
 		defer sb.Stop()
