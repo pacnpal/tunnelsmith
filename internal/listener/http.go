@@ -521,12 +521,15 @@ func (h *HTTPServer) newOutReq(r *http.Request, body []byte) *http.Request {
 
 // writeForwardSuccess copies the upstream response back to the client and
 // adds the Tunnelsmith-specific headers. Hop-by-hop headers are stripped
-// per RFC 7230 §6.1; everything else (including Set-Cookie, Cache-Control,
-// etc.) is forwarded verbatim. Closes resp.Body when done.
+// per RFC 7230 §6.1; any X-Tunnelsmith-* headers the destination tried to
+// inject are stripped too so a malicious or careless server cannot spoof
+// the proxy's own observability namespace. Everything else (Set-Cookie,
+// Cache-Control, ...) is forwarded verbatim. Closes resp.Body when done.
 func (h *HTTPServer) writeForwardSuccess(w http.ResponseWriter, resp *http.Response, upID string, retries int) {
 	defer func() { _ = resp.Body.Close() }()
 	respHeader := resp.Header.Clone()
 	stripHopHeaders(respHeader)
+	stripTunnelsmithHeaders(respHeader)
 	for k, vs := range respHeader {
 		for _, v := range vs {
 			w.Header().Add(k, v)
@@ -537,6 +540,17 @@ func (h *HTTPServer) writeForwardSuccess(w http.ResponseWriter, resp *http.Respo
 	w.WriteHeader(resp.StatusCode)
 	if _, err := io.Copy(w, resp.Body); err != nil {
 		h.logger.Warn("forward copy failed", "upstream_id", upID, "err", err)
+	}
+}
+
+// stripTunnelsmithHeaders removes any X-Tunnelsmith-* headers from h.
+// http.Header keys are stored in canonical MIME form ("X-Tunnelsmith-...")
+// so a single prefix check covers every variant a destination might send.
+func stripTunnelsmithHeaders(h http.Header) {
+	for k := range h {
+		if strings.HasPrefix(k, "X-Tunnelsmith-") {
+			h.Del(k)
+		}
 	}
 }
 

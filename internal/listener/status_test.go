@@ -65,8 +65,19 @@ func startForwardListener(t *testing.T, sb *scoreboard.Scoreboard, detector *fai
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = srv.Shutdown(ctx)
-		<-serveErr
+		if err := srv.Shutdown(ctx); err != nil {
+			t.Logf("http shutdown: %v", err)
+		}
+		// Bound the wait for Serve to return: if a regression keeps it
+		// blocked, the whole suite would otherwise hang on this Cleanup.
+		select {
+		case err := <-serveErr:
+			if err != nil {
+				t.Logf("http serve returned: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Logf("http serve did not return after shutdown")
+		}
 	})
 	return srv, &url.URL{Scheme: "http", Host: srv.Addr().String()}
 }
@@ -876,6 +887,54 @@ func TestForwardRejectsEmptyHost(t *testing.T) {
 	// Empty-string cascade key must NOT have been tripped.
 	if got := sb.CascadeUntil(""); !got.IsZero() {
 		t.Errorf("CascadeUntil(\"\") = %v, want zero (no upstream was tried)", got)
+	}
+}
+
+// TestForwardStripsDestinationTunnelsmithHeaders covers Copilot's review
+// on PR #13: a destination that ships X-Tunnelsmith-* headers (e.g. a
+// spoofed X-Tunnelsmith-Cascade or a stale X-Tunnelsmith-Upstream from
+// a chained Tunnelsmith) must not have those forwarded to the client.
+// The proxy owns that header namespace; only Tunnelsmith's own values
+// for the response shape are allowed through.
+func TestForwardStripsDestinationTunnelsmithHeaders(t *testing.T) {
+	t.Parallel()
+	dest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Tunnelsmith-Cascade", "spoofed.example")
+		w.Header().Set("X-Tunnelsmith-Upstream", "spoofed-upstream")
+		w.Header().Set("X-Tunnelsmith-Retries", "999")
+		w.Header().Set("X-Tunnelsmith-Future", "irrelevant")
+		w.Header().Set("X-Real-Header", "untouched")
+		_, _ = io.WriteString(w, "ok")
+	}))
+	t.Cleanup(dest.Close)
+
+	pool := directPoolWith(t, "real-upstream")
+	sb := scoreboardFor(t, pool)
+	_, proxyURL := startForwardListener(t, sb, failure.NewStatusDetector(config.DefaultStatusRules), 5)
+	client := proxyClient(t, proxyURL)
+
+	resp, err := client.Get(dest.URL)
+	if err != nil {
+		t.Fatalf("client.Get: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Tunnelsmith-Cascade"); got != "" {
+		t.Errorf("X-Tunnelsmith-Cascade = %q, want \"\" (destination spoof must be stripped)", got)
+	}
+	if got := resp.Header.Get("X-Tunnelsmith-Future"); got != "" {
+		t.Errorf("X-Tunnelsmith-Future = %q, want \"\" (any X-Tunnelsmith-* must be stripped)", got)
+	}
+	if got := resp.Header.Get("X-Tunnelsmith-Upstream"); got != "real-upstream" {
+		t.Errorf("X-Tunnelsmith-Upstream = %q, want %q (proxy's value, not the spoof)", got, "real-upstream")
+	}
+	if got := resp.Header.Get("X-Tunnelsmith-Retries"); got != "0" {
+		t.Errorf("X-Tunnelsmith-Retries = %q, want %q (proxy's value, not the spoof)", got, "0")
+	}
+	if got := resp.Header.Get("X-Real-Header"); got != "untouched" {
+		t.Errorf("X-Real-Header = %q, want %q (only X-Tunnelsmith-* should be stripped)", got, "untouched")
 	}
 }
 
