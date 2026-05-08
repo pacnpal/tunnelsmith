@@ -95,7 +95,7 @@ Rule fields:
 | `cooldown`           | duration | `0`     | how long to cool the upstream down for this host after this code |
 | `honor_retry_after`  | bool     | `false` | when true, the response's `Retry-After` header overrides `cooldown` |
 
-5xx, 4xx-other, and 2xx codes are deliberately not in the default list. See `tunnelsmith-proposal.md` for the rationale.
+5xx, 4xx-other, and 2xx codes are deliberately not in the default list: 5xx is usually a transient destination problem rather than an upstream issue, generic 4xx is request-shaped, and 2xx is success unless a body-regex says otherwise.
 
 ## `[[rule]]`
 

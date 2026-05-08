@@ -1,6 +1,6 @@
 // Package config loads, validates, and applies defaults to Tunnelsmith's
-// TOML configuration. The schema mirrors the one described in
-// tunnelsmith-proposal.md.
+// TOML configuration. Every key, default, and validation rule is documented
+// in docs/configuration.md.
 package config
 
 import (
