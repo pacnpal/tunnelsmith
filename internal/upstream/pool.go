@@ -8,6 +8,8 @@ import (
 	"net"
 	"sort"
 	"time"
+
+	"github.com/pacnpal/tunnelsmith/internal/failure"
 )
 
 // PoolEntry pairs an Upstream with the priority that determines its place
@@ -99,7 +101,17 @@ func (p *Pool) DialFor(ctx context.Context, network, addr string) (net.Conn, str
 	var attemptErrs []error
 	for i := 0; i < limit; i++ {
 		if err := ctx.Err(); err != nil {
-			attemptErrs = append(attemptErrs, fmt.Errorf("context canceled before attempt %d: %w", i+1, err))
+			if len(attemptErrs) == 0 {
+				// Context already done before the first dial. Don't
+				// pretend an attempt happened: surface the cancellation
+				// directly so operator logs and the returned error
+				// reflect reality.
+				return nil, "", fmt.Errorf("pool: context canceled before any upstream was tried: %w", err)
+			}
+			// Cancellation arrived between attempts. Note it on the
+			// aggregated trail and stop iterating; counters below
+			// reflect dials that actually fired.
+			attemptErrs = append(attemptErrs, fmt.Errorf("context canceled after %d attempt(s): %w", len(attemptErrs), err))
 			break
 		}
 		entry := p.entries[i]
@@ -122,7 +134,8 @@ func (p *Pool) DialFor(ctx context.Context, network, addr string) (net.Conn, str
 			"outcome", "failure",
 			"latency_ms", latencyMS,
 			"attempt", i+1,
-			"err", err.Error(),
+			"kind", classifyKind(err),
+			"err", err,
 		)
 		attemptErrs = append(attemptErrs, fmt.Errorf("%s: %w", entry.Up.ID(), err))
 	}
@@ -131,6 +144,20 @@ func (p *Pool) DialFor(ctx context.Context, network, addr string) (net.Conn, str
 		"pool: all upstreams failed after %d attempt(s) (cap=%d, pool=%d): %w",
 		len(attemptErrs), p.retryCap, len(p.entries), errors.Join(attemptErrs...),
 	)
+}
+
+// classifyKind maps a dial error to the short tag the failure-log line
+// uses ("refused" / "timeout" / "other"). Phase 4 will key its scoreboard
+// off the same classification.
+func classifyKind(err error) string {
+	switch {
+	case failure.IsConnectionRefused(err):
+		return "refused"
+	case failure.IsTimeout(err):
+		return "timeout"
+	default:
+		return "other"
+	}
 }
 
 // hostOnly returns the host portion of a host:port pair. Falls back to the
