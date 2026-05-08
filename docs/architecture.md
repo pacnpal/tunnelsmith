@@ -104,7 +104,7 @@ Status detection is on the listener side, not the scoreboard side. `internal/fai
 
 1. Pick an upstream. On cascade or pool exhaustion, fall through to a 502 with `X-Tunnelsmith-Cascade`.
 2. RoundTrip through the upstream's pinned `http.Transport`.
-3. If the dial / transport returned an error, classify via `failure.ClassifyDialError` and `RecordFailure` (Refused or Timeout). Mark tried, retry.
+3. If the RoundTrip returned an error, narrow it: only `failure.IsTimeout` and `failure.IsConnectionRefused` matches translate into a `RecordFailure` (with `KindTimeout` or `KindRefused`). Other RoundTrip errors (TLS verification, HTTP parse, server hangup mid-response, ...) might belong to the destination rather than the upstream, so the listener marks the upstream tried and rotates without penalizing it. The scoreboard's own `DialFor` (used by CONNECT / SOCKS5) operates one layer down, where every error is a real dial-level error, and there it still uses `failure.ClassifyDialError`'s "unknown defaults to refused" mapping.
 4. If a response came back, ask the detector. On a positive match, drain the body, `RecordFailure` with the matched Kind plus any honored `Retry-After`, mark tried, retry.
 5. On a non-match (the common path), `RecordSuccess` and write the response back to the client with `X-Tunnelsmith-Upstream` and `X-Tunnelsmith-Retries`.
 

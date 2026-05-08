@@ -838,6 +838,47 @@ func TestForwardNonDialRoundTripErrorSkipsPenalty(t *testing.T) {
 	}
 }
 
+// TestForwardRejectsEmptyHost covers Copilot's review on PR #13: a
+// malformed absolute-form URI like "http:/path" is IsAbs() = true but
+// has no host. Without an explicit empty-host check the listener would
+// run the retry loop with host = "" and trip cascade for the empty
+// string. The listener must reject up front so the scoreboard never
+// sees an empty host key.
+func TestForwardRejectsEmptyHost(t *testing.T) {
+	t.Parallel()
+	pool := directPoolWith(t, "a")
+	sb := scoreboardFor(t, pool)
+	_, proxyURL := startForwardListener(t, sb, failure.NewStatusDetector(config.DefaultStatusRules), 5)
+
+	conn, err := net.Dial("tcp", proxyURL.Host)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	// Request line that parses as IsAbs() = true with an empty host. A
+	// stdlib http.Client will not generate one of these, so we have to
+	// hand-roll the bytes.
+	const req = "GET http:/path HTTP/1.1\r\nHost: \r\n\r\n"
+	if _, err := conn.Write([]byte(req)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodGet})
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	// Empty-string cascade key must NOT have been tripped.
+	if got := sb.CascadeUntil(""); !got.IsZero() {
+		t.Errorf("CascadeUntil(\"\") = %v, want zero (no upstream was tried)", got)
+	}
+}
+
 // TestForwardSinglePool429RetryCapStops confirms a 429-returning pool with
 // only one upstream halts after one attempt because the retry cap caps total
 // attempts and the only upstream is now in tried[].

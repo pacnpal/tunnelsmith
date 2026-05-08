@@ -308,6 +308,15 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 	if host == "" {
 		host = hostOnly(r.Host)
 	}
+	// IsAbs is true for malformed absolute-form URIs like "http:/path"
+	// where the scheme is set but the host is missing. Without this guard
+	// such requests would key into the scoreboard with an empty host
+	// string and trip cascade for "" once the loop exhausts. Reject up
+	// front so the scoreboard never sees an empty key.
+	if host == "" {
+		http.Error(w, "request URL missing host", http.StatusBadRequest)
+		return
+	}
 
 	// Buffer the request body so the retry loop can replay it on each
 	// attempt. Cap the buffer so a client cannot exhaust the proxy's
