@@ -295,17 +295,12 @@ func (c *Config) Validate() error {
 }
 
 func validateAddr(addr, fieldName string) error {
-	host, port, err := net.SplitHostPort(addr)
+	_, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return fmt.Errorf("%s: invalid host:port %q: %w", fieldName, addr, err)
 	}
-	_ = host
-	p, err := strconv.Atoi(port)
-	if err != nil {
-		return fmt.Errorf("%s: port %q is not numeric: %w", fieldName, port, err)
-	}
-	if p < 1 || p > 65535 {
-		return fmt.Errorf("%s: port %d is outside the 1-65535 range", fieldName, p)
+	if err := validatePort(port); err != nil {
+		return fmt.Errorf("%s: %w", fieldName, err)
 	}
 	return nil
 }
@@ -318,12 +313,21 @@ func validateUpstreamAddr(addr, where string) error {
 	if strings.TrimSpace(host) == "" {
 		return fmt.Errorf("%s: addr %q is missing a host", where, addr)
 	}
+	if err := validatePort(port); err != nil {
+		return fmt.Errorf("%s: addr %w", where, err)
+	}
+	return nil
+}
+
+// validatePort parses a port string and confirms it falls in 1-65535.
+// Errors carry no section label; callers wrap with their own prefix.
+func validatePort(port string) error {
 	p, err := strconv.Atoi(port)
 	if err != nil {
-		return fmt.Errorf("%s: addr port %q is not numeric: %w", where, port, err)
+		return fmt.Errorf("port %q is not numeric: %w", port, err)
 	}
 	if p < 1 || p > 65535 {
-		return fmt.Errorf("%s: addr port %d is outside the 1-65535 range", where, p)
+		return fmt.Errorf("port %d is outside the 1-65535 range", p)
 	}
 	return nil
 }
