@@ -892,7 +892,7 @@ func TestForwardRejectsEmptyHost(t *testing.T) {
 	// Host-header key must also stay clean: malformed URL host must be
 	// rejected before any attempt can trip cascade for example.com.
 	if got := sb.CascadeUntil("example.com"); !got.IsZero() {
-		t.Errorf("CascadeUntil(example.com) = %v, want zero (no upstream was tried)", got)
+		t.Errorf("CascadeUntil(\"example.com\") = %v, want zero (no upstream was tried)", got)
 	}
 }
 
