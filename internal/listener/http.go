@@ -96,9 +96,11 @@ func NewHTTP(addr string, sb *scoreboard.Scoreboard, detector *failure.StatusDet
 // transportFor returns the Transport pinned to up, building it on first use.
 // Each Transport's DialContext is closed over the upstream's Dial method, so
 // HTTP keep-alive pools conns to the destination through the same upstream.
-// MaxIdleConnsPerHost is intentionally small: a homelab proxy serving a few
-// concurrent clients does not need the stdlib default of 2 to stretch into
-// the hundreds, and bounding it makes idle-conn churn observable.
+// MaxIdleConnsPerHost is set to 4 (slightly above stdlib's default of 2)
+// so a small burst of concurrent clients hitting the same destination
+// through this upstream can keep a handful of conns warm; MaxIdleConns is
+// capped at 100 (versus stdlib's default of unlimited) so the total idle
+// pool across destinations cannot grow without bound.
 func (h *HTTPServer) transportFor(up upstream.Upstream) *http.Transport {
 	h.transportsMu.Lock()
 	defer h.transportsMu.Unlock()
