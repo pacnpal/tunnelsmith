@@ -1,12 +1,25 @@
-# Minimal Tunnelsmith config used by deploy/docker-compose.example.yml.
-# One direct upstream; both listeners forward to it. Phase 3 will turn
-# this into a real priority pool with retries.
+# Tunnelsmith config used by deploy/docker-compose.example.yml. Two
+# upstreams demonstrate the Phase 3 retry path:
+#
+#   "unreachable" is a SOCKS5 entry pointed at a port nothing listens on,
+#   so its dial errors out immediately. It sits at the lowest priority
+#   value (10), which means the pool tries it first.
+#
+#   "direct" is the host's default route at priority 20. The pool falls
+#   back to it after the unreachable upstream fails. CI's curl checks
+#   succeed only if the fallback path works.
 
 [listener]
 http  = ":8080"
 socks = ":1080"
 
 [[upstream]]
+id       = "unreachable"
+kind     = "socks5"
+addr     = "127.0.0.1:1"
+priority = 10
+
+[[upstream]]
 id       = "direct"
 kind     = "direct"
-priority = 10
+priority = 20

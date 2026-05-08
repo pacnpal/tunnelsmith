@@ -1,6 +1,9 @@
-# Minimal Tunnelsmith stack with a single direct upstream. Useful for
-# local sanity checking and as the starting point CI uses to exercise
-# the listeners.
+# Minimal Tunnelsmith stack used by CI to exercise the priority pool.
+# The mounted config has two upstreams: an unreachable SOCKS5 entry at
+# priority 10 (always refuses) and "direct" at priority 20. Every curl
+# below succeeds only because the pool retries through "direct" after
+# the first upstream fails, so a green CI run is end-to-end proof of
+# the Phase 3 retry path.
 #
 # Bring it up (in CI; do not run on a developer host per ADR-001):
 #   docker compose -f deploy/docker-compose.example.yml up -d
@@ -10,9 +13,6 @@
 #
 # Or through SOCKS5:
 #   curl --socks5-hostname localhost:1080 https://example.com
-#
-# Both should return the upstream content unchanged. The listeners
-# route through "direct", which uses the host's default route.
 
 services:
   tunnelsmith:

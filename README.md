@@ -14,7 +14,7 @@ This is the gap between HAProxy (no per-host memory), Squid (static rules, no le
 
 ## Quick start
 
-The Phase 2 binary boots an HTTP CONNECT plus forward proxy on `:8080` and a SOCKS5 listener on `:1080`. With the minimal `direct` upstream in [`deploy/tunnelsmith.example.toml`](deploy/tunnelsmith.example.toml), both listeners route through the host's default route. Image builds run in CI per ADR-001; locally, run the binary directly:
+The binary boots an HTTP CONNECT plus forward proxy on `:8080` and a SOCKS5 listener on `:1080`. The pool tries upstreams in priority order and retries on hard failure up to `failure.max_retries_per_request` (default 5). [`deploy/tunnelsmith.example.toml`](deploy/tunnelsmith.example.toml) ships an unreachable SOCKS5 entry first and `direct` as the fallback, so each curl below exercises the retry path. Image builds run in CI per ADR-001; locally, run the binary directly:
 
 ```sh
 make build
@@ -28,7 +28,7 @@ curl --proxy http://localhost:8080 https://example.com
 curl --socks5-hostname localhost:1080 https://example.com
 ```
 
-CI uses [`deploy/docker-compose.example.yml`](deploy/docker-compose.example.yml) to exercise the same path against the built image.
+The Tunnelsmith logs show one `upstream dial` line per attempt with `outcome=failure` for the unreachable entry and `outcome=success` for `direct`. CI uses [`deploy/docker-compose.example.yml`](deploy/docker-compose.example.yml) to exercise the same path against the built image.
 
 ## Configuration
 

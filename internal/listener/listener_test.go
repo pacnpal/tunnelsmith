@@ -21,16 +21,25 @@ import (
 	"github.com/pacnpal/tunnelsmith/internal/upstream"
 )
 
-// directUpstream returns an upstream that dials with no proxy in the way.
-// All listener tests in this file use it so the test stays focused on
-// listener behavior, not upstream-specific dial logic.
-func directUpstream(t *testing.T) upstream.Upstream {
+// directPool returns a single-upstream pool that dials directly. Most
+// listener tests use it so the test stays focused on listener behavior
+// rather than pool retry mechanics; the retry path has its own tests in
+// internal/upstream and a dedicated listener-level test below.
+func directPool(t *testing.T) *upstream.Pool {
 	t.Helper()
 	up, err := upstream.New(config.UpstreamConfig{ID: "direct", Kind: config.KindDirect}, 5*time.Second)
 	if err != nil {
 		t.Fatalf("build direct upstream: %v", err)
 	}
-	return up
+	pool, err := upstream.NewPool(
+		[]upstream.PoolEntry{{Up: up, Priority: 10}},
+		5,
+		quietLogger(),
+	)
+	if err != nil {
+		t.Fatalf("build pool: %v", err)
+	}
+	return pool
 }
 
 // quietLogger discards log output so tests do not spam stderr. Tests check
@@ -44,7 +53,7 @@ func quietLogger() *slog.Logger {
 // shutdown completes.
 func startHTTPListener(t *testing.T) (*listener.HTTPServer, *url.URL) {
 	t.Helper()
-	srv := listener.NewHTTP("127.0.0.1:0", directUpstream(t), quietLogger())
+	srv := listener.NewHTTP("127.0.0.1:0", directPool(t), quietLogger())
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(context.Background()) }()
@@ -80,7 +89,7 @@ func startHTTPListener(t *testing.T) (*listener.HTTPServer, *url.URL) {
 // startSOCKSListener mirrors startHTTPListener for the SOCKS5 path.
 func startSOCKSListener(t *testing.T) *listener.SOCKSServer {
 	t.Helper()
-	srv, err := listener.NewSOCKS("127.0.0.1:0", directUpstream(t), quietLogger())
+	srv, err := listener.NewSOCKS("127.0.0.1:0", directPool(t), quietLogger())
 	if err != nil {
 		t.Fatalf("build socks listener: %v", err)
 	}
@@ -110,6 +119,155 @@ func startSOCKSListener(t *testing.T) *listener.SOCKSServer {
 		}
 	})
 	return srv
+}
+
+// poolWithUnreachableThenDirect builds a two-entry pool whose first entry is
+// a SOCKS5 upstream pointed at a closed local port (so its dial errors
+// immediately) and whose second entry is direct. Used to confirm the
+// listener composes with the pool's retry behavior.
+func poolWithUnreachableThenDirect(t *testing.T) *upstream.Pool {
+	t.Helper()
+
+	closed, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen closed: %v", err)
+	}
+	closedAddr := closed.Addr().String()
+	_ = closed.Close()
+
+	bad, err := upstream.New(
+		config.UpstreamConfig{ID: "socks-bad", Kind: config.KindSOCKS5, Addr: closedAddr},
+		2*time.Second,
+	)
+	if err != nil {
+		t.Fatalf("build bad upstream: %v", err)
+	}
+	good, err := upstream.New(
+		config.UpstreamConfig{ID: "direct", Kind: config.KindDirect},
+		5*time.Second,
+	)
+	if err != nil {
+		t.Fatalf("build good upstream: %v", err)
+	}
+	pool, err := upstream.NewPool(
+		[]upstream.PoolEntry{
+			{Up: bad, Priority: 10},
+			{Up: good, Priority: 20},
+		},
+		5,
+		quietLogger(),
+	)
+	if err != nil {
+		t.Fatalf("build pool: %v", err)
+	}
+	return pool
+}
+
+// TestHTTPForwardProxyFallsBackThroughPool exercises the listener composed
+// with a pool whose first upstream refuses every dial. The listener must
+// surface a 200 because the pool's second upstream (direct) succeeds. This
+// is the listener-side counterpart to the pool-only tests in
+// internal/upstream.
+func TestHTTPForwardProxyFallsBackThroughPool(t *testing.T) {
+	t.Parallel()
+	dest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "via-fallback")
+	}))
+	t.Cleanup(dest.Close)
+
+	pool := poolWithUnreachableThenDirect(t)
+	srv := listener.NewHTTP("127.0.0.1:0", pool, quietLogger())
+
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve(context.Background()) }()
+	select {
+	case <-srv.Ready():
+	case <-time.After(2 * time.Second):
+		t.Fatal("http listener did not bind in time")
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+		<-serveErr
+	})
+
+	proxyURL := &url.URL{Scheme: "http", Host: srv.Addr().String()}
+	client := &http.Client{
+		Timeout:   5 * time.Second,
+		Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)},
+	}
+	t.Cleanup(client.CloseIdleConnections)
+
+	resp, err := client.Get(dest.URL)
+	if err != nil {
+		t.Fatalf("client.Get via fallback: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "via-fallback" {
+		t.Fatalf("body = %q, want %q", string(body), "via-fallback")
+	}
+}
+
+// TestSOCKS5FallsBackThroughPool is the SOCKS5 mirror of the HTTP test
+// above. The library does not surface upstream-id metadata, so the test
+// only asserts the request succeeds via the second pool entry.
+func TestSOCKS5FallsBackThroughPool(t *testing.T) {
+	t.Parallel()
+	dest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "socks-via-fallback")
+	}))
+	t.Cleanup(dest.Close)
+
+	pool := poolWithUnreachableThenDirect(t)
+	srv, err := listener.NewSOCKS("127.0.0.1:0", pool, quietLogger())
+	if err != nil {
+		t.Fatalf("build socks listener: %v", err)
+	}
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve(context.Background()) }()
+	select {
+	case <-srv.Ready():
+	case <-time.After(2 * time.Second):
+		t.Fatal("socks listener did not bind in time")
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+		<-serveErr
+	})
+
+	dialer, err := proxy.SOCKS5("tcp", srv.Addr().String(), nil, &net.Dialer{Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("build SOCKS5 client dialer: %v", err)
+	}
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return dialer.Dial(network, addr)
+			},
+		},
+	}
+	t.Cleanup(client.CloseIdleConnections)
+
+	resp, err := client.Get(dest.URL)
+	if err != nil {
+		t.Fatalf("client.Get via SOCKS5 fallback: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "socks-via-fallback" {
+		t.Fatalf("body = %q, want %q", string(body), "socks-via-fallback")
+	}
 }
 
 func TestHTTPForwardProxy(t *testing.T) {
@@ -243,7 +401,7 @@ func TestHTTPConnectShutdownDrains(t *testing.T) {
 		}
 	}()
 
-	srv := listener.NewHTTP("127.0.0.1:0", directUpstream(t), quietLogger())
+	srv := listener.NewHTTP("127.0.0.1:0", directPool(t), quietLogger())
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(context.Background()) }()
 	select {

@@ -31,8 +31,16 @@ negative_ttl = "1m"
 # persist_path = "/data/tunnelsmith/decisions.db"
 
 # --------------------------------------------------------------------
-# Upstreams. At least one is required. Lower priority wins on tie.
-# Every upstream needs a unique id.
+# Upstreams. At least one is required. Every upstream needs a unique id.
+#
+# Tunnelsmith builds a priority pool from these entries and tries them
+# in ascending priority order on each request. On hard failure (refused,
+# timeout, future scoreboard signals) the next entry is tried, up to
+# failure.max_retries_per_request total attempts. Lower priority wins.
+#
+# A common minimal setup is one fast-failing entry plus "direct" as the
+# fallback, which is what deploy/tunnelsmith.example.toml uses to
+# exercise the retry path in CI.
 # --------------------------------------------------------------------
 
 # kind = "direct" sends traffic out the host's default route. No addr.
