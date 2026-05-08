@@ -84,11 +84,27 @@ type CacheConfig struct {
 
 // UpstreamConfig declares one egress option that the router can pick.
 // Addr is required for kinds http and socks5 and ignored for kind direct.
+//
+// Priority is a *int so applyDefaults can tell "field omitted in TOML" (nil,
+// gets defaulted to 100) from "user wrote priority = 0" (non-nil pointer to
+// zero, kept as-is so the user can elect 0 as the highest-priority slot).
+// After Parse, Priority is always non-nil; downstream code can dereference
+// without a nil check.
 type UpstreamConfig struct {
 	ID       string       `toml:"id"`
 	Kind     UpstreamKind `toml:"kind"`
 	Addr     string       `toml:"addr"`
-	Priority int          `toml:"priority"` // default: 100
+	Priority *int         `toml:"priority,omitempty"` // default: 100
+}
+
+// PriorityValue returns the resolved priority. After Parse the field is
+// always populated; this helper exists for code paths that build an
+// UpstreamConfig by hand without going through Parse.
+func (u UpstreamConfig) PriorityValue() int {
+	if u.Priority == nil {
+		return 100
+	}
+	return *u.Priority
 }
 
 // StatusRule says how a single HTTP status code maps to a failure-detection
@@ -101,11 +117,14 @@ type StatusRule struct {
 	HonorRetryAfter bool     `toml:"honor_retry_after"` // default: false
 }
 
-// FailureConfig collects the user's failure-detection preferences.
+// FailureConfig collects the user's failure-detection preferences. Bool and
+// numeric fields are defaulted via toml.MetaData.IsDefined rather than
+// "value == zero", so a user-provided 0 reaches Validate (and rightly fails)
+// instead of being silently replaced by the default.
 type FailureConfig struct {
 	ConnectionRefused    bool         `toml:"connection_refused"`      // default: true (always on for Phase 1; opt-out lands in Phase 5)
 	TimeoutMS            int          `toml:"timeout_ms"`              // default: 8000
-	BodyRegex            []string     `toml:"body_regex"`              // default: nil
+	BodyRegex            []string     `toml:"body_regex"`              // default: []
 	MaxRetriesPerRequest int          `toml:"max_retries_per_request"` // default: 5
 	Status               []StatusRule `toml:"status"`                  // default: see DefaultStatusRules
 }
@@ -147,41 +166,49 @@ func Parse(data []byte, sourceLabel string) (*Config, error) {
 	for _, key := range md.Undecoded() {
 		cfg.UnknownKeys = append(cfg.UnknownKeys, key.String())
 	}
-	cfg.applyDefaults()
+	cfg.applyDefaults(md)
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("validate %s: %w", sourceLabel, err)
 	}
 	return &cfg, nil
 }
 
-func (c *Config) applyDefaults() {
-	if c.Listener.HTTP == "" {
+func (c *Config) applyDefaults(md toml.MetaData) {
+	if !md.IsDefined("listener", "http") {
 		c.Listener.HTTP = ":8080"
 	}
-	if c.Listener.SOCKS == "" {
+	if !md.IsDefined("listener", "socks") {
 		c.Listener.SOCKS = ":1080"
 	}
-	if c.Cache.TTL == 0 {
+	if !md.IsDefined("cache", "ttl") {
 		c.Cache.TTL = Duration(15 * time.Minute)
 	}
-	if c.Cache.NegativeTTL == 0 {
+	if !md.IsDefined("cache", "negative_ttl") {
 		c.Cache.NegativeTTL = Duration(time.Minute)
 	}
-	if c.Failure.TimeoutMS == 0 {
+	if !md.IsDefined("failure", "timeout_ms") {
 		c.Failure.TimeoutMS = 8000
 	}
-	if c.Failure.MaxRetriesPerRequest == 0 {
+	if !md.IsDefined("failure", "max_retries_per_request") {
 		c.Failure.MaxRetriesPerRequest = 5
 	}
-	// Connection-refused detection is always on for Phase 1. Phase 5
-	// will introduce an opt-out path if a real use case shows up.
-	c.Failure.ConnectionRefused = true
-	if len(c.Failure.Status) == 0 {
+	if !md.IsDefined("failure", "connection_refused") {
+		c.Failure.ConnectionRefused = true
+	}
+	if !md.IsDefined("failure", "body_regex") {
+		c.Failure.BodyRegex = []string{}
+	}
+	if !md.IsDefined("failure", "status") {
 		c.Failure.Status = append([]StatusRule(nil), DefaultStatusRules...)
 	}
+	// IsDefined cannot single out individual array-of-tables entries, so
+	// per-upstream priority uses a *int sentinel: nil means the user
+	// omitted priority for this entry; non-nil (including 0) is verbatim
+	// from the TOML.
 	for i := range c.Upstreams {
-		if c.Upstreams[i].Priority == 0 {
-			c.Upstreams[i].Priority = 100
+		if c.Upstreams[i].Priority == nil {
+			v := 100
+			c.Upstreams[i].Priority = &v
 		}
 	}
 }

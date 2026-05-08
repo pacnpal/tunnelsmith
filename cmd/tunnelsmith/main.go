@@ -99,7 +99,7 @@ func run(args []string, stdout, stderr *os.File) error {
 		if err != nil {
 			return fmt.Errorf("build upstream %q: %w", uc.ID, err)
 		}
-		entries = append(entries, upstream.PoolEntry{Up: up, Priority: uc.Priority})
+		entries = append(entries, upstream.PoolEntry{Up: up, Priority: uc.PriorityValue()})
 	}
 	pool, err := upstream.NewPool(entries, cfg.Failure.MaxRetriesPerRequest, logger)
 	if err != nil {
