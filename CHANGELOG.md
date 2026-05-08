@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Bumped `golang.org/x/net` from v0.35.0 to v0.38.0 to absorb the fixes for GHSA-qxp5-gwg8-xv66 (HTTP proxy bypass via IPv6 Zone IDs, directly relevant) and GHSA-vvgc-356p-c3xw (XSS in `html`). Project `go` directive moves from `1.22` to `1.23.0` as a knock-on; CI and Dockerfile follow. See ADR-002 for the rationale.
+
 ### Added (Phase 3)
 
 - `internal/upstream` package: `Pool` type with priority-ordered fallback and a per-request retry cap. `NewPool` validates inputs and stably sorts entries by `Priority`; `DialFor(ctx, network, addr)` walks the list, returns the first conn that opens, and on full failure surfaces `errors.Join` of every per-attempt error with each upstream id prefixed.
