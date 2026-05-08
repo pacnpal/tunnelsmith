@@ -87,9 +87,10 @@ func proxyClient(t *testing.T, proxyURL *url.URL) *http.Client {
 // TestForwardCyclesThroughUpstreamsOn429 covers the headline Phase 5
 // scenario: three upstreams each return 429 once and then succeed. The
 // listener must cycle through them and surface a 200 to the client. The
-// destination's hit count proves only one attempt landed: the in-flight
-// request rotated through 429-tagged upstreams to a fresh one, not that the
-// request was retried against the same destination.
+// destination's hit count of exactly 3 proves the listener rotated
+// through all three upstreams (one request per upstream) within a single
+// in-flight client request rather than retrying through the same upstream
+// or stopping early.
 //
 // The pool is built from three direct upstreams; the destination handler
 // returns 429 for the first two requests (one per upstream) and 200 on the

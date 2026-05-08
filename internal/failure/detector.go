@@ -93,11 +93,14 @@ func (d *StatusDetector) WithClock(now func() time.Time) *StatusDetector {
 }
 
 // Detect reports whether a response with the given status code and headers
-// should be treated as an upstream failure. ok is false for any code without
-// a configured rule (including all 2xx responses, all 5xx responses, and
-// 4xx codes outside the statusKinds set). When ok is true, the returned
-// Detection.Kind names the failure shape; RetryAfter is non-zero only when
-// the rule allows honoring it and the Retry-After header parsed cleanly.
+// should be treated as an upstream failure. ok is false for any code
+// without a configured rule (including all 2xx responses, all 5xx
+// responses, and 4xx codes outside the statusKinds set). When ok is true,
+// the returned Detection.Kind names the failure shape;
+// Detection.CooldownOverride is non-nil only when the matching rule honors
+// Retry-After and the response carried a parsable value (including the
+// legitimate "Retry-After: 0" case). When nil, the scoreboard falls back
+// to the kind's configured default cooldown.
 func (d *StatusDetector) Detect(status int, header http.Header) (Detection, bool) {
 	if d == nil {
 		return Detection{}, false
