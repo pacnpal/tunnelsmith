@@ -115,6 +115,12 @@ func (h *HTTPServer) transportFor(up upstream.Upstream) *http.Transport {
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
+		// Forward proxies must not auto-add Accept-Encoding and silently
+		// decompress: net/http would strip Content-Encoding and
+		// Content-Length on the way back, breaking byte-for-byte
+		// transparency. With DisableCompression true, the destination's
+		// encoded body and headers reach the client untouched.
+		DisableCompression: true,
 	}
 	h.transports[up.ID()] = t
 	return t
@@ -384,7 +390,25 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 				)
 				return
 			}
-			kind := failure.ClassifyDialError(rtErr)
+			// RoundTrip errors come in two flavors:
+			//   1. dial-level (refused, timeout) - the upstream could not
+			//      open a TCP/TLS path to the destination.
+			//   2. post-dial (TLS verification, HTTP parse, server hung up
+			//      mid-response, etc.) - the upstream connected fine but
+			//      something past the dial layer failed.
+			// Only the first kind is fairly attributed to the upstream.
+			// Recording the second kind would penalize the upstream for
+			// problems that may belong to the destination, so we narrow
+			// to explicit timeout / refused matches and skip RecordFailure
+			// for everything else. The request still rotates to the next
+			// upstream because tried[] gets the id either way.
+			var kind failure.Kind
+			switch {
+			case failure.IsTimeout(rtErr):
+				kind = failure.KindTimeout
+			case failure.IsConnectionRefused(rtErr):
+				kind = failure.KindRefused
+			}
 			if kind != "" {
 				h.sb.RecordFailure(host, up.ID(), kind, nil)
 			}

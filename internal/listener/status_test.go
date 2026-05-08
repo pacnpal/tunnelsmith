@@ -3,6 +3,7 @@ package listener_test
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"io"
 	"net"
@@ -704,6 +705,136 @@ func TestForwardRejectsUnsupportedScheme(t *testing.T) {
 	// Cascade must NOT trip: the listener rejected before any dial fired.
 	if got := sb.CascadeUntil("example.com"); !got.IsZero() {
 		t.Errorf("CascadeUntil(example.com) = %v, want zero (no upstream was tried)", got)
+	}
+}
+
+// TestForwardPassesGzippedBodyThrough covers Copilot's review on PR #13:
+// the per-upstream Transport must not auto-add Accept-Encoding and
+// silently decompress, because that would strip Content-Encoding and
+// Content-Length on the way back to the client and break byte-for-byte
+// proxy transparency. The destination here serves a gzipped body with
+// the matching Content-Encoding header; the client must see the encoded
+// bytes and the header verbatim.
+//
+// Both the test client and the proxy must keep DisableCompression=true.
+// Without it on either side, net/http would auto-add Accept-Encoding to
+// the outgoing request and transparently decompress the response,
+// hiding whether the proxy itself was preserving the encoding.
+func TestForwardPassesGzippedBodyThrough(t *testing.T) {
+	t.Parallel()
+
+	var encoded bytes.Buffer
+	gz := gzip.NewWriter(&encoded)
+	if _, err := gz.Write([]byte("compressed payload")); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	gzippedBody := encoded.Bytes()
+
+	dest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("Content-Length", strconv.Itoa(len(gzippedBody)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(gzippedBody)
+	}))
+	t.Cleanup(dest.Close)
+
+	pool := directPoolWith(t, "a")
+	sb := scoreboardFor(t, pool)
+	_, proxyURL := startForwardListener(t, sb, failure.NewStatusDetector(config.DefaultStatusRules), 5)
+
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			Proxy:              http.ProxyURL(proxyURL),
+			DisableKeepAlives:  true,
+			DisableCompression: true,
+		},
+	}
+	t.Cleanup(client.CloseIdleConnections)
+
+	req, err := http.NewRequest(http.MethodGet, dest.URL, nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("client.Do: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Content-Encoding"); got != "gzip" {
+		t.Errorf("Content-Encoding = %q, want %q (proxy stripped or rewrote it)", got, "gzip")
+	}
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if !bytes.Equal(got, gzippedBody) {
+		t.Fatalf("body bytes differ: len(got)=%d len(want)=%d (proxy decompressed transparently)",
+			len(got), len(gzippedBody))
+	}
+}
+
+// TestForwardNonDialRoundTripErrorSkipsPenalty covers Copilot's review on
+// PR #13: a RoundTrip error that is neither a timeout nor a refusal should
+// not be classified as a dial-level failure. Recording such an error as
+// KindRefused would unfairly penalize the upstream for problems that may
+// belong to the destination (TLS misconfiguration, HTTP parse errors,
+// server hangup mid-response, ...). The listener still rotates to the
+// next upstream, but the scoreboard does not blame the upstream.
+//
+// Stand-in here: a destination that accepts the TCP conn and immediately
+// closes it. The proxy's RoundTrip writes the request and reads EOF on
+// the response, which neither IsTimeout nor IsConnectionRefused matches.
+func TestForwardNonDialRoundTripErrorSkipsPenalty(t *testing.T) {
+	t.Parallel()
+	dest, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen dest: %v", err)
+	}
+	t.Cleanup(func() { _ = dest.Close() })
+	go func() {
+		for {
+			c, err := dest.Accept()
+			if err != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
+
+	pool := directPoolWith(t, "a")
+	sb := scoreboardFor(t, pool)
+	_, proxyURL := startForwardListener(t, sb, failure.NewStatusDetector(config.DefaultStatusRules), 2)
+	client := proxyClient(t, proxyURL)
+
+	destURL := &url.URL{Scheme: "http", Host: dest.Addr().String()}
+	resp, err := client.Get(destURL.String())
+	if err == nil {
+		_ = resp.Body.Close()
+		// Acceptable shape too: 502 from the listener's exhaustion path.
+		if resp.StatusCode != http.StatusBadGateway {
+			t.Fatalf("status = %d, want 502 (the destination drops the conn)", resp.StatusCode)
+		}
+	}
+
+	// The actual property under test: no upstream got penalized for a
+	// non-dial RoundTrip error. Score for "a" should stay at zero.
+	host := destURL.Hostname()
+	for _, e := range sb.Snapshot() {
+		if e.Host == host && e.UpstreamID == "a" {
+			if e.Score < 0 {
+				t.Errorf("a.Score = %v, want >= 0 (non-dial RoundTrip error must not penalize upstream)", e.Score)
+			}
+			if e.GlobalFailure > 0 {
+				t.Errorf("a.GlobalFailure = %d, want 0 (no penalty event recorded)", e.GlobalFailure)
+			}
+		}
 	}
 }
 
