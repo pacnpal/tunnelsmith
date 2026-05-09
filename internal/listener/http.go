@@ -25,6 +25,14 @@ import (
 	"github.com/pacnpal/tunnelsmith/internal/upstream"
 )
 
+// MetricsSink is the listener-side metrics surface. metrics.Registry
+// implements it; pass nil to disable emission.
+type MetricsSink interface {
+	ObserveDial(upstreamID, outcome string, latency time.Duration)
+	ObserveStatusFailure(upstreamID, code string)
+	ObserveRequestOutcome(outcome string)
+}
+
 // HTTPServer accepts HTTP CONNECT and plain-HTTP forward-proxy traffic.
 type HTTPServer struct {
 	addr     string
@@ -32,6 +40,7 @@ type HTTPServer struct {
 	detector *failure.StatusDetector
 	retryCap int
 	logger   *slog.Logger
+	metrics  MetricsSink
 
 	server *http.Server
 
@@ -57,6 +66,16 @@ type HTTPServer struct {
 	tunnels   map[*tunnel]struct{}
 }
 
+// HTTPOption customizes an HTTPServer at construction.
+type HTTPOption func(*HTTPServer)
+
+// WithHTTPMetrics attaches a metrics sink. Pass nil to disable emission.
+func WithHTTPMetrics(m MetricsSink) HTTPOption {
+	return func(h *HTTPServer) {
+		h.metrics = m
+	}
+}
+
 // NewHTTP builds an HTTP listener that routes everything through sb. The
 // scoreboard must be non-nil; passing nil returns a clear error so callers
 // see the contract violation at construction time instead of a nil-deref
@@ -65,7 +84,7 @@ type HTTPServer struct {
 // must be at least 1 and bounds the per-request attempts on the plain-HTTP
 // forward path; the value mirrors failure.max_retries_per_request from
 // config so dial retries and status retries share the same budget.
-func NewHTTP(addr string, sb *scoreboard.Scoreboard, detector *failure.StatusDetector, retryCap int, logger *slog.Logger) (*HTTPServer, error) {
+func NewHTTP(addr string, sb *scoreboard.Scoreboard, detector *failure.StatusDetector, retryCap int, logger *slog.Logger, opts ...HTTPOption) (*HTTPServer, error) {
 	if sb == nil {
 		return nil, errors.New("listener.NewHTTP: scoreboard is nil")
 	}
@@ -84,6 +103,9 @@ func NewHTTP(addr string, sb *scoreboard.Scoreboard, detector *failure.StatusDet
 		ready:      make(chan struct{}),
 		tunnels:    make(map[*tunnel]struct{}),
 		transports: make(map[string]*http.Transport),
+	}
+	for _, opt := range opts {
+		opt(h)
 	}
 	h.server = &http.Server{
 		Addr:              addr,
@@ -239,6 +261,7 @@ func (h *HTTPServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		h.logger.Warn("connect dial failed", "host", host, "err", err)
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		h.observeOutcome(connectOutcome(err))
 		return
 	}
 
@@ -282,6 +305,7 @@ func (h *HTTPServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 		"upstream_id", upID,
 		"latency_ms", time.Since(start).Milliseconds(),
 	)
+	h.observeOutcome("success")
 }
 
 // handleForward serves the plain-HTTP forward-proxy path. Each request runs
@@ -423,6 +447,7 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 			if kind != "" {
 				h.sb.RecordFailure(host, up.ID(), kind, nil)
 			}
+			h.observeForwardDial(up.ID(), forwardDialOutcome(kind), latency)
 			tried[up.ID()] = true
 			retries++
 			h.logger.Warn("forward attempt failed",
@@ -439,6 +464,7 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 		det, isFail := h.detector.Detect(resp.StatusCode, resp.Header)
 		if isFail {
 			h.sb.RecordFailure(host, up.ID(), det.Kind, det.CooldownOverride)
+			h.observeStatusFailure(up.ID(), resp.StatusCode)
 			drainAndClose(resp.Body)
 			tried[up.ID()] = true
 			retries++
@@ -459,6 +485,7 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 		}
 
 		h.sb.RecordSuccess(host, up.ID(), latency)
+		h.observeForwardDial(up.ID(), "success", latency)
 		h.writeForwardSuccess(w, resp, up.ID(), retries)
 		h.logger.Info("forward done",
 			"url", r.URL.String(),
@@ -468,6 +495,7 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 			"retries", retries,
 			"latency_ms", time.Since(start).Milliseconds(),
 		)
+		h.observeOutcome("success")
 		return
 	}
 
@@ -486,6 +514,25 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 		"retries", retries,
 		"latency_ms", time.Since(start).Milliseconds(),
 	)
+	if cascadeAlready {
+		h.observeOutcome("cascade")
+	} else {
+		h.observeOutcome("exhausted")
+	}
+}
+
+// forwardDialOutcome maps a classified RoundTrip dial error to the metrics
+// outcome label. Empty kind (post-dial failure we cannot fairly attribute)
+// becomes "other" so it stays counted but distinct from refused/timeout.
+func forwardDialOutcome(kind failure.Kind) string {
+	switch kind {
+	case failure.KindRefused:
+		return "refused"
+	case failure.KindTimeout:
+		return "timeout"
+	default:
+		return "other"
+	}
 }
 
 // newOutReq clones r for an outbound attempt. RequestURI is cleared, hop
@@ -552,6 +599,44 @@ func (h *HTTPServer) writeForwardSuccess(w http.ResponseWriter, resp *http.Respo
 	if _, err := io.Copy(w, resp.Body); err != nil {
 		h.logger.Warn("forward copy failed", "upstream_id", upID, "err", err)
 	}
+}
+
+// observeOutcome records the terminal outcome of one client request when a
+// metrics sink is attached. Outcomes match metrics package constants:
+// "success" / "cascade" / "exhausted".
+func (h *HTTPServer) observeOutcome(outcome string) {
+	if h.metrics == nil {
+		return
+	}
+	h.metrics.ObserveRequestOutcome(outcome)
+}
+
+// observeStatusFailure records a per-(upstream, status) counter for a
+// listener-detected failure response.
+func (h *HTTPServer) observeStatusFailure(upstreamID string, code int) {
+	if h.metrics == nil {
+		return
+	}
+	h.metrics.ObserveStatusFailure(upstreamID, strconv.Itoa(code))
+}
+
+// observeForwardDial records the forward path's per-attempt dial outcome.
+// outcome mirrors the scoreboard's labels ("success" / "refused" / "timeout"
+// / "other") so /metrics shows the same shape across paths.
+func (h *HTTPServer) observeForwardDial(upstreamID string, outcome string, latency time.Duration) {
+	if h.metrics == nil {
+		return
+	}
+	h.metrics.ObserveDial(upstreamID, outcome, latency)
+}
+
+// connectOutcome maps a CONNECT-side dial error to a terminal outcome label.
+// Cascade is its own outcome; everything else is "exhausted".
+func connectOutcome(err error) string {
+	if errors.Is(err, scoreboard.ErrCascadeCooling) {
+		return "cascade"
+	}
+	return "exhausted"
 }
 
 // stripTunnelsmithHeaders removes any X-Tunnelsmith-* headers from h.

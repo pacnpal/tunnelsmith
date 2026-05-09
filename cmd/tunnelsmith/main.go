@@ -22,6 +22,7 @@ import (
 	"github.com/pacnpal/tunnelsmith/internal/config"
 	"github.com/pacnpal/tunnelsmith/internal/failure"
 	"github.com/pacnpal/tunnelsmith/internal/listener"
+	"github.com/pacnpal/tunnelsmith/internal/metrics"
 	"github.com/pacnpal/tunnelsmith/internal/scoreboard"
 	"github.com/pacnpal/tunnelsmith/internal/upstream"
 	"github.com/pacnpal/tunnelsmith/internal/upstream/mullvad"
@@ -135,8 +136,12 @@ func run(args []string, stdout, stderr *os.File) error {
 		"dial_timeout_ms", cfg.Failure.TimeoutMS,
 	)
 
+	metricsRegistry := metrics.New()
+	metricsRegistry.SetUpstreamPoolSize(pool.Len())
+
 	sb, err := scoreboard.New(pool, scoreboard.FromConfig(cfg.Failure.Scoring, cfg.Failure.Status),
 		scoreboard.WithLogger(logger),
+		scoreboard.WithMetrics(metricsRegistry),
 	)
 	if err != nil {
 		return fmt.Errorf("build scoreboard: %w", err)
@@ -152,18 +157,29 @@ func run(args []string, stdout, stderr *os.File) error {
 	defer sb.Stop()
 
 	detector := failure.NewStatusDetector(cfg.Failure.Status)
-	httpSrv, err := listener.NewHTTP(cfg.Listener.HTTP, sb, detector, cfg.Failure.MaxRetriesPerRequest, logger)
+	httpSrv, err := listener.NewHTTP(cfg.Listener.HTTP, sb, detector, cfg.Failure.MaxRetriesPerRequest, logger,
+		listener.WithHTTPMetrics(metricsRegistry),
+	)
 	if err != nil {
 		return fmt.Errorf("build http listener: %w", err)
 	}
-	socksSrv, err := listener.NewSOCKS(cfg.Listener.SOCKS, sb, logger)
+	socksSrv, err := listener.NewSOCKS(cfg.Listener.SOCKS, sb, logger,
+		listener.WithSOCKSMetrics(metricsRegistry),
+	)
 	if err != nil {
 		return fmt.Errorf("build socks listener: %w", err)
+	}
+	var metricsSrv *metrics.Server
+	if cfg.Metrics.Bind != "" {
+		metricsSrv = metrics.NewServer(cfg.Metrics.Bind, metricsRegistry, logger)
 	}
 
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error { return httpSrv.Serve(gctx) })
 	g.Go(func() error { return socksSrv.Serve(gctx) })
+	if metricsSrv != nil {
+		g.Go(func() error { return metricsSrv.Serve(gctx) })
+	}
 	for _, run := range expanders {
 		run := run
 		g.Go(func() error { return run(gctx) })
@@ -181,6 +197,11 @@ func run(args []string, stdout, stderr *os.File) error {
 	}
 	if err := socksSrv.Shutdown(shutdownCtx); err != nil {
 		logger.Warn("socks shutdown error", "err", err)
+	}
+	if metricsSrv != nil {
+		if err := metricsSrv.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("metrics shutdown error", "err", err)
+		}
 	}
 
 	if err := g.Wait(); err != nil && !errors.Is(err, context.Canceled) {

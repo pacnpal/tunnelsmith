@@ -26,6 +26,16 @@ import (
 	"github.com/pacnpal/tunnelsmith/internal/upstream"
 )
 
+// MetricsSink names the methods the scoreboard calls when it wants to
+// record an observation. metrics.Registry implements this interface; pass
+// nil to disable metric emission. Every call site checks for nil before
+// dispatching, so the scoreboard is usable without a registry attached.
+type MetricsSink interface {
+	ObserveDial(upstreamID, outcome string, latency time.Duration)
+	ObserveCascadeTrip()
+	ObserveProbePick()
+}
+
 // Policy is the per-Kind tuple of penalty (a positive number subtracted from
 // the relevant entry's score) and cooldown (how long the affected
 // (host, upstream) pair sits out of the rotation).
@@ -180,6 +190,11 @@ type Scoreboard struct {
 	decayMu     sync.Mutex
 	decayCancel context.CancelFunc
 	decayDone   chan struct{}
+
+	// metrics is the optional sink for Prometheus emission. Nil means
+	// metrics are disabled; every call site uses recordMetric helpers
+	// that no-op on nil.
+	metrics MetricsSink
 }
 
 // entry is per-(host, upstream) state. Field comments name the invariants;
@@ -240,6 +255,14 @@ func WithRand(r *rand.Rand) Option {
 		if r != nil {
 			s.rand = r
 		}
+	}
+}
+
+// WithMetrics attaches a metrics sink. Pass nil to disable metric emission;
+// the scoreboard never deferences a nil sink.
+func WithMetrics(m MetricsSink) Option {
+	return func(s *Scoreboard) {
+		s.metrics = m
 	}
 }
 
@@ -459,6 +482,9 @@ func (s *Scoreboard) Pick(host string, tried map[string]bool) (upstream.Upstream
 	// to recover. Skip when there is only one eligible.
 	if len(eligible) > 1 && s.cfg.ProbeChance > 0 && s.probeRoll() {
 		idx := s.probePick(len(eligible) - 1)
+		if s.metrics != nil {
+			s.metrics.ObserveProbePick()
+		}
 		return eligible[1+idx].up, nil
 	}
 
@@ -636,6 +662,7 @@ func (s *Scoreboard) DialFor(ctx context.Context, network, addr string) (net.Con
 		attempts++
 		if dialErr == nil {
 			s.RecordSuccess(host, up.ID(), latency)
+			s.observeDialMetric(up.ID(), "", latency)
 			s.logger.Info("upstream dial",
 				"upstream_id", up.ID(),
 				"host", host,
@@ -663,6 +690,7 @@ func (s *Scoreboard) DialFor(ctx context.Context, network, addr string) (net.Con
 		if kind != "" {
 			s.RecordFailure(host, up.ID(), kind, nil)
 		}
+		s.observeDialMetric(up.ID(), kind, latency)
 		s.logger.Warn("upstream dial",
 			"upstream_id", up.ID(),
 			"host", host,
@@ -704,6 +732,27 @@ func (s *Scoreboard) Snapshot() []EntrySnapshot {
 		}
 	}
 	return out
+}
+
+// observeDialMetric translates a (host, upstream, kind) outcome into the
+// label values metrics.Registry expects. An empty kind means success;
+// known dial-failure kinds map to refused / timeout / other.
+func (s *Scoreboard) observeDialMetric(upstreamID string, kind failure.Kind, latency time.Duration) {
+	if s.metrics == nil {
+		return
+	}
+	var outcome string
+	switch kind {
+	case "":
+		outcome = "success"
+	case failure.KindRefused:
+		outcome = "refused"
+	case failure.KindTimeout:
+		outcome = "timeout"
+	default:
+		outcome = "other"
+	}
+	s.metrics.ObserveDial(upstreamID, outcome, latency)
 }
 
 // hostOnly returns the host portion of a host:port pair. Mirrors the helper

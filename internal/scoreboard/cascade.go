@@ -42,6 +42,9 @@ func (s *Scoreboard) TripCascade(host string) {
 	s.mu.Lock()
 	s.cascade[host] = until
 	s.mu.Unlock()
+	if s.metrics != nil {
+		s.metrics.ObserveCascadeTrip()
+	}
 	s.logger.Warn("cascade tripped",
 		"host", host,
 		"ttl_ms", s.cfg.CascadeTTL.Milliseconds(),
