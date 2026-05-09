@@ -21,9 +21,10 @@ import (
 // retries on hard failure up to the configured cap, and surfaces an
 // aggregated error to the SOCKS5 library when nothing succeeds.
 type SOCKSServer struct {
-	addr   string
-	sb     *scoreboard.Scoreboard
-	logger *slog.Logger
+	addr    string
+	sb      *scoreboard.Scoreboard
+	logger  *slog.Logger
+	metrics MetricsSink
 
 	server *socks5.Server
 
@@ -45,10 +46,20 @@ type SOCKSServer struct {
 	conns   map[net.Conn]struct{}
 }
 
+// SOCKSOption customizes a SOCKSServer at construction.
+type SOCKSOption func(*SOCKSServer)
+
+// WithSOCKSMetrics attaches a metrics sink. Pass nil to disable emission.
+func WithSOCKSMetrics(m MetricsSink) SOCKSOption {
+	return func(s *SOCKSServer) {
+		s.metrics = m
+	}
+}
+
 // NewSOCKS builds a SOCKS5 listener that dials through sb. The scoreboard
 // must be non-nil; passing nil returns a clear error rather than letting
 // the socks5 dial callback nil-deref on the first conn.
-func NewSOCKS(addr string, sb *scoreboard.Scoreboard, logger *slog.Logger) (*SOCKSServer, error) {
+func NewSOCKS(addr string, sb *scoreboard.Scoreboard, logger *slog.Logger, opts ...SOCKSOption) (*SOCKSServer, error) {
 	if sb == nil {
 		return nil, errors.New("listener.NewSOCKS: scoreboard is nil")
 	}
@@ -62,6 +73,9 @@ func NewSOCKS(addr string, sb *scoreboard.Scoreboard, logger *slog.Logger) (*SOC
 		ready:  make(chan struct{}),
 		conns:  make(map[net.Conn]struct{}),
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
 	srv, err := socks5.New(&socks5.Config{
 		// armon/go-socks5 logs to stdout by default. Route into a discard
 		// log.Logger so its output does not pollute Tunnelsmith's slog
@@ -69,8 +83,17 @@ func NewSOCKS(addr string, sb *scoreboard.Scoreboard, logger *slog.Logger) (*SOC
 		// value, which we log via slog below.
 		Logger: log.New(io.Discard, "", 0),
 		Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			conn, _, err := sb.DialFor(ctx, network, addr)
-			return conn, err
+			conn, _, dialErr := sb.DialFor(ctx, network, addr)
+			if s.metrics != nil {
+				if dialErr == nil {
+					s.metrics.ObserveRequestOutcome("success")
+				} else if errors.Is(dialErr, scoreboard.ErrCascadeCooling) {
+					s.metrics.ObserveRequestOutcome("cascade")
+				} else {
+					s.metrics.ObserveRequestOutcome("exhausted")
+				}
+			}
+			return conn, dialErr
 		},
 	})
 	if err != nil {

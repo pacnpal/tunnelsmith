@@ -35,16 +35,24 @@ func (s *Scoreboard) cascadeActive(host string, now time.Time) bool {
 // cascade after exhausting every upstream for one request. DialFor calls
 // it on the dial-only path; both call sites converge on the same state.
 func (s *Scoreboard) TripCascade(host string) {
-	if s.cfg.CascadeTTL <= 0 {
+	// Read CascadeTTL under the same lock that protects s.cfg from
+	// Reload so the field cannot tear; copy the value and any reads we
+	// need after the lock release out of the locked section.
+	s.mu.Lock()
+	ttl := s.cfg.CascadeTTL
+	if ttl <= 0 {
+		s.mu.Unlock()
 		return
 	}
-	until := s.clock().Add(s.cfg.CascadeTTL)
-	s.mu.Lock()
+	until := s.clock().Add(ttl)
 	s.cascade[host] = until
 	s.mu.Unlock()
+	if s.metrics != nil {
+		s.metrics.ObserveCascadeTrip()
+	}
 	s.logger.Warn("cascade tripped",
 		"host", host,
-		"ttl_ms", s.cfg.CascadeTTL.Milliseconds(),
+		"ttl_ms", ttl.Milliseconds(),
 	)
 }
 

@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 	"github.com/pacnpal/tunnelsmith/internal/config"
 	"github.com/pacnpal/tunnelsmith/internal/failure"
 	"github.com/pacnpal/tunnelsmith/internal/listener"
+	"github.com/pacnpal/tunnelsmith/internal/metrics"
 	"github.com/pacnpal/tunnelsmith/internal/scoreboard"
 	"github.com/pacnpal/tunnelsmith/internal/upstream"
 	"github.com/pacnpal/tunnelsmith/internal/upstream/mullvad"
@@ -100,6 +102,10 @@ func run(args []string, stdout, stderr *os.File) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	hupCh := make(chan os.Signal, 1)
+	signal.Notify(hupCh, syscall.SIGHUP)
+	defer signal.Stop(hupCh)
+
 	dialTimeout := time.Duration(cfg.Failure.TimeoutMS) * time.Millisecond
 	expandedPools, expanders, err := expandUpstreamPools(ctx, cfg.UpstreamPools, logger)
 	if err != nil {
@@ -135,11 +141,28 @@ func run(args []string, stdout, stderr *os.File) error {
 		"dial_timeout_ms", cfg.Failure.TimeoutMS,
 	)
 
+	metricsRegistry := metrics.New()
+	metricsRegistry.SetUpstreamPoolSize(pool.Len())
+
 	sb, err := scoreboard.New(pool, scoreboard.FromConfig(cfg.Failure.Scoring, cfg.Failure.Status),
 		scoreboard.WithLogger(logger),
+		scoreboard.WithMetrics(metricsRegistry),
 	)
 	if err != nil {
 		return fmt.Errorf("build scoreboard: %w", err)
+	}
+	if cfg.Cache.PersistPath != "" {
+		if err := sb.LoadSnapshot(cfg.Cache.PersistPath); err != nil {
+			logger.Warn("scoreboard snapshot load failed, starting from empty state",
+				"path", cfg.Cache.PersistPath,
+				"err", err,
+			)
+		} else {
+			logger.Info("scoreboard snapshot loaded",
+				"path", cfg.Cache.PersistPath,
+				"entries", sb.EntriesCount(),
+			)
+		}
 	}
 	logger.Info("scoreboard built",
 		"probe_chance", cfg.Failure.Scoring.ProbeChance,
@@ -152,18 +175,70 @@ func run(args []string, stdout, stderr *os.File) error {
 	defer sb.Stop()
 
 	detector := failure.NewStatusDetector(cfg.Failure.Status)
-	httpSrv, err := listener.NewHTTP(cfg.Listener.HTTP, sb, detector, cfg.Failure.MaxRetriesPerRequest, logger)
+	httpSrv, err := listener.NewHTTP(cfg.Listener.HTTP, sb, detector, cfg.Failure.MaxRetriesPerRequest, logger,
+		listener.WithHTTPMetrics(metricsRegistry),
+	)
 	if err != nil {
 		return fmt.Errorf("build http listener: %w", err)
 	}
-	socksSrv, err := listener.NewSOCKS(cfg.Listener.SOCKS, sb, logger)
+	socksSrv, err := listener.NewSOCKS(cfg.Listener.SOCKS, sb, logger,
+		listener.WithSOCKSMetrics(metricsRegistry),
+	)
 	if err != nil {
 		return fmt.Errorf("build socks listener: %w", err)
+	}
+	var metricsSrv *metrics.Server
+	if cfg.Metrics.Bind != "" {
+		metricsSrv = metrics.NewServer(cfg.Metrics.Bind, metricsRegistry, logger)
 	}
 
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error { return httpSrv.Serve(gctx) })
 	g.Go(func() error { return socksSrv.Serve(gctx) })
+	if metricsSrv != nil {
+		g.Go(func() error { return metricsSrv.Serve(gctx) })
+	}
+	if cfg.Cache.PersistPath != "" {
+		persistLoop := scoreboard.NewPersistenceLoop(sb, scoreboard.PersistenceConfig{
+			Path:     cfg.Cache.PersistPath,
+			Interval: cfg.Cache.PersistInterval.Duration(),
+		}, logger, metricsRegistry)
+		g.Go(func() error { return persistLoop.Run(gctx) })
+	}
+	var gaugeRefresh *scoreboardGaugeRefresher
+	if metricsSrv != nil {
+		// Refresh the scoreboard-shape gauges on every metrics scrape
+		// would be more accurate, but Prometheus client_golang does not
+		// expose a "before-collect" hook for arbitrary gauges. A light
+		// background ticker mirrors the scoreboard state into the gauge
+		// vectors at a reasonable cadence.
+		gaugeRefresh = newScoreboardGaugeRefresher(sb, metricsRegistry, pool.IDs())
+		g.Go(func() error { return gaugeRefresh.run(gctx) })
+	}
+
+	// SIGHUP hot-reload: re-read the config file, validate, then apply
+	// the subset that does not require a restart. Listener bindings,
+	// the decay interval, [[upstream_pool]] refresh interval, and the
+	// persistence path stay frozen at startup.
+	reloader := &reloader{
+		path:           *configPath,
+		logger:         logger,
+		sb:             sb,
+		httpSrv:        httpSrv,
+		registry:       metricsRegistry,
+		gauges:         gaugeRefresh,
+		runningHasPool: len(cfg.UpstreamPools) > 0,
+	}
+	g.Go(func() error {
+		for {
+			select {
+			case <-gctx.Done():
+				return nil
+			case <-hupCh:
+				reloader.reload(gctx)
+			}
+		}
+	})
 	for _, run := range expanders {
 		run := run
 		g.Go(func() error { return run(gctx) })
@@ -181,6 +256,11 @@ func run(args []string, stdout, stderr *os.File) error {
 	}
 	if err := socksSrv.Shutdown(shutdownCtx); err != nil {
 		logger.Warn("socks shutdown error", "err", err)
+	}
+	if metricsSrv != nil {
+		if err := metricsSrv.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("metrics shutdown error", "err", err)
+		}
 	}
 
 	if err := g.Wait(); err != nil && !errors.Is(err, context.Canceled) {
@@ -370,6 +450,173 @@ func diffUpstreams(prev, next []config.UpstreamConfig) (added, removed []string)
 		}
 	}
 	return added, removed
+}
+
+// reloader drives the SIGHUP hot-reload path. It re-reads the config file,
+// validates it, and applies the subset of fields the running binary can
+// change in place. Listener bindings, decay interval, persist path, and
+// the [[upstream_pool]] refresh schedule are frozen at startup.
+//
+// runningHasPool says whether the running instance was built with at
+// least one [[upstream_pool]] block. When true the reloader leaves the
+// upstream pool alone (pool expansion is restart-frozen for v1) and
+// only swaps scoring tunings, the status detector, and the retry cap;
+// the alternative would silently drop pool-expanded upstreams from the
+// live pool on every SIGHUP, which is worse than not reloading them.
+type reloader struct {
+	path           string
+	logger         *slog.Logger
+	sb             *scoreboard.Scoreboard
+	httpSrv        *listener.HTTPServer
+	registry       *metrics.Registry
+	gauges         *scoreboardGaugeRefresher
+	runningHasPool bool
+}
+
+func (r *reloader) reload(ctx context.Context) {
+	r.logger.Info("config reload requested", "path", r.path)
+	newCfg, err := config.Load(r.path)
+	if err != nil {
+		r.logger.Warn("config reload failed (keeping current config)", "err", err)
+		r.registry.ObserveConfigReload(metrics.ResultError)
+		return
+	}
+	if len(newCfg.UnknownKeys) > 0 {
+		r.logger.Warn("reloaded config has unknown keys; check for typos",
+			"path", r.path,
+			"keys", newCfg.UnknownKeys,
+		)
+	}
+
+	// Always hot-reload scoring tunings and the status detector. They
+	// are independent of the pool shape.
+	r.sb.Reload(scoreboard.FromConfig(newCfg.Failure.Scoring, newCfg.Failure.Status))
+	r.httpSrv.Reload(failure.NewStatusDetector(newCfg.Failure.Status), newCfg.Failure.MaxRetriesPerRequest)
+
+	switch {
+	case r.runningHasPool || len(newCfg.UpstreamPools) > 0:
+		// The running config or the new config carries an
+		// [[upstream_pool]] block. Pool expansion runs on its own
+		// refresh ticker per ADR-006-equivalent reasoning: rebuilding
+		// the priority pool here would either drop the pool-expanded
+		// upstreams (if we used only newCfg.Upstreams) or duplicate
+		// them (if we mixed snapshots). Skip the swap entirely and let
+		// the user restart for pool-shape changes.
+		r.logger.Warn("upstream pool not hot-reloaded; [[upstream_pool]] in play, restart to apply pool shape changes",
+			"running_has_pool", r.runningHasPool,
+			"new_has_pool", len(newCfg.UpstreamPools) > 0,
+		)
+	default:
+		if err := r.swapStaticPool(newCfg); err != nil {
+			r.logger.Warn("config reload failed (pool swap)", "err", err)
+			r.registry.ObserveConfigReload(metrics.ResultError)
+			return
+		}
+	}
+
+	r.registry.ObserveConfigReload(metrics.ResultSuccess)
+	r.logger.Info("config reloaded",
+		"path", r.path,
+		"static_upstreams", len(newCfg.Upstreams),
+		"pools", len(newCfg.UpstreamPools),
+		"retry_cap", newCfg.Failure.MaxRetriesPerRequest,
+	)
+	_ = ctx // reserved for future cancel-aware reloads
+}
+
+// swapStaticPool builds a fresh priority pool from newCfg.Upstreams and
+// installs it on the scoreboard plus drops every cached HTTP transport.
+// Cached transports pin the previous Upstream object via their
+// DialContext closure, so a same-id reload that changes addr/kind would
+// otherwise route through the stale destination; dropping the whole
+// cache is simpler than tracking per-upstream identity.
+func (r *reloader) swapStaticPool(newCfg *config.Config) error {
+	dialTimeout := time.Duration(newCfg.Failure.TimeoutMS) * time.Millisecond
+	entries := make([]upstream.PoolEntry, 0, len(newCfg.Upstreams))
+	for _, uc := range newCfg.Upstreams {
+		up, buildErr := upstream.New(uc, dialTimeout)
+		if buildErr != nil {
+			return fmt.Errorf("build upstream %q: %w", uc.ID, buildErr)
+		}
+		entries = append(entries, upstream.PoolEntry{Up: up, Priority: uc.PriorityValue()})
+	}
+	if len(entries) == 0 {
+		return errors.New("no static upstreams in reloaded config")
+	}
+	newPool, err := upstream.NewPool(entries, newCfg.Failure.MaxRetriesPerRequest, r.logger)
+	if err != nil {
+		return fmt.Errorf("build pool: %w", err)
+	}
+	if err := r.sb.ReplacePool(newPool); err != nil {
+		return fmt.Errorf("scoreboard ReplacePool: %w", err)
+	}
+
+	newIDs := newPool.IDs()
+	// Pass an empty keep set so every cached transport is dropped. The
+	// new pool's Upstream objects need their own freshly-pinned
+	// transports; a same-id transport from the old pool would still
+	// dial through the previous Upstream's closure.
+	r.httpSrv.CloseTransportsExcept(map[string]struct{}{})
+
+	if r.gauges != nil {
+		r.gauges.setPoolIDs(newIDs)
+	}
+
+	r.registry.SetUpstreamPoolSize(newPool.Len())
+	return nil
+}
+
+// scoreboardGaugeRefresher periodically copies the scoreboard's
+// shape-only state (total entries, per-upstream cooled hosts, cascade
+// active count) into the metrics registry. The refresh interval is
+// independent of the persistence loop so the metrics gauges stay
+// reasonably fresh even when persistence is disabled.
+type scoreboardGaugeRefresher struct {
+	sb       *scoreboard.Scoreboard
+	registry *metrics.Registry
+
+	mu       sync.RWMutex
+	poolIDs  []string
+	interval time.Duration
+}
+
+func newScoreboardGaugeRefresher(sb *scoreboard.Scoreboard, reg *metrics.Registry, poolIDs []string) *scoreboardGaugeRefresher {
+	return &scoreboardGaugeRefresher{sb: sb, registry: reg, poolIDs: poolIDs, interval: 5 * time.Second}
+}
+
+// setPoolIDs swaps the upstream id list the gauges reset against. Called
+// from the SIGHUP hot-reload path after the upstream pool changes so a
+// scrape after the reload reports the right set of upstream_id labels.
+func (r *scoreboardGaugeRefresher) setPoolIDs(ids []string) {
+	r.mu.Lock()
+	r.poolIDs = ids
+	r.mu.Unlock()
+}
+
+func (r *scoreboardGaugeRefresher) run(ctx context.Context) error {
+	t := time.NewTicker(r.interval)
+	defer t.Stop()
+	r.tick()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-t.C:
+			r.tick()
+		}
+	}
+}
+
+func (r *scoreboardGaugeRefresher) tick() {
+	r.mu.RLock()
+	ids := r.poolIDs
+	r.mu.RUnlock()
+	r.registry.SetScoreboardSnapshot(
+		r.sb.EntriesCount(),
+		r.sb.CooledHostsByUpstream(),
+		r.sb.CascadeActiveCount(),
+		ids,
+	)
 }
 
 // newLogger builds the structured JSON logger. Level is read from the

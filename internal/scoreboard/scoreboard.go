@@ -26,6 +26,16 @@ import (
 	"github.com/pacnpal/tunnelsmith/internal/upstream"
 )
 
+// MetricsSink names the methods the scoreboard calls when it wants to
+// record an observation. metrics.Registry implements this interface; pass
+// nil to disable metric emission. Every call site checks for nil before
+// dispatching, so the scoreboard is usable without a registry attached.
+type MetricsSink interface {
+	ObserveDial(upstreamID, outcome string, latency time.Duration)
+	ObserveCascadeTrip()
+	ObserveProbePick()
+}
+
 // Policy is the per-Kind tuple of penalty (a positive number subtracted from
 // the relevant entry's score) and cooldown (how long the affected
 // (host, upstream) pair sits out of the rotation).
@@ -70,6 +80,12 @@ type Config struct {
 	// concurrent client requests from over-penalizing one rate-limit event
 	// into N penalties.
 	DebounceWindow time.Duration
+
+	// PruneAfter governs the persistence-tick prune pass. An entry whose
+	// score has decayed to zero and whose lastSeen is older than
+	// PruneAfter is dropped during the next snapshot. <= 0 disables
+	// entry pruning; cascade and debounce eviction always run.
+	PruneAfter time.Duration
 }
 
 // FromConfig builds a scoreboard Config from the parsed [failure.scoring]
@@ -116,6 +132,7 @@ func FromConfig(s config.ScoringConfig, status []config.StatusRule) Config {
 		DecayStep:      s.DecayStep,
 		CascadeTTL:     s.CascadeTTL.Duration(),
 		DebounceWindow: s.DebounceWindow.Duration(),
+		PruneAfter:     s.PruneAfter.Duration(),
 	}
 }
 
@@ -180,6 +197,11 @@ type Scoreboard struct {
 	decayMu     sync.Mutex
 	decayCancel context.CancelFunc
 	decayDone   chan struct{}
+
+	// metrics is the optional sink for Prometheus emission. Nil means
+	// metrics are disabled; every call site uses recordMetric helpers
+	// that no-op on nil.
+	metrics MetricsSink
 }
 
 // entry is per-(host, upstream) state. Field comments name the invariants;
@@ -243,6 +265,14 @@ func WithRand(r *rand.Rand) Option {
 	}
 }
 
+// WithMetrics attaches a metrics sink. Pass nil to disable metric emission;
+// the scoreboard never dereferences a nil sink.
+func WithMetrics(m MetricsSink) Option {
+	return func(s *Scoreboard) {
+		s.metrics = m
+	}
+}
+
 // New builds a Scoreboard wrapping pool. Pool must be non-nil. Pass options
 // to override the default logger, clock, or random source.
 func New(pool *upstream.Pool, cfg Config, opts ...Option) (*Scoreboard, error) {
@@ -268,6 +298,80 @@ func New(pool *upstream.Pool, cfg Config, opts ...Option) (*Scoreboard, error) {
 	return s, nil
 }
 
+// configSnapshot returns a value copy of s.cfg taken under the read lock.
+// Reload swaps the whole struct, never mutates a field in place, so a
+// readers' value copy stays consistent with whatever cfg the writer
+// installed at snapshot time. Hot paths that read more than one field
+// take one snapshot at the start so multiple reads cannot tear
+// mid-write.
+func (s *Scoreboard) configSnapshot() Config {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.cfg
+}
+
+// poolSnapshot returns the cached pool view (entries slice header, retry
+// cap, pool length) taken under the read lock. ReplacePool installs
+// fresh slices, so a reader's pointer to the old backing array stays
+// stable for the lifetime of its dial.
+func (s *Scoreboard) poolSnapshot() (entries []upstream.PoolEntry, retryCap, poolLen int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.poolEntries, s.poolRetryCap, s.poolLen
+}
+
+// ReplacePool swaps the wrapped pool for a new one. Used by the SIGHUP
+// hot-reload path: the per-(host, upstream) entry table survives the
+// swap, so a host whose previous winner is still in the new pool keeps
+// the cached winner. Entries keyed off ids that no longer exist in the
+// new pool stay in the map but are unreachable through Pick (their id
+// is not a candidate). The next Prune pass evicts them once their score
+// decays below the threshold.
+//
+// Returns an error if newPool is nil; callers pass the old pool back if
+// they want to keep things unchanged.
+func (s *Scoreboard) ReplacePool(newPool *upstream.Pool) error {
+	if newPool == nil {
+		return errors.New("scoreboard: ReplacePool called with nil pool")
+	}
+	entries := newPool.Entries()
+	retryCap := newPool.RetryCap()
+	poolLen := newPool.Len()
+	s.mu.Lock()
+	s.pool = newPool
+	s.poolEntries = entries
+	s.poolRetryCap = retryCap
+	s.poolLen = poolLen
+	s.mu.Unlock()
+	return nil
+}
+
+// Reload updates the runtime tuning knobs in place. The new Config can
+// change penalty weights, cooldowns, probe chance, debounce window,
+// cascade TTL, and prune-after; DecayInterval is intentionally left
+// alone because the decay goroutine reads its ticker once at start.
+// Listener bindings, the upstream pool, and the random source are all
+// changed through their own paths.
+//
+// Reload holds the write lock for the duration of the swap to avoid
+// torn reads from concurrent Pick / Record* callers.
+func (s *Scoreboard) Reload(newCfg Config) {
+	s.mu.Lock()
+	// Preserve DecayInterval so a SIGHUP cannot accidentally tear down
+	// the running decay goroutine. Operators who want a different
+	// interval restart the binary; the build plan documents this.
+	preservedDecay := s.cfg.DecayInterval
+	s.cfg = newCfg
+	s.cfg.DecayInterval = preservedDecay
+	s.mu.Unlock()
+	s.logger.Info("scoreboard reloaded",
+		"probe_chance", newCfg.ProbeChance,
+		"cascade_ttl_ms", newCfg.CascadeTTL.Milliseconds(),
+		"debounce_window_ms", newCfg.DebounceWindow.Milliseconds(),
+		"prune_after_ms", newCfg.PruneAfter.Milliseconds(),
+	)
+}
+
 // Start launches the time-decay goroutine. Stop or a cancelled ctx ends it.
 // Calling Start twice without an intervening Stop is a no-op past the first
 // call; the existing loop keeps running.
@@ -277,7 +381,12 @@ func (s *Scoreboard) Start(ctx context.Context) {
 	if s.decayCancel != nil {
 		return
 	}
-	if s.cfg.DecayInterval <= 0 {
+	// Snapshot DecayInterval under s.mu so a SIGHUP-driven Reload that
+	// runs concurrently with Start cannot race the field read. Reload
+	// preserves the value, but the byte-level swap of s.cfg is still
+	// non-atomic.
+	interval := s.configSnapshot().DecayInterval
+	if interval <= 0 {
 		// No decay configured; nothing to start. Keep Stop a no-op.
 		return
 	}
@@ -288,7 +397,7 @@ func (s *Scoreboard) Start(ctx context.Context) {
 	// Pass done as an argument so the goroutine never has to read
 	// s.decayDone after Stop nils it. Without this, Stop and the goroutine
 	// race on the struct field and Stop can hang on the receive.
-	go s.decayLoop(dctx, done)
+	go s.decayLoop(dctx, done, interval)
 }
 
 // Stop cancels the decay goroutine and waits for it to exit. Safe to call
@@ -309,7 +418,7 @@ func (s *Scoreboard) Stop() {
 	}
 }
 
-func (s *Scoreboard) decayLoop(ctx context.Context, done chan struct{}) {
+func (s *Scoreboard) decayLoop(ctx context.Context, done chan struct{}, interval time.Duration) {
 	defer close(done)
 	defer func() {
 		// Clear the lifecycle fields when the goroutine exits. Stop may
@@ -321,7 +430,11 @@ func (s *Scoreboard) decayLoop(ctx context.Context, done chan struct{}) {
 		s.decayDone = nil
 		s.decayMu.Unlock()
 	}()
-	t := time.NewTicker(s.cfg.DecayInterval)
+	// interval is captured at Start time and frozen for the lifetime of
+	// the goroutine; Reload deliberately preserves DecayInterval so that
+	// changing it requires a process restart (documented in
+	// docs/configuration.md).
+	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
 		select {
@@ -336,14 +449,15 @@ func (s *Scoreboard) decayLoop(ctx context.Context, done chan struct{}) {
 // decayTick drifts every entry's score toward zero by DecayStep, clamped at
 // zero. Holds mu for the duration; decay is cheap (one float subtraction
 // per entry) and runs every DecayInterval, not per-request, so the lock
-// pressure is fine for v1.
+// pressure is fine for v1. DecayStep is read under the same lock so a
+// concurrent Reload cannot race with the field read.
 func (s *Scoreboard) decayTick() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	step := s.cfg.DecayStep
 	if step <= 0 {
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	for _, perUpstream := range s.entries {
 		for _, e := range perUpstream {
 			switch {
@@ -376,10 +490,6 @@ func (s *Scoreboard) Pick(host string, tried map[string]bool) (upstream.Upstream
 	if s.cascadeActive(host, now) {
 		return nil, &CascadeError{Host: host}
 	}
-	candidates := s.poolEntries
-	if len(candidates) == 0 {
-		return nil, ErrPoolExhausted
-	}
 	type ranked struct {
 		up       upstream.Upstream
 		basePri  int
@@ -388,8 +498,18 @@ func (s *Scoreboard) Pick(host string, tried map[string]bool) (upstream.Upstream
 		untilT   time.Time
 		untilSet bool
 	}
-	pool := make([]ranked, 0, len(candidates))
+	// Take one read lock around every field that hot-reload can swap
+	// (poolEntries, cfg.ProbeChance) plus the entries map iteration. A
+	// concurrent ReplacePool / Reload waits behind this RLock; a
+	// concurrent reader runs without contention.
 	s.mu.RLock()
+	candidates := s.poolEntries
+	probeChance := s.cfg.ProbeChance
+	if len(candidates) == 0 {
+		s.mu.RUnlock()
+		return nil, ErrPoolExhausted
+	}
+	pool := make([]ranked, 0, len(candidates))
 	for _, c := range candidates {
 		id := c.Up.ID()
 		if tried[id] {
@@ -456,9 +576,14 @@ func (s *Scoreboard) Pick(host string, tried map[string]bool) (upstream.Upstream
 
 	// Probe roll: with prob ProbeChance, pick a non-top eligible candidate
 	// uniformly at random so a previously-penalized upstream gets a chance
-	// to recover. Skip when there is only one eligible.
-	if len(eligible) > 1 && s.cfg.ProbeChance > 0 && s.probeRoll() {
+	// to recover. Skip when there is only one eligible. probeChance was
+	// captured under the RLock above so it cannot tear with a concurrent
+	// Reload.
+	if len(eligible) > 1 && probeChance > 0 && s.probeRoll(probeChance) {
 		idx := s.probePick(len(eligible) - 1)
+		if s.metrics != nil {
+			s.metrics.ObserveProbePick()
+		}
 		return eligible[1+idx].up, nil
 	}
 
@@ -509,10 +634,14 @@ func (s *Scoreboard) RecordFailure(host, upstreamID string, kind failure.Kind, c
 		return
 	}
 	now := s.clock()
-	if !s.acceptForDebounce(host, upstreamID, kind, now) {
+	// Snapshot the cfg fields the rest of this method reads so a
+	// concurrent Reload cannot tear KindPolicy / DebounceWindow / ScoreCap
+	// across the call.
+	cfg := s.configSnapshot()
+	if !s.acceptForDebounce(host, upstreamID, kind, now, cfg.DebounceWindow) {
 		return
 	}
-	policy := s.cfg.KindPolicy[kind]
+	policy := cfg.KindPolicy[kind]
 	overridden := cooldownOverride != nil
 	cooldown := policy.Cooldown
 	if overridden {
@@ -521,8 +650,8 @@ func (s *Scoreboard) RecordFailure(host, upstreamID string, kind failure.Kind, c
 	s.mu.Lock()
 	e := s.getOrCreateLocked(host, upstreamID)
 	e.score -= policy.Penalty
-	if e.score < -s.cfg.ScoreCap {
-		e.score = -s.cfg.ScoreCap
+	if e.score < -cfg.ScoreCap {
+		e.score = -cfg.ScoreCap
 	}
 	switch {
 	case overridden && cooldown > 0:
@@ -557,16 +686,17 @@ func (s *Scoreboard) RecordFailure(host, upstreamID string, kind failure.Kind, c
 }
 
 // acceptForDebounce returns true if a (host, upstream, kind) penalty should
-// be applied now. False means the previous penalty was within DebounceWindow
-// and this call should be a no-op.
-func (s *Scoreboard) acceptForDebounce(host, upstreamID string, kind failure.Kind, now time.Time) bool {
-	if s.cfg.DebounceWindow <= 0 {
+// be applied now. False means the previous penalty was within window
+// and this call should be a no-op. window is passed by the caller so a
+// concurrent Reload cannot tear the s.cfg.DebounceWindow read.
+func (s *Scoreboard) acceptForDebounce(host, upstreamID string, kind failure.Kind, now time.Time, window time.Duration) bool {
+	if window <= 0 {
 		return true
 	}
 	key := debounceKey{host: host, upstreamID: upstreamID, kind: kind}
 	s.debounceMu.Lock()
 	defer s.debounceMu.Unlock()
-	if last, ok := s.debounce[key]; ok && now.Sub(last) < s.cfg.DebounceWindow {
+	if last, ok := s.debounce[key]; ok && now.Sub(last) < window {
 		return false
 	}
 	s.debounce[key] = now
@@ -603,8 +733,9 @@ func (s *Scoreboard) DialFor(ctx context.Context, network, addr string) (net.Con
 	if s.cascadeActive(host, s.clock()) {
 		return nil, "", &CascadeError{Host: host}
 	}
-	retryCap := s.poolRetryCap
-	candidateCount := s.poolLen
+	// Snapshot pool metadata under the read lock so a concurrent
+	// ReplacePool cannot tear retryCap or candidateCount.
+	_, retryCap, candidateCount := s.poolSnapshot()
 	limit := retryCap
 	if limit > candidateCount {
 		limit = candidateCount
@@ -636,6 +767,7 @@ func (s *Scoreboard) DialFor(ctx context.Context, network, addr string) (net.Con
 		attempts++
 		if dialErr == nil {
 			s.RecordSuccess(host, up.ID(), latency)
+			s.observeDialSuccess(up.ID(), latency)
 			s.logger.Info("upstream dial",
 				"upstream_id", up.ID(),
 				"host", host,
@@ -663,6 +795,7 @@ func (s *Scoreboard) DialFor(ctx context.Context, network, addr string) (net.Con
 		if kind != "" {
 			s.RecordFailure(host, up.ID(), kind, nil)
 		}
+		s.observeDialFailure(up.ID(), kind, latency)
 		s.logger.Warn("upstream dial",
 			"upstream_id", up.ID(),
 			"host", host,
@@ -704,6 +837,37 @@ func (s *Scoreboard) Snapshot() []EntrySnapshot {
 		}
 	}
 	return out
+}
+
+// observeDialSuccess records a successful dial against the metrics sink.
+// Split from the failure path so a post-dial failure that
+// ClassifyDialError cannot tag (kind == "") is reported as "other"
+// instead of being silently miscounted as a success.
+func (s *Scoreboard) observeDialSuccess(upstreamID string, latency time.Duration) {
+	if s.metrics == nil {
+		return
+	}
+	s.metrics.ObserveDial(upstreamID, "success", latency)
+}
+
+// observeDialFailure records a failed dial against the metrics sink.
+// Known kinds (KindRefused, KindTimeout) map to their named outcomes;
+// any other value, including the empty Kind ClassifyDialError returns
+// for unrecognized errors, falls into "other".
+func (s *Scoreboard) observeDialFailure(upstreamID string, kind failure.Kind, latency time.Duration) {
+	if s.metrics == nil {
+		return
+	}
+	var outcome string
+	switch kind {
+	case failure.KindRefused:
+		outcome = "refused"
+	case failure.KindTimeout:
+		outcome = "timeout"
+	default:
+		outcome = "other"
+	}
+	s.metrics.ObserveDial(upstreamID, outcome, latency)
 }
 
 // hostOnly returns the host portion of a host:port pair. Mirrors the helper

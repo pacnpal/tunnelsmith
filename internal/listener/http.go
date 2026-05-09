@@ -25,13 +25,27 @@ import (
 	"github.com/pacnpal/tunnelsmith/internal/upstream"
 )
 
+// MetricsSink is the listener-side metrics surface. metrics.Registry
+// implements it; pass nil to disable emission.
+type MetricsSink interface {
+	ObserveDial(upstreamID, outcome string, latency time.Duration)
+	ObserveStatusFailure(upstreamID, code string)
+	ObserveRequestOutcome(outcome string)
+}
+
 // HTTPServer accepts HTTP CONNECT and plain-HTTP forward-proxy traffic.
 type HTTPServer struct {
-	addr     string
-	sb       *scoreboard.Scoreboard
-	detector *failure.StatusDetector
-	retryCap int
-	logger   *slog.Logger
+	addr    string
+	sb      *scoreboard.Scoreboard
+	logger  *slog.Logger
+	metrics MetricsSink
+
+	// runtime is the slice of knobs SIGHUP hot-reload can swap in place.
+	// Guarded by runtimeMu so the request path's reads stay consistent
+	// with concurrent Reload calls.
+	runtimeMu sync.RWMutex
+	detector  *failure.StatusDetector
+	retryCap  int
 
 	server *http.Server
 
@@ -57,6 +71,16 @@ type HTTPServer struct {
 	tunnels   map[*tunnel]struct{}
 }
 
+// HTTPOption customizes an HTTPServer at construction.
+type HTTPOption func(*HTTPServer)
+
+// WithHTTPMetrics attaches a metrics sink. Pass nil to disable emission.
+func WithHTTPMetrics(m MetricsSink) HTTPOption {
+	return func(h *HTTPServer) {
+		h.metrics = m
+	}
+}
+
 // NewHTTP builds an HTTP listener that routes everything through sb. The
 // scoreboard must be non-nil; passing nil returns a clear error so callers
 // see the contract violation at construction time instead of a nil-deref
@@ -65,7 +89,7 @@ type HTTPServer struct {
 // must be at least 1 and bounds the per-request attempts on the plain-HTTP
 // forward path; the value mirrors failure.max_retries_per_request from
 // config so dial retries and status retries share the same budget.
-func NewHTTP(addr string, sb *scoreboard.Scoreboard, detector *failure.StatusDetector, retryCap int, logger *slog.Logger) (*HTTPServer, error) {
+func NewHTTP(addr string, sb *scoreboard.Scoreboard, detector *failure.StatusDetector, retryCap int, logger *slog.Logger, opts ...HTTPOption) (*HTTPServer, error) {
 	if sb == nil {
 		return nil, errors.New("listener.NewHTTP: scoreboard is nil")
 	}
@@ -85,12 +109,73 @@ func NewHTTP(addr string, sb *scoreboard.Scoreboard, detector *failure.StatusDet
 		tunnels:    make(map[*tunnel]struct{}),
 		transports: make(map[string]*http.Transport),
 	}
+	// Reload knobs default to the constructor arguments above; the
+	// runtimeMu fields are populated implicitly via the struct literal.
+
+	for _, opt := range opts {
+		opt(h)
+	}
 	h.server = &http.Server{
 		Addr:              addr,
 		Handler:           http.HandlerFunc(h.handle),
 		ReadHeaderTimeout: 30 * time.Second,
 	}
 	return h, nil
+}
+
+// currentDetector returns the live failure detector. Reads are guarded by
+// runtimeMu so a concurrent Reload cannot tear the pointer.
+func (h *HTTPServer) currentDetector() *failure.StatusDetector {
+	h.runtimeMu.RLock()
+	defer h.runtimeMu.RUnlock()
+	return h.detector
+}
+
+// currentRetryCap returns the live retry cap.
+func (h *HTTPServer) currentRetryCap() int {
+	h.runtimeMu.RLock()
+	defer h.runtimeMu.RUnlock()
+	return h.retryCap
+}
+
+// Reload swaps the live detector and retry cap. Called from the SIGHUP
+// hot-reload path. Invalid retryCap values (< 1) are ignored with a
+// log line so a misconfigured reload does not zero out the cap.
+//
+// Per-upstream HTTP transports are kept across reloads so connection
+// pools survive a config bump that does not change the upstream list;
+// when an upstream goes away in the new pool, CloseTransportsExcept
+// drops its transport explicitly.
+func (h *HTTPServer) Reload(detector *failure.StatusDetector, retryCap int) {
+	if retryCap < 1 {
+		h.logger.Warn("http listener reload ignored (retryCap < 1)", "retry_cap", retryCap)
+		return
+	}
+	h.runtimeMu.Lock()
+	h.detector = detector
+	h.retryCap = retryCap
+	h.runtimeMu.Unlock()
+	h.logger.Info("http listener reloaded", "retry_cap", retryCap)
+}
+
+// CloseTransportsExcept closes idle conns and drops cached transports for
+// every upstream whose id is not in keep. Called from the hot-reload path
+// after the upstream pool changes so per-upstream conn pools cannot leak.
+func (h *HTTPServer) CloseTransportsExcept(keep map[string]struct{}) {
+	h.transportsMu.Lock()
+	var removed []string
+	for id, t := range h.transports {
+		if _, ok := keep[id]; ok {
+			continue
+		}
+		t.CloseIdleConnections()
+		delete(h.transports, id)
+		removed = append(removed, id)
+	}
+	h.transportsMu.Unlock()
+	if len(removed) > 0 {
+		h.logger.Info("http listener dropped transports for removed upstreams", "ids", removed)
+	}
 }
 
 // transportFor returns the Transport pinned to up, building it on first use.
@@ -239,6 +324,7 @@ func (h *HTTPServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		h.logger.Warn("connect dial failed", "host", host, "err", err)
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		h.observeOutcome(connectOutcome(err))
 		return
 	}
 
@@ -282,6 +368,7 @@ func (h *HTTPServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 		"upstream_id", upID,
 		"latency_ms", time.Since(start).Milliseconds(),
 	)
+	h.observeOutcome("success")
 }
 
 // handleForward serves the plain-HTTP forward-proxy path. Each request runs
@@ -356,12 +443,14 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tried := make(map[string]bool, h.retryCap)
+	retryCap := h.currentRetryCap()
+	detector := h.currentDetector()
+	tried := make(map[string]bool, retryCap)
 	var (
 		retries        int
 		cascadeAlready bool
 	)
-	for attempt := 0; attempt < h.retryCap; attempt++ {
+	for attempt := 0; attempt < retryCap; attempt++ {
 		if err := r.Context().Err(); err != nil {
 			h.logger.Warn("forward client context done",
 				"host", host,
@@ -423,6 +512,7 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 			if kind != "" {
 				h.sb.RecordFailure(host, up.ID(), kind, nil)
 			}
+			h.observeForwardDial(up.ID(), forwardDialOutcome(kind), latency)
 			tried[up.ID()] = true
 			retries++
 			h.logger.Warn("forward attempt failed",
@@ -436,9 +526,26 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		det, isFail := h.detector.Detect(resp.StatusCode, resp.Header)
+		// detector may be nil per NewHTTP / Reload's contract: that
+		// mode means "status detection disabled, treat every response
+		// as success". Skip the call entirely so the nil-detector path
+		// cannot panic.
+		var (
+			det    failure.Detection
+			isFail bool
+		)
+		if detector != nil {
+			det, isFail = detector.Detect(resp.StatusCode, resp.Header)
+		}
 		if isFail {
 			h.sb.RecordFailure(host, up.ID(), det.Kind, det.CooldownOverride)
+			// The dial itself succeeded (the upstream answered with a
+			// status code); the failure signal is the response body, not
+			// the connection. Record dial success so dial_attempts_total
+			// stays consistent with the retry loop, and let
+			// status_failures_total carry the failure-shaped dimension.
+			h.observeForwardDial(up.ID(), "success", latency)
+			h.observeStatusFailure(up.ID(), resp.StatusCode)
 			drainAndClose(resp.Body)
 			tried[up.ID()] = true
 			retries++
@@ -459,6 +566,7 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 		}
 
 		h.sb.RecordSuccess(host, up.ID(), latency)
+		h.observeForwardDial(up.ID(), "success", latency)
 		h.writeForwardSuccess(w, resp, up.ID(), retries)
 		h.logger.Info("forward done",
 			"url", r.URL.String(),
@@ -468,6 +576,7 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 			"retries", retries,
 			"latency_ms", time.Since(start).Milliseconds(),
 		)
+		h.observeOutcome("success")
 		return
 	}
 
@@ -486,6 +595,25 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 		"retries", retries,
 		"latency_ms", time.Since(start).Milliseconds(),
 	)
+	if cascadeAlready {
+		h.observeOutcome("cascade")
+	} else {
+		h.observeOutcome("exhausted")
+	}
+}
+
+// forwardDialOutcome maps a classified RoundTrip dial error to the metrics
+// outcome label. Empty kind (post-dial failure we cannot fairly attribute)
+// becomes "other" so it stays counted but distinct from refused/timeout.
+func forwardDialOutcome(kind failure.Kind) string {
+	switch kind {
+	case failure.KindRefused:
+		return "refused"
+	case failure.KindTimeout:
+		return "timeout"
+	default:
+		return "other"
+	}
 }
 
 // newOutReq clones r for an outbound attempt. RequestURI is cleared, hop
@@ -552,6 +680,44 @@ func (h *HTTPServer) writeForwardSuccess(w http.ResponseWriter, resp *http.Respo
 	if _, err := io.Copy(w, resp.Body); err != nil {
 		h.logger.Warn("forward copy failed", "upstream_id", upID, "err", err)
 	}
+}
+
+// observeOutcome records the terminal outcome of one client request when a
+// metrics sink is attached. Outcomes match metrics package constants:
+// "success" / "cascade" / "exhausted".
+func (h *HTTPServer) observeOutcome(outcome string) {
+	if h.metrics == nil {
+		return
+	}
+	h.metrics.ObserveRequestOutcome(outcome)
+}
+
+// observeStatusFailure records a per-(upstream, status) counter for a
+// listener-detected failure response.
+func (h *HTTPServer) observeStatusFailure(upstreamID string, code int) {
+	if h.metrics == nil {
+		return
+	}
+	h.metrics.ObserveStatusFailure(upstreamID, strconv.Itoa(code))
+}
+
+// observeForwardDial records the forward path's per-attempt dial outcome.
+// outcome mirrors the scoreboard's labels ("success" / "refused" / "timeout"
+// / "other") so /metrics shows the same shape across paths.
+func (h *HTTPServer) observeForwardDial(upstreamID string, outcome string, latency time.Duration) {
+	if h.metrics == nil {
+		return
+	}
+	h.metrics.ObserveDial(upstreamID, outcome, latency)
+}
+
+// connectOutcome maps a CONNECT-side dial error to a terminal outcome label.
+// Cascade is its own outcome; everything else is "exhausted".
+func connectOutcome(err error) string {
+	if errors.Is(err, scoreboard.ErrCascadeCooling) {
+		return "cascade"
+	}
+	return "exhausted"
 }
 
 // stripTunnelsmithHeaders removes any X-Tunnelsmith-* headers from h.

@@ -19,6 +19,7 @@ This page lists every key, its type, default, and what it does. The defaults mat
 ```toml
 [listener]
 [cache]
+[metrics]
 [[upstream]]         # zero or more (must have at least one upstream OR upstream_pool)
 [[upstream_pool]]    # zero or more (Phase 6: provider = "mullvad")
 [failure]
@@ -41,13 +42,24 @@ Both must parse via `net.SplitHostPort` and the port must be in `1-65535`.
 
 The decision-cache and persistence settings.
 
-| key            | type     | default | notes |
-|----------------|----------|---------|-------|
-| `ttl`          | duration | `15m`   | how long a successful (host, upstream) decision stays cached |
-| `negative_ttl` | duration | `1m`    | cascade-failure cooldown for a host where every upstream just failed |
-| `persist_path` | string   | `""`    | absolute file path for scoreboard persistence; empty means in-memory only |
+| key                | type     | default | notes |
+|--------------------|----------|---------|-------|
+| `ttl`              | duration | `15m`   | how long a successful (host, upstream) decision stays cached |
+| `negative_ttl`     | duration | `1m`    | cascade-failure cooldown for a host where every upstream just failed |
+| `persist_path`     | string   | `""`    | absolute file path for scoreboard persistence; empty means in-memory only |
+| `persist_interval` | duration | `30s`   | how often the persistence loop snapshots state to `persist_path`; `0s` disables periodic writes (the shutdown flush still runs when `persist_path` is set) |
 
 Durations use Go's `time.ParseDuration` syntax (`120s`, `15m`, `6h`, etc.).
+
+## `[metrics]`
+
+Prometheus exposition surface added in Phase 7.
+
+| key    | type   | default   | notes |
+|--------|--------|-----------|-------|
+| `bind` | string | `:9090`   | host:port for `/metrics` (and `/healthz`); empty disables the listener entirely |
+
+When set, `bind` must parse via `net.SplitHostPort` with a port in `1-65535`. The endpoint is unauthenticated; bind it to an internal interface only. See [observability.md](observability.md) for the metric reference and Grafana dashboard.
 
 ## `[[upstream]]`
 
@@ -143,6 +155,7 @@ Knobs for the per-(host, upstream) scoreboard introduced in Phase 4. Sensible de
 | `decay_step`       | float    | `0.5`   | absolute amount each entry's score moves toward zero per tick |
 | `cascade_ttl`      | duration | `30s`   | negative TTL for a host where every upstream just failed; subsequent requests within the TTL get an immediate cascade error without burning through the pool |
 | `debounce_window`  | duration | `100ms` | identical `(host, upstream, kind)` failures arriving within this window collapse into one penalty event |
+| `prune_after`      | duration | `24h`   | the persistence-tick prune pass drops entries with `score == 0` and `lastSeen` older than this; `0s` disables entry pruning (cascade and debounce eviction still run) |
 
 The rate-limit, forbidden, and legal-block kinds get their penalty and cooldown from `[[failure.status]]` entries. Phase 5 wires them through the plain-HTTP listener: when a 429, 403, or 451 lands, the listener records a failure of the matching kind and rotates to the next upstream within the same request, up to `failure.max_retries_per_request`. Body-match policy lands in Phase 8.
 
@@ -173,7 +186,29 @@ Practical consequence: a client that issues an HTTPS request through Tunnelsmith
 
 Body-regex detection in Phase 8 will share this constraint: it can read response bodies on the plain-HTTP path only.
 
+## Hot-reload
+
+Sending `SIGHUP` to the running Tunnelsmith process re-reads the config file from the same path it was loaded from. The reload is best-effort: if the new config fails to parse or validate, the binary logs a warning and keeps running on the old config.
+
+What hot-reload changes in place:
+
+- `[[upstream]]` list (rebuilds the priority pool, swaps it into the scoreboard, drops cached transports for upstreams that disappeared)
+- `[failure]` retry cap and `[[failure.status]]` rules
+- `[failure.scoring]` penalty weights, cooldowns, probe chance, cascade TTL, debounce window, prune-after
+- `[[rule]]` block list (parsed and stored; Phase 8 will apply them)
+
+What hot-reload does NOT change (restart required):
+
+- `[listener]` bindings
+- `metrics.bind`
+- `cache.persist_path` and `cache.persist_interval`
+- `failure.scoring.decay_interval`
+- `[[upstream_pool]]` (Mullvad refresh schedule)
+
+The reload outcome is reported on `tunnelsmith_config_reloads_total{result="success" | "error"}`.
+
 ## See also
 
 - [Architecture](architecture.md): how the scoreboard uses these settings (filled in during Phase 4).
+- [Observability](observability.md): the metric surface, scrape config, hot-reload behavior, and Grafana dashboard import.
 - [Decisions](decisions.md): the running ADR log.
