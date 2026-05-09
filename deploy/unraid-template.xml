@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>tunnelsmith</Name>
+  <Repository>ghcr.io/pacnpal/tunnelsmith:latest</Repository>
+  <Registry>https://github.com/pacnpal/tunnelsmith/pkgs/container/tunnelsmith</Registry>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/pacnpal/tunnelsmith/issues</Support>
+  <Project>https://github.com/pacnpal/tunnelsmith</Project>
+  <Overview>Per-destination egress router for HTTP and SOCKS5. Picks the best upstream per host based on observed success, with cooldowns, time decay, cascade-failure handling, and recovery probing. Pair with any of: a Mullvad gluetun container (auto-discovered SOCKS5 mesh), one or more upstream HTTP / SOCKS5 proxies, or the host's direct route. The web UI exposes the live scoreboard and four action buttons (forget, force, force-clear, reset).</Overview>
+  <Category>Network:Proxy Tools:</Category>
+  <WebUI>http://[IP]:[PORT:9091]/</WebUI>
+  <TemplateURL>https://raw.githubusercontent.com/pacnpal/tunnelsmith/main/deploy/unraid-template.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/pacnpal/tunnelsmith/main/docs/tunnelsmith-icon.png</Icon>
+  <DateInstalled>1715299200</DateInstalled>
+  <DonateText/>
+  <DonateLink/>
+  <Description>Tunnelsmith sits in front of your apps as an HTTP CONNECT and SOCKS5 proxy. It maintains a per-(host, upstream) scoreboard so each destination eventually settles on the upstream that works for it: 429s and geo-blocks pick a different exit, refused connections and timeouts cool the bad upstream down, and recovered upstreams probe back into rotation automatically.
+
+The web UI on port 9091 is unauthenticated by design: the security boundary is the Docker bridge or the host network, not the port. Keep the UI bound to a private interface or to the bridge network only.
+
+Configuration lives in /etc/tunnelsmith/config.toml inside the container; mount /mnt/user/appdata/tunnelsmith to it. An example config ships at /etc/tunnelsmith/config.toml.example. SIGHUP triggers a hot-reload.</Description>
+  <Config Name="HTTP CONNECT Port" Target="8080" Default="8080" Mode="tcp" Description="Port the HTTP CONNECT proxy listens on. Point your apps at http://&lt;unraid-ip&gt;:&lt;this-port&gt;." Type="Port" Display="always" Required="true" Mask="false">8080</Config>
+  <Config Name="SOCKS5 Port" Target="1080" Default="1080" Mode="tcp" Description="Port the SOCKS5 proxy listens on. Useful for clients that prefer SOCKS5 (curl --socks5-hostname, browsers, etc.)." Type="Port" Display="always" Required="true" Mask="false">1080</Config>
+  <Config Name="Web UI Port" Target="9091" Default="9091" Mode="tcp" Description="Port the read-and-act web UI listens on. Unauthenticated; restrict via the Docker bridge or your network." Type="Port" Display="always" Required="true" Mask="false">9091</Config>
+  <Config Name="Metrics Port" Target="9090" Default="9090" Mode="tcp" Description="Prometheus /metrics endpoint. Also serves /healthz." Type="Port" Display="advanced" Required="false" Mask="false">9090</Config>
+  <Config Name="Config Directory" Target="/etc/tunnelsmith" Default="/mnt/user/appdata/tunnelsmith" Mode="rw" Description="Directory holding config.toml. The container reads /etc/tunnelsmith/config.toml at startup; copy /etc/tunnelsmith/config.toml.example out, edit, save as config.toml, then restart or send SIGHUP." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/tunnelsmith</Config>
+  <Config Name="Log Level" Target="TUNNELSMITH_LOG_LEVEL" Default="info" Mode="" Description="One of debug, info, warn, error. JSON structured logging." Type="Variable" Display="advanced" Required="false" Mask="false">info</Config>
+</Container>

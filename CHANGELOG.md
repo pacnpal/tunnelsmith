@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (Phase 9)
+
+- `internal/ui` package: embedded HTML / JS / CSS via `embed.FS` plus a `net/http`-based server that exposes the page at `/`, four JSON action endpoints (`/api/forget`, `/api/force`, `/api/force/clear`, `/api/reset`), the read-only `/api/scoreboard`, and a cheap `/healthz` probe. The `Backend` interface lets handler tests drive every endpoint with a fake; the live wiring uses `*scoreboard.Scoreboard` directly because it satisfies the interface 1:1.
+- `internal/scoreboard.Forget` / `Force` / `ClearForce` / `ForcedFor` / `ForceSnapshot` / `Reset`: the four mutating actions the UI needs plus the read helpers the handlers use. Force pins are checked at the top of `Pick` before the per-host RuleSet scan, so a pin wins over normal scoring while live; if the pinned upstream is in the per-call `tried` set (in-flight retry already burned it), `Pick` falls back to the usual scoring path so a pin cannot loop on a single failing exit.
+- `internal/config`: new `[ui]` section. `bind` defaults to `:9091` and disables the listener entirely when set to `""`; same shape as `[metrics]`.
+- `cmd/tunnelsmith`: starts the UI HTTP server alongside the metrics server when `ui.bind` is non-empty; graceful shutdown drains both on SIGINT/SIGTERM. SIGHUP does not change `ui.bind`; restart to move the listener.
+- `deploy/unraid-template.xml`: Community Apps template for one-click install on Unraid. WebUI link points at port 9091; default config volume is `/mnt/user/appdata/tunnelsmith`; HTTP and SOCKS5 ports are user-configurable; `TUNNELSMITH_LOG_LEVEL` is exposed as an advanced variable.
+- `docs/ui.md`: the page, the four endpoints, and the security stance ("the boundary is the network, not the port"). Linked from the README and from the configuration guide's `[ui]` section. `examples/tunnelsmith.toml` includes a commented `[ui]` block.
+
 ### Added (Phase 8)
 
 - `internal/upstream.RuleSet`: compiled view of `[[rule]]` blocks. `Match` evaluates rules in declaration order with `path.Match` semantics over the lowercased host (case insensitive, first-match-wins). Each rule carries the prefer list, the force flag, and pre-compiled body regexes so the request path never has to recompile a pattern. `CheckPreferIDs` validates `Prefer` entries against the merged upstream pool (including pool-derived ids).
