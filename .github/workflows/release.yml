@@ -98,10 +98,23 @@ jobs:
             and (.manifests | map(.platform.os)         | unique) == ["linux"]
           ' > /dev/null
           echo "multi-arch manifest verified: linux/amd64 + linux/arm64"
-          version_digest="$(docker buildx imagetools inspect --format '{{json .Manifest}}' "${IMAGE}:${PULL_TAG}" | jq -r '.digest')"
+          # buildx imagetools exposes the descriptor digest as
+          # `.Manifest.Digest`. Use the template field directly rather
+          # than `{{json .Manifest}}` plus `jq '.digest'`, which depends
+          # on the marshaled struct still carrying a top-level `digest`
+          # field; the templated form is unambiguous.
+          version_digest="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "${IMAGE}:${PULL_TAG}")"
+          if [ -z "${version_digest}" ] || [ "${version_digest}" = "<no value>" ]; then
+            echo "buildx imagetools returned an empty digest for ${IMAGE}:${PULL_TAG}" >&2
+            exit 1
+          fi
           echo "${PULL_TAG} index digest: ${version_digest}"
           if docker buildx imagetools inspect "${IMAGE}:latest" > /dev/null 2>&1; then
-            latest_digest="$(docker buildx imagetools inspect --format '{{json .Manifest}}' "${IMAGE}:latest" | jq -r '.digest')"
+            latest_digest="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "${IMAGE}:latest")"
+            if [ -z "${latest_digest}" ] || [ "${latest_digest}" = "<no value>" ]; then
+              echo "buildx imagetools returned an empty digest for ${IMAGE}:latest" >&2
+              exit 1
+            fi
             echo ":latest index digest:    ${latest_digest}"
             if [ "${version_digest}" != "${latest_digest}" ]; then
               echo ":latest index digest does not match ${PULL_TAG}" >&2

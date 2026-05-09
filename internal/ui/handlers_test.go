@@ -246,6 +246,9 @@ func TestScoreboardEndpointGeneratedAtFromBackendClock(t *testing.T) {
 		t.Fatalf("GET /api/scoreboard: %v", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
 	var got struct {
 		GeneratedAt time.Time `json:"generated_at"`
 	}
