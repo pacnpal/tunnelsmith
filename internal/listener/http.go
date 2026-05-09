@@ -512,6 +512,22 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 	retryCap := h.currentRetryCap()
 	detector := h.currentDetector()
 	tried := make(map[string]bool, retryCap)
+	// Resolve the rule and the body-inspect knobs once per request:
+	// the destination host is constant across retry attempts, the
+	// rule pointer is stable for the duration of the request (Reload
+	// installs a new pointer atomically), and rebuilding the
+	// failure.Pattern slice on every retry would just allocate the
+	// same content over and over. The slice is non-nil only when
+	// inspection is actually wired up for this host.
+	rule := h.currentRules().Match(host)
+	bodyBufferBytes := h.currentBodyBufferBytes()
+	var bodyPatterns []failure.Pattern
+	if rule.HasBodyRegex() && bodyBufferBytes > 0 {
+		bodyPatterns = make([]failure.Pattern, len(rule.BodyRegex))
+		for i, re := range rule.BodyRegex {
+			bodyPatterns[i] = re
+		}
+	}
 	var (
 		retries        int
 		cascadeAlready bool
@@ -631,22 +647,16 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// Phase 8: response-body inspection. Run only when a [[rule]]
-		// matched the host AND the rule has compiled patterns AND the
-		// body buffer is configured. Status-code path above already
-		// consumed any failure shape, so a body match here is a fresh
-		// signal: the destination served 2xx but the page itself looks
-		// like a soft block. failure.BufferAndDecide handles the
-		// encoded-body skip, the limit, and the replay reader so the
-		// listener stays simple.
-		rule := h.currentRules().Match(host)
-		bufBytes := h.currentBodyBufferBytes()
-		if rule.HasBodyRegex() && bufBytes > 0 {
-			patterns := make([]failure.Pattern, len(rule.BodyRegex))
-			for i, re := range rule.BodyRegex {
-				patterns[i] = re
-			}
-			dec, bdErr := failure.BufferAndDecide(resp.Body, resp.Header.Get("Content-Encoding"), bufBytes, patterns)
+		// Phase 8: response-body inspection. Skip the call entirely
+		// when bodyPatterns is nil (no rule matched the host, no
+		// patterns on the matching rule, or the buffer cap is 0).
+		// Status-code path above already consumed any failure shape,
+		// so a body match here is a fresh signal: the destination
+		// served 2xx but the page itself looks like a soft block.
+		// failure.BufferAndDecide handles the encoded-body skip, the
+		// limit, and the replay reader so the listener stays simple.
+		if len(bodyPatterns) > 0 {
+			dec, bdErr := failure.BufferAndDecide(resp.Body, resp.Header.Get("Content-Encoding"), bodyBufferBytes, bodyPatterns)
 			if bdErr != nil {
 				// Read failed mid-body. The upstream's TCP path is
 				// suspect but not necessarily broken; rotating to the
