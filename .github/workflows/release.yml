@@ -45,6 +45,7 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: build and push
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -57,6 +58,49 @@ jobs:
             VERSION=${{ github.ref_name }}
             COMMIT=${{ github.sha }}
             DATE=${{ github.event.head_commit.timestamp }}
+
+      # Per ADR-005, release-image verification runs in CI rather than on
+      # the host. Pull the freshly pushed tag, run --version inside it, and
+      # confirm the manifest index carries both architectures the build
+      # step asked for. If `:latest` was also pushed (default-branch tag),
+      # confirm its index digest matches the version tag's. Any failure
+      # here aborts the release before the GitHub release is created, so
+      # a broken image cannot reach v* tags.
+      - name: verify pushed image runs and is multi-arch
+        env:
+          VERSION_TAG: ${{ github.ref_name }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        run: |
+          set -euo pipefail
+          echo "verifying ${IMAGE}:${VERSION_TAG}"
+          docker pull "${IMAGE}:${VERSION_TAG}"
+          out="$(docker run --rm "${IMAGE}:${VERSION_TAG}" --version)"
+          echo "image --version: ${out}"
+          case "${out}" in
+            *"${VERSION_TAG}"*) ;;
+            *)
+              echo "image --version output does not contain tag ${VERSION_TAG}" >&2
+              exit 1
+              ;;
+          esac
+          docker manifest inspect "${IMAGE}:${VERSION_TAG}" | jq -e '
+            (.manifests | map(.platform.architecture) | sort) == ["amd64","arm64"]
+            and (.manifests | map(.platform.os)         | unique) == ["linux"]
+          ' > /dev/null
+          echo "multi-arch manifest verified: linux/amd64 + linux/arm64"
+          version_digest="$(docker buildx imagetools inspect --format '{{json .Manifest}}' "${IMAGE}:${VERSION_TAG}" | jq -r '.digest')"
+          echo "${VERSION_TAG} index digest: ${version_digest}"
+          if docker buildx imagetools inspect "${IMAGE}:latest" > /dev/null 2>&1; then
+            latest_digest="$(docker buildx imagetools inspect --format '{{json .Manifest}}' "${IMAGE}:latest" | jq -r '.digest')"
+            echo ":latest index digest:    ${latest_digest}"
+            if [ "${version_digest}" != "${latest_digest}" ]; then
+              echo ":latest index digest does not match ${VERSION_TAG}" >&2
+              exit 1
+            fi
+            echo ":latest matches ${VERSION_TAG}"
+          else
+            echo "::notice::no :latest tag in registry; metadata-action did not emit latest for this push"
+          fi
 
       - name: create github release
         env:

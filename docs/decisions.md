@@ -132,3 +132,28 @@ The relay API schema is also shaped differently than the plan suggested. It retu
 
 - https://mullvad.net/en/help/socks5-proxy
 - Live response from `https://api.mullvad.net/public/relays/wireguard/v2/` captured during Phase 6 kickoff (200 OK, 563 WG relays).
+
+---
+
+## ADR-005: Release-image verification runs in CI, not on the host
+
+**Date:** 2026-05-09
+**Status:** Accepted
+
+### Context
+
+ADR-001 already pushed image build and run off the host onto CI. It left one open question for v1.0.0 (Phase 10): the build plan still required `docker pull ghcr.io/$GH_USER/tunnelsmith:v1.0.0`, the same pull for `:latest` (digest match), and `docker manifest inspect` for the multi-arch check, all on the host. Pull and inspect are read-only operations against an already-built image, so they sit in a grey area of the no-local-docker rule, but they still drag in a host Docker daemon for what is fundamentally a CI-side artifact check.
+
+The release workflow already builds and pushes the image to GHCR for `v*` tags. Adding a verify step to the same workflow keeps the entire release-time Docker surface in CI.
+
+### Decision
+
+1. The Phase 10 release-verify checkboxes move from the host into `.github/workflows/release.yml`. The job pulls `ghcr.io/<owner>/tunnelsmith:<tag>` after the push, runs `--version` from inside the published image, asserts the `:latest` digest matches the `:<tag>` digest, and asserts `docker manifest inspect` reports both `linux/amd64` and `linux/arm64`. CI failure fails the release.
+2. The build plan checkboxes are reworded to "the release.yml verify step succeeded for v1.0.0", proven by `gh run view` on the release workflow run.
+3. `docker manifest inspect` and `docker pull` against the published image are still allowed on the host for ad-hoc inspection. They are not part of any phase gate.
+
+### Consequences
+
+- One workflow runs the entire release including verification. A failed verify fails the release rather than passing CI but failing on someone's laptop later.
+- The verify step adds ~30 seconds to the release workflow. Acceptable for a per-release operation that ships a public artifact.
+- ADR-001's note ("Release verification for v1.0.0 (Phase 10) still pulls from GHCR, which technically requires a local daemon. That is a release sanity check, not a build-time loop, and is fine to revisit when Phase 10 starts.") is now resolved by this ADR.
