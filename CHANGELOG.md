@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (Phase 7)
+
+- `internal/metrics` package: Prometheus exposition surface backed by a private `*prometheus.Registry`. Counters, histograms, and gauges live under the `tunnelsmith_` namespace. The metric set is intentionally bounded to keep cardinality safe: per-upstream labels only, no per-host labels (per-host detail belongs in the Phase 9 web UI). Dependency: `github.com/prometheus/client_golang v1.23.2`.
+- `internal/metrics.Server`: exposes `/metrics` plus a cheap `/healthz` endpoint at the address `metrics.bind` names. Setting `metrics.bind = ""` disables the listener entirely.
+- `internal/scoreboard.SaveSnapshot` / `LoadSnapshot`: gob-encoded scoreboard state with a fixed magic-plus-version header and an atomic temp-and-rename write. Missing files are not an error so a fresh install starts clean. `internal/scoreboard.PersistenceLoop` ticks on `cache.persist_interval` and runs one final flush at ctx cancellation; setting `persist_interval` to `"0s"` disables periodic writes.
+- `internal/scoreboard.Prune` (closes #11): drops zero-score entries whose `lastSeen` is older than `failure.scoring.prune_after`, removes empty per-host maps, evicts expired cascade entries, and clears debounce keys older than `10 * debounce_window`. Runs from the persistence tick and at shutdown.
+- `internal/scoreboard.ReplacePool` and `Reload`: hot-swap the upstream pool and the scoring tunings under a single write lock so concurrent Pick / Record* calls cannot tear. Per-(host, upstream) entries survive the swap; entries keyed off ids that no longer exist age out via Prune.
+- `internal/listener (HTTP).Reload` and `CloseTransportsExcept`: live updates for the failure detector and the retry cap, plus a way to drop cached transports for upstreams that disappeared in the new pool.
+- `cmd/tunnelsmith`: SIGHUP hot-reload. Re-reads the config file, validates it, and applies upstream list, scoring tunings, status detector, and retry cap in place. Listener bindings, decay interval, persistence path / interval, and `[[upstream_pool]]` refresh interval stay frozen at startup; a reload that violates that scope logs a warning and the binary keeps running on the old config.
+- `cmd/tunnelsmith`: scoreboard gauge refresher copies `EntriesCount`, `CooledHostsByUpstream`, and `CascadeActiveCount` into the metrics registry every 5 seconds so `/metrics` mirrors the snapshot file.
+- `internal/config`: new keys `metrics.bind` (default `:9090`; `""` disables), `cache.persist_interval` (default `30s`; `0s` disables periodic writes), and `failure.scoring.prune_after` (default `24h`; `0s` disables entry pruning).
+- `docs/observability.md`: every metric documented (name, type, labels, meaning) plus a worked example of a Prometheus scrape config and a Grafana dashboard import.
+- `deploy/grafana-dashboard.json`: importable dashboard with panels for request outcome rate, dial latency, status failures by upstream, scoreboard size, and cascade active hosts.
+- Resolution for issue #12 (scoreboard lock contention): `BenchmarkScoreboardWriterContention` covers the worst-case mix of concurrent Pick + RecordSuccess writers running against a snapshotter on a 5ms tick and a SaveSnapshot on a 50ms tick. The bench shows ~3.3 microseconds per op at homelab scale (1k hosts, 20 upstreams) with no starvation of either auxiliary loop, so no mitigation is needed for v1.
+
 ### Added (Phase 6)
 
 - `internal/upstream/mullvad` package: relay-list parser, disk-cache fallback, SOCKS5 hostname derivation per ADR-004, and an `Expander` that turns `[[upstream_pool]]` blocks into `config.UpstreamConfig` entries the priority pool consumes. Country filter is case-insensitive, inactive relays are dropped by default, malformed hostnames are skipped with a warn-level log line. The `Run` method drives a refresh ticker; the first snapshot is delivered synchronously so a missing API at startup is fatal.

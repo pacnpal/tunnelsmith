@@ -30,6 +30,17 @@ negative_ttl = "1m"
 # Must be absolute when set. Empty means in-memory only.
 # persist_path = "/data/tunnelsmith/decisions.db"
 
+# How often the persistence loop snapshots state to persist_path.
+# 0s disables periodic writes; the shutdown flush still runs when
+# persist_path is set.
+persist_interval = "30s"
+
+# --------------------------------------------------------------------
+# Metrics endpoint. Defaults to :9090; empty disables the listener.
+# --------------------------------------------------------------------
+[metrics]
+bind = ":9090"
+
 # --------------------------------------------------------------------
 # Upstreams. At least one is required. Every upstream needs a unique id.
 #
@@ -150,6 +161,11 @@ cascade_ttl = "30s"
 # within debounce_window collapse into one penalty event. Stops
 # concurrent client requests from over-penalizing one rate-limit event.
 debounce_window = "100ms"
+
+# The persistence-tick prune pass drops entries with score == 0 and
+# lastSeen older than prune_after. 0s disables entry pruning; expired
+# cascade entries and stale debounce keys are still evicted.
+prune_after = "24h"
 
 # --------------------------------------------------------------------
 # Per-host rules. Optional. Phase 8 enables them in the router.

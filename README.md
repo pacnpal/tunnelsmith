@@ -57,9 +57,14 @@ If you build a container that benefits from outbound proxying (`*arr` apps, scra
 - [`docs/configuration.md`](docs/configuration.md): every config key explained
 - [`docs/architecture.md`](docs/architecture.md): how the scoreboard works (Phase 4)
 - [`docs/deployment.md`](docs/deployment.md): running Tunnelsmith with Mullvad and other upstreams (Phase 6)
+- [`docs/observability.md`](docs/observability.md): Prometheus metrics, persistence, and SIGHUP hot-reload (Phase 7)
 - [`docs/request-lifecycle.md`](docs/request-lifecycle.md): end-to-end trace of a single request
 - [`docs/integration-guide.md`](docs/integration-guide.md): for container maintainers adding Tunnelsmith support
 - [`docs/decisions.md`](docs/decisions.md): architecture decision records
+
+## Metrics and persistence
+
+When `metrics.bind` is set (default `:9090`), Tunnelsmith exposes Prometheus metrics at `/metrics`. Setting `cache.persist_path` makes the scoreboard survive restarts via a gob snapshot on `cache.persist_interval`. Sending `SIGHUP` re-reads the config file and applies upstreams, scoring, and detection rules in place. See [`docs/observability.md`](docs/observability.md) for the metric reference, scrape config, and Grafana dashboard import.
 
 ## License
 
