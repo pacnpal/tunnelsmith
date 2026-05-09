@@ -1,0 +1,58 @@
+package failure
+
+import (
+	"math"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// maxRetryAfterSeconds caps the seconds form at the largest value
+// time.Duration (an int64 nanoseconds) can represent without wrapping
+// negative. ~292 years; anything beyond is rejected as unparsable so the
+// "non-negative when ok=true" contract holds.
+const maxRetryAfterSeconds = int64(math.MaxInt64) / int64(time.Second)
+
+// ParseRetryAfter parses an RFC 7231 §7.1.3 Retry-After header value relative
+// to the supplied clock reading. The grammar admits two shapes: a
+// non-negative integer count of seconds, or an HTTP-date in any of the three
+// forms RFC 7231 §7.1.1.1 lists (IMF-fixdate, the obsolete RFC 850 form, and
+// ANSI C asctime). net/http.ParseTime handles all three date shapes.
+//
+// Returns the duration the destination is asking the caller to wait. ok is
+// false when the value is empty, parses as neither shape, names a negative
+// integer of seconds, or names a date in the past relative to now (which
+// would otherwise produce a negative duration). The returned duration is
+// non-negative when ok is true, including the legitimate "Retry-After: 0"
+// case which means "retry immediately".
+func ParseRetryAfter(value string, now time.Time) (time.Duration, bool) {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return 0, false
+	}
+	// ParseInt with explicit bitSize=64 instead of strconv.Atoi: the latter
+	// parses into platform-dependent int, which is 32-bit on 32-bit
+	// platforms. A valid Retry-After value larger than int32 would there
+	// overflow and read as unparsable. Forcing 64 bits keeps the parser
+	// portable across builds.
+	if secs, err := strconv.ParseInt(v, 10, 64); err == nil {
+		if secs < 0 || secs > maxRetryAfterSeconds {
+			// Negative is nonsense per RFC 7231 §7.1.3. Above the cap
+			// would overflow time.Duration's int64 nanoseconds and
+			// surface as a silently-negative Duration; the doc contract
+			// promises non-negative when ok=true, so refuse instead.
+			return 0, false
+		}
+		return time.Duration(secs) * time.Second, true
+	}
+	t, err := http.ParseTime(v)
+	if err != nil {
+		return 0, false
+	}
+	d := t.Sub(now)
+	if d < 0 {
+		return 0, false
+	}
+	return d, true
+}

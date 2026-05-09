@@ -492,12 +492,19 @@ func (s *Scoreboard) RecordSuccess(host, upstreamID string, latency time.Duratio
 }
 
 // RecordFailure applies a penalty + cooldown for (host, upstreamID, kind).
-// retryAfter, if > 0, replaces the kind's default cooldown. Identical
-// (host, upstream, kind) triples arriving within DebounceWindow collapse
-// into one penalty event; later calls are dropped silently. globalFailureCount
-// counts penalty events, not raw observations, so it stays consistent with
-// what the score actually changed by.
-func (s *Scoreboard) RecordFailure(host, upstreamID string, kind failure.Kind, retryAfter time.Duration) {
+// cooldownOverride, when non-nil, is authoritative: it replaces any
+// prior cooldownUntil rather than only extending it. A non-nil zero
+// pointer represents "Retry-After: 0", meaning the destination says
+// retry immediately, and clears any existing cooldownUntil. A nil
+// pointer falls back to the kind's default cooldown from KindPolicy
+// and only extends cooldownUntil (the same monotonic behavior earlier
+// failures used).
+//
+// Identical (host, upstream, kind) triples arriving within DebounceWindow
+// collapse into one penalty event; later calls are dropped silently.
+// globalFailureCount counts penalty events, not raw observations, so it
+// stays consistent with what the score actually changed by.
+func (s *Scoreboard) RecordFailure(host, upstreamID string, kind failure.Kind, cooldownOverride *time.Duration) {
 	if !kind.Valid() {
 		return
 	}
@@ -506,9 +513,10 @@ func (s *Scoreboard) RecordFailure(host, upstreamID string, kind failure.Kind, r
 		return
 	}
 	policy := s.cfg.KindPolicy[kind]
+	overridden := cooldownOverride != nil
 	cooldown := policy.Cooldown
-	if retryAfter > 0 {
-		cooldown = retryAfter
+	if overridden {
+		cooldown = *cooldownOverride
 	}
 	s.mu.Lock()
 	e := s.getOrCreateLocked(host, upstreamID)
@@ -516,7 +524,19 @@ func (s *Scoreboard) RecordFailure(host, upstreamID string, kind failure.Kind, r
 	if e.score < -s.cfg.ScoreCap {
 		e.score = -s.cfg.ScoreCap
 	}
-	if cooldown > 0 {
+	switch {
+	case overridden && cooldown > 0:
+		// Destination's explicit Retry-After wins over any prior
+		// cooldown, even if the prior was longer.
+		e.cooldownUntil = now.Add(cooldown)
+	case overridden:
+		// Retry-After: 0 means retry immediately; clear any prior
+		// cooldown so this upstream is eligible again.
+		e.cooldownUntil = time.Time{}
+	case cooldown > 0:
+		// No explicit override, fall back to extend-only behavior so
+		// later default-cooldown events cannot shorten an active
+		// cooldown.
 		until := now.Add(cooldown)
 		if until.After(e.cooldownUntil) {
 			e.cooldownUntil = until
@@ -641,7 +661,7 @@ func (s *Scoreboard) DialFor(ctx context.Context, network, addr string) (net.Con
 		}
 		kind := failure.ClassifyDialError(dialErr)
 		if kind != "" {
-			s.RecordFailure(host, up.ID(), kind, 0)
+			s.RecordFailure(host, up.ID(), kind, nil)
 		}
 		s.logger.Warn("upstream dial",
 			"upstream_id", up.ID(),
@@ -657,7 +677,7 @@ func (s *Scoreboard) DialFor(ctx context.Context, network, addr string) (net.Con
 	}
 
 	// Out of retries. Trip cascade and surface the aggregated error.
-	s.tripCascade(host)
+	s.TripCascade(host)
 	return nil, "", fmt.Errorf(
 		"scoreboard: all upstreams failed after %d attempt(s) (cap=%d, pool=%d): %w",
 		attempts, retryCap, candidateCount, errors.Join(attemptErrs...),

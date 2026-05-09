@@ -7,6 +7,7 @@ package listener
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -14,27 +15,34 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/pacnpal/tunnelsmith/internal/failure"
 	"github.com/pacnpal/tunnelsmith/internal/scoreboard"
+	"github.com/pacnpal/tunnelsmith/internal/upstream"
 )
 
 // HTTPServer accepts HTTP CONNECT and plain-HTTP forward-proxy traffic.
 type HTTPServer struct {
-	addr   string
-	sb     *scoreboard.Scoreboard
-	logger *slog.Logger
+	addr     string
+	sb       *scoreboard.Scoreboard
+	detector *failure.StatusDetector
+	retryCap int
+	logger   *slog.Logger
 
 	server *http.Server
 
-	// transport is shared across all forward-proxy requests so the
-	// per-Transport allocation and bookkeeping happens once at boot, not
-	// on every request. DisableKeepAlives stays true: the scoreboard
-	// decides upstreams per dial, and reusing a TCP connection would pin
-	// the request to whichever upstream served the cold dial.
-	transport *http.Transport
+	// transports caches one *http.Transport per upstream id. Each
+	// transport's DialContext pins to one upstream's Dial method, so HTTP
+	// keep-alive can pool conns to the destination through that upstream
+	// without the dial path losing its per-upstream identity. The map is
+	// lazy: an entry is created the first time the listener picks that
+	// upstream. Guarded by transportsMu.
+	transportsMu sync.Mutex
+	transports   map[string]*http.Transport
 
 	// ready closes once Serve has finished binding the listener (or
 	// finished failing to bind). Callers waiting on Addr() block on this
@@ -49,32 +57,33 @@ type HTTPServer struct {
 	tunnels   map[*tunnel]struct{}
 }
 
-// chosenIDCtxKey carries a *string into the forward-proxy DialContext so
-// the dial callback can hand the upstream id back to the per-request log
-// line without sharing mutable state across goroutines on the Transport.
-type chosenIDCtxKey struct{}
-
 // NewHTTP builds an HTTP listener that routes everything through sb. The
 // scoreboard must be non-nil; passing nil returns a clear error so callers
 // see the contract violation at construction time instead of a nil-deref
-// on the first request. Mirrors NewSOCKS's signature for symmetry.
-func NewHTTP(addr string, sb *scoreboard.Scoreboard, logger *slog.Logger) (*HTTPServer, error) {
+// on the first request. detector may be nil, in which case status-code
+// detection is disabled and every response is treated as success. retryCap
+// must be at least 1 and bounds the per-request attempts on the plain-HTTP
+// forward path; the value mirrors failure.max_retries_per_request from
+// config so dial retries and status retries share the same budget.
+func NewHTTP(addr string, sb *scoreboard.Scoreboard, detector *failure.StatusDetector, retryCap int, logger *slog.Logger) (*HTTPServer, error) {
 	if sb == nil {
 		return nil, errors.New("listener.NewHTTP: scoreboard is nil")
+	}
+	if retryCap < 1 {
+		return nil, fmt.Errorf("listener.NewHTTP: retryCap must be >= 1, got %d", retryCap)
 	}
 	if logger == nil {
 		logger = slog.Default()
 	}
 	h := &HTTPServer{
-		addr:    addr,
-		sb:      sb,
-		logger:  logger.With("listener", "http"),
-		ready:   make(chan struct{}),
-		tunnels: make(map[*tunnel]struct{}),
-	}
-	h.transport = &http.Transport{
-		DialContext:       h.dialThroughScoreboard,
-		DisableKeepAlives: true,
+		addr:       addr,
+		sb:         sb,
+		detector:   detector,
+		retryCap:   retryCap,
+		logger:     logger.With("listener", "http"),
+		ready:      make(chan struct{}),
+		tunnels:    make(map[*tunnel]struct{}),
+		transports: make(map[string]*http.Transport),
 	}
 	h.server = &http.Server{
 		Addr:              addr,
@@ -84,18 +93,39 @@ func NewHTTP(addr string, sb *scoreboard.Scoreboard, logger *slog.Logger) (*HTTP
 	return h, nil
 }
 
-// dialThroughScoreboard is the Transport's DialContext. The scoreboard
-// picks an upstream and returns the conn; if a *string is stashed in ctx
-// under chosenIDCtxKey, the chosen upstream id is written there for the
-// caller's log line.
-func (h *HTTPServer) dialThroughScoreboard(ctx context.Context, network, addr string) (net.Conn, error) {
-	conn, id, err := h.sb.DialFor(ctx, network, addr)
-	if err == nil {
-		if box, ok := ctx.Value(chosenIDCtxKey{}).(*string); ok {
-			*box = id
-		}
+// transportFor returns the Transport pinned to up, building it on first use.
+// Each Transport's DialContext is closed over the upstream's Dial method, so
+// HTTP keep-alive pools conns to the destination through the same upstream.
+// MaxIdleConnsPerHost is set to 4 (slightly above stdlib's default of 2)
+// so a small burst of concurrent clients hitting the same destination
+// through this upstream can keep a handful of conns warm; MaxIdleConns is
+// capped at 100 (versus stdlib's default of unlimited) so the total idle
+// pool across destinations cannot grow without bound.
+func (h *HTTPServer) transportFor(up upstream.Upstream) *http.Transport {
+	h.transportsMu.Lock()
+	defer h.transportsMu.Unlock()
+	if t, ok := h.transports[up.ID()]; ok {
+		return t
 	}
-	return conn, err
+	pinned := up
+	t := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return pinned.Dial(ctx, network, addr)
+		},
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   4,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		// Forward proxies must not auto-add Accept-Encoding and silently
+		// decompress: net/http would strip Content-Encoding and
+		// Content-Length on the way back, breaking byte-for-byte
+		// transparency. With DisableCompression true, the destination's
+		// encoded body and headers reach the client untouched.
+		DisableCompression: true,
+	}
+	h.transports[up.ID()] = t
+	return t
 }
 
 // Ready returns a channel that closes once Serve has either bound the
@@ -150,6 +180,10 @@ func (h *HTTPServer) Shutdown(ctx context.Context) error {
 	// not see them; we close them explicitly below.
 	httpErr := h.server.Shutdown(ctx)
 
+	// Close idle conns held by every per-upstream transport so the OS can
+	// reap them promptly instead of waiting on IdleConnTimeout.
+	h.closeAllIdleConns()
+
 	// Drain hijacked tunnels.
 	tunnels := h.snapshotTunnels()
 	if len(tunnels) == 0 {
@@ -175,6 +209,18 @@ func (h *HTTPServer) Shutdown(ctx context.Context) error {
 			return ctx.Err()
 		}
 		return httpErr
+	}
+}
+
+func (h *HTTPServer) closeAllIdleConns() {
+	h.transportsMu.Lock()
+	transports := make([]*http.Transport, 0, len(h.transports))
+	for _, t := range h.transports {
+		transports = append(transports, t)
+	}
+	h.transportsMu.Unlock()
+	for _, t := range transports {
+		t.CloseIdleConnections()
 	}
 }
 
@@ -238,50 +284,348 @@ func (h *HTTPServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 	)
 }
 
+// handleForward serves the plain-HTTP forward-proxy path. Each request runs
+// through a Pick + RoundTrip + status-detect loop bounded by retryCap. Dial
+// failures and status-code failures both consume the retry budget; the
+// scoreboard records each failure under the right Kind so cooldowns and
+// global counters stay in sync. On success the response carries
+// X-Tunnelsmith-Upstream and X-Tunnelsmith-Retries; on cascade-failure 502
+// the response carries X-Tunnelsmith-Cascade and X-Tunnelsmith-Retries.
 func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 	if !r.URL.IsAbs() {
 		http.Error(w, "absolute URL required for forward proxy", http.StatusBadRequest)
 		return
 	}
+	// Restrict to http/https. Unsupported schemes (ftp://, gopher://, etc.)
+	// would make every RoundTrip fail deterministically, burning the retry
+	// budget and incorrectly tripping cascade for the host. Reject up front
+	// so the scoreboard does not blame any upstream for a request the
+	// listener cannot serve.
+	if scheme := strings.ToLower(r.URL.Scheme); scheme != "http" && scheme != "https" {
+		http.Error(w, "unsupported scheme: forward proxy supports http and https only", http.StatusBadRequest)
+		return
+	}
 	start := time.Now()
+	host := r.URL.Hostname()
+	// IsAbs is true for malformed absolute-form URIs like "http:/path"
+	// where the scheme is set but the URL host is missing. Even if a Host:
+	// header is present, outbound RoundTrip still fails deterministically
+	// because req.URL.Host is empty. Reject up front so the scoreboard
+	// does not burn retries or trip cascade for a host the listener cannot
+	// actually serve.
+	if host == "" {
+		http.Error(w, "request URL missing host", http.StatusBadRequest)
+		return
+	}
 
-	// Per-request *string box passed to the shared Transport's
-	// DialContext via the request context. Each in-flight request has
-	// its own box, so concurrent requests do not race on the chosen id.
-	var chosenID string
-	ctx := context.WithValue(r.Context(), chosenIDCtxKey{}, &chosenID)
-	outReq := r.Clone(ctx)
-	outReq.RequestURI = ""
-	stripHopHeaders(outReq.Header)
-	stripProxyHeaders(outReq.Header)
-
-	resp, err := h.transport.RoundTrip(outReq)
+	// Buffer the request body so the retry loop can replay it on each
+	// attempt. Cap the buffer so a client cannot exhaust the proxy's
+	// memory by streaming an unbounded body through a forward request:
+	// 8 MiB is comfortably larger than any homelab traffic Tunnelsmith
+	// is meant to carry while still bounded. Bodies above the cap get a
+	// 413; they cannot be safely retried without spooling to disk, which
+	// is out of scope for v1.
+	//
+	// When the client declared Content-Length, reject early without
+	// reading any body bytes: the alternative is to drain the oversize
+	// body just to send a 413, which defeats the memory bound.
+	if r.ContentLength > maxBufferedRequestBody {
+		h.logger.Warn("forward body too large for retry buffer (declared)",
+			"host", host,
+			"declared_bytes", r.ContentLength,
+			"cap_bytes", maxBufferedRequestBody,
+		)
+		_ = r.Body.Close()
+		http.Error(w, "Request Entity Too Large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	bodyBytes, oversize, err := readBoundedBody(r.Body, maxBufferedRequestBody)
 	if err != nil {
-		h.logger.Warn("forward roundtrip failed", "url", r.URL.String(), "err", err)
+		_ = r.Body.Close()
+		h.logger.Warn("forward read body failed", "host", host, "err", err)
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		return
 	}
-	defer func() { _ = resp.Body.Close() }()
+	_ = r.Body.Close()
+	if oversize {
+		h.logger.Warn("forward body too large for retry buffer (streamed)",
+			"host", host,
+			"cap_bytes", maxBufferedRequestBody,
+		)
+		http.Error(w, "Request Entity Too Large", http.StatusRequestEntityTooLarge)
+		return
+	}
 
+	tried := make(map[string]bool, h.retryCap)
+	var (
+		retries        int
+		cascadeAlready bool
+	)
+	for attempt := 0; attempt < h.retryCap; attempt++ {
+		if err := r.Context().Err(); err != nil {
+			h.logger.Warn("forward client context done",
+				"host", host,
+				"attempt", attempt+1,
+				"err", err,
+			)
+			panic(http.ErrAbortHandler)
+		}
+		up, pickErr := h.sb.Pick(host, tried)
+		if pickErr != nil {
+			cascadeAlready = errors.Is(pickErr, scoreboard.ErrCascadeCooling)
+			h.logger.Warn("forward pick exhausted",
+				"host", host,
+				"attempt", attempt+1,
+				"err", pickErr,
+			)
+			break
+		}
+		outReq := h.newOutReq(r, bodyBytes)
+		tport := h.transportFor(up)
+		attemptStart := time.Now()
+		resp, rtErr := tport.RoundTrip(outReq)
+		latency := time.Since(attemptStart)
+
+		if rtErr != nil {
+			// Distinguish caller-cancelled from upstream failure: if the
+			// client's request context is done, the dial error reflects a
+			// teardown rather than the upstream being unable to reach the
+			// host. Skip RecordFailure so the upstream is not penalized
+			// for the client's hangup.
+			if ctxErr := r.Context().Err(); ctxErr != nil {
+				h.logger.Warn("forward client context done mid-attempt",
+					"host", host,
+					"upstream_id", up.ID(),
+					"attempt", attempt+1,
+					"err", ctxErr,
+				)
+				panic(http.ErrAbortHandler)
+			}
+			// RoundTrip errors come in two flavors:
+			//   1. dial-level (refused, timeout) - the upstream could not
+			//      open a TCP/TLS path to the destination.
+			//   2. post-dial (TLS verification, HTTP parse, server hung up
+			//      mid-response, etc.) - the upstream connected fine but
+			//      something past the dial layer failed.
+			// Only the first kind is fairly attributed to the upstream.
+			// Recording the second kind would penalize the upstream for
+			// problems that may belong to the destination, so we narrow
+			// to explicit timeout / refused matches and skip RecordFailure
+			// for everything else. The request still rotates to the next
+			// upstream because tried[] gets the id either way.
+			var kind failure.Kind
+			switch {
+			case failure.IsTimeout(rtErr):
+				kind = failure.KindTimeout
+			case failure.IsConnectionRefused(rtErr):
+				kind = failure.KindRefused
+			}
+			if kind != "" {
+				h.sb.RecordFailure(host, up.ID(), kind, nil)
+			}
+			tried[up.ID()] = true
+			retries++
+			h.logger.Warn("forward attempt failed",
+				"host", host,
+				"upstream_id", up.ID(),
+				"kind", string(kind),
+				"latency_ms", latency.Milliseconds(),
+				"attempt", attempt+1,
+				"err", rtErr,
+			)
+			continue
+		}
+
+		det, isFail := h.detector.Detect(resp.StatusCode, resp.Header)
+		if isFail {
+			h.sb.RecordFailure(host, up.ID(), det.Kind, det.CooldownOverride)
+			drainAndClose(resp.Body)
+			tried[up.ID()] = true
+			retries++
+			retryAfterMS := int64(-1)
+			if det.CooldownOverride != nil {
+				retryAfterMS = det.CooldownOverride.Milliseconds()
+			}
+			h.logger.Warn("forward status failure",
+				"host", host,
+				"upstream_id", up.ID(),
+				"status", resp.StatusCode,
+				"kind", string(det.Kind),
+				"retry_after_ms", retryAfterMS,
+				"latency_ms", latency.Milliseconds(),
+				"attempt", attempt+1,
+			)
+			continue
+		}
+
+		h.sb.RecordSuccess(host, up.ID(), latency)
+		h.writeForwardSuccess(w, resp, up.ID(), retries)
+		h.logger.Info("forward done",
+			"url", r.URL.String(),
+			"host", host,
+			"upstream_id", up.ID(),
+			"status", resp.StatusCode,
+			"retries", retries,
+			"latency_ms", time.Since(start).Milliseconds(),
+		)
+		return
+	}
+
+	// Exhausted: every attempt either failed to dial or returned a
+	// status-code-detected failure. Trip cascade if Pick did not already
+	// hand back a cascade error, then respond 502 with the cascade headers.
+	if !cascadeAlready {
+		h.sb.TripCascade(host)
+	}
+	w.Header().Set("X-Tunnelsmith-Cascade", host)
+	w.Header().Set("X-Tunnelsmith-Retries", strconv.Itoa(retries))
+	http.Error(w, "Bad Gateway", http.StatusBadGateway)
+	h.logger.Warn("forward exhausted",
+		"url", r.URL.String(),
+		"host", host,
+		"retries", retries,
+		"latency_ms", time.Since(start).Milliseconds(),
+	)
+}
+
+// newOutReq clones r for an outbound attempt. RequestURI is cleared, hop
+// and proxy headers are stripped, and the body is rebuilt from the buffered
+// bytes so retries replay the same payload. GetBody is set as well; the
+// stdlib transport calls GetBody on internal retries (e.g. an HTTP/1
+// connection that the server closed mid-request) and on 307/308 redirects.
+//
+// TransferEncoding and Trailer are cleared on the outbound request: when
+// the inbound request was chunked, r.Clone preserves
+// TransferEncoding=["chunked"], which would race ContentLength on the
+// outbound side and surface a "request has both Content-Length and
+// Transfer-Encoding" error from the transport. The buffered body has a
+// known length, so chunked framing is not needed on the way out.
+//
+// Host is pinned to URL.Host so the outbound Host header matches the dial
+// target. Clients can legally send a forward-proxy request whose Host
+// header disagrees with the absolute URL (e.g. GET http://a.example/...
+// HTTP/1.1\r\nHost: b.example); without this normalization the transport
+// would dial a.example but advertise b.example, which misroutes virtual
+// hosts at the destination and lets the cascade key (URL.Hostname) drift
+// from what the origin actually serves.
+func (h *HTTPServer) newOutReq(r *http.Request, body []byte) *http.Request {
+	out := r.Clone(r.Context())
+	out.RequestURI = ""
+	out.TransferEncoding = nil
+	out.Trailer = nil
+	out.Host = out.URL.Host
+	if len(body) > 0 {
+		out.Body = io.NopCloser(bytes.NewReader(body))
+		out.ContentLength = int64(len(body))
+		out.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(body)), nil
+		}
+	} else {
+		out.Body = http.NoBody
+		out.ContentLength = 0
+		out.GetBody = func() (io.ReadCloser, error) { return http.NoBody, nil }
+	}
+	stripHopHeaders(out.Header)
+	stripProxyHeaders(out.Header)
+	return out
+}
+
+// writeForwardSuccess copies the upstream response back to the client and
+// adds the Tunnelsmith-specific headers. Hop-by-hop headers are stripped
+// per RFC 7230 §6.1; any X-Tunnelsmith-* headers the destination tried to
+// inject are stripped too so a malicious or careless server cannot spoof
+// the proxy's own observability namespace. Everything else (Set-Cookie,
+// Cache-Control, ...) is forwarded verbatim. Closes resp.Body when done.
+func (h *HTTPServer) writeForwardSuccess(w http.ResponseWriter, resp *http.Response, upID string, retries int) {
+	defer func() { _ = resp.Body.Close() }()
 	respHeader := resp.Header.Clone()
 	stripHopHeaders(respHeader)
+	stripTunnelsmithHeaders(respHeader)
 	for k, vs := range respHeader {
 		for _, v := range vs {
 			w.Header().Add(k, v)
 		}
 	}
+	w.Header().Set("X-Tunnelsmith-Upstream", upID)
+	w.Header().Set("X-Tunnelsmith-Retries", strconv.Itoa(retries))
 	w.WriteHeader(resp.StatusCode)
 	if _, err := io.Copy(w, resp.Body); err != nil {
-		h.logger.Warn("forward copy failed", "url", r.URL.String(), "err", err)
-		return
+		h.logger.Warn("forward copy failed", "upstream_id", upID, "err", err)
 	}
+}
 
-	h.logger.Info("forward done",
-		"url", r.URL.String(),
-		"upstream_id", chosenID,
-		"status", resp.StatusCode,
-		"latency_ms", time.Since(start).Milliseconds(),
+// stripTunnelsmithHeaders removes any X-Tunnelsmith-* headers from h.
+// http.Header keys are stored in canonical MIME form ("X-Tunnelsmith-...")
+// so a single prefix check covers every variant a destination might send.
+func stripTunnelsmithHeaders(h http.Header) {
+	for k := range h {
+		if strings.HasPrefix(k, "X-Tunnelsmith-") {
+			h.Del(k)
+		}
+	}
+}
+
+// drainAndClose drains and closes a response body that the listener
+// intends to discard. The drain is bounded two ways: by bytes (64 KiB
+// via io.LimitReader) and by time (drainTimeout via a goroutine plus
+// timer). A misbehaving upstream that ships a status line plus headers
+// and then stalls on body bytes would otherwise block the retry loop
+// here indefinitely, since LimitReader caps bytes but not wall time.
+// On timeout the body is closed (which interrupts the in-flight read in
+// the helper goroutine) and the goroutine is awaited so it does not
+// leak. Either path means keep-alive reuse is best-effort: bodies that
+// fit within the cap and arrive before the timeout let the transport
+// return the conn to its pool; anything else makes the transport close
+// the conn instead.
+func drainAndClose(body io.ReadCloser) {
+	const (
+		maxDrain     = 64 << 10 // 64 KiB
+		drainTimeout = 250 * time.Millisecond
 	)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = io.Copy(io.Discard, io.LimitReader(body, maxDrain))
+	}()
+	timer := time.NewTimer(drainTimeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		_ = body.Close()
+	case <-timer.C:
+		// Close interrupts the in-flight Read inside the goroutine; wait
+		// for the goroutine to observe the close and exit so we never
+		// return with a live drain still running.
+		_ = body.Close()
+		<-done
+	}
+}
+
+// maxBufferedRequestBody caps how much of an inbound request body the
+// listener buffers for retry replay. 8 MiB covers homelab traffic
+// (Sonarr, browsers, scrapers) with plenty of margin and bounds the
+// memory a single request can pin. Requests above this size get a 413;
+// adding a streaming or disk-spool fallback for larger bodies is a
+// post-v1 question.
+const maxBufferedRequestBody = 8 << 20 // 8 MiB
+
+// readBoundedBody reads body up to limit+1 bytes. If the result is
+// strictly larger than limit, the body is reported as oversize and the
+// returned slice contains the prefix that was read (the rest of body is
+// not drained: the caller is expected to respond and bail). Errors
+// propagate as-is; an EOF inside Read is not an error.
+func readBoundedBody(body io.Reader, limit int64) ([]byte, bool, error) {
+	if body == nil {
+		return nil, false, nil
+	}
+	buf, err := io.ReadAll(io.LimitReader(body, limit+1))
+	if err != nil {
+		return nil, false, err
+	}
+	if int64(len(buf)) > limit {
+		return buf, true, nil
+	}
+	return buf, false, nil
 }
 
 // hopHeaders are the connection-scoped headers RFC 7230 §6.1 says a proxy

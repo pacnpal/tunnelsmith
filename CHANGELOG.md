@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (Phase 5)
+
+- `internal/failure`: `ParseRetryAfter` covers RFC 7231 §7.1.3 in both shapes (non-negative integer seconds and any of the three HTTP-date forms `net/http.ParseTime` accepts), and `StatusDetector` maps configured `[[failure.status]]` rules to a `failure.Kind` plus an optional honored `Retry-After` duration. Codes outside the supported set (429 / 403 / 451) are skipped silently because no `failure.Kind` exists for them yet.
+- `internal/listener` (HTTP plain-HTTP forward path): the forward path now drives its own pick-dial-detect retry loop on top of the scoreboard. 429, 403, and 451 responses are recorded against the (host, upstream) entry with the right kind, the response is drained, and the request rotates to the next-best upstream within the same retry budget. 5xx and other 4xx responses are forwarded to the client without being treated as upstream failures (no penalty, no rotation). Every response that reaches the client on the success path - 2xx, 3xx, 4xx-other, 5xx alike - carries `X-Tunnelsmith-Upstream` and `X-Tunnelsmith-Retries` so operators can see which upstream served and how many retries the request consumed; the cascade-failure 502 carries `X-Tunnelsmith-Cascade` and `X-Tunnelsmith-Retries`.
+- `internal/listener` (HTTP): one `http.Transport` per upstream, lazily created and cached, so HTTP keep-alive can pool conns to the destination through that upstream. The Phase 4 single-shared-Transport with `DisableKeepAlives = true` is gone; per-upstream Transport pools are the right shape now that the listener picks upstreams itself.
+- `internal/scoreboard`: `Scoreboard.TripCascade(host)` is exported so the listener's plain-HTTP loop can mark cascade after exhausting every upstream for one request. Internal callers converged on the public name.
+- `docs/configuration.md`: new "CONNECT and SOCKS5: what status detection cannot see" section explaining why neither status detection nor header injection runs on those paths.
+
 ### Added (Phase 4)
 
 - `internal/scoreboard` package: per-(host, upstream) scoreboard with score, cooldowns, time decay, cascade-failure handling with negative TTL, recovery probing, failure debounce, and an injectable random source. `Scoreboard.DialFor` is the listener-side dial entry point; it walks Pick → Dial → Record in a loop bounded by the pool's retry cap and trips cascade for the host on full failure.

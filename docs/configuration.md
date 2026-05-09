@@ -115,7 +115,7 @@ Knobs for the per-(host, upstream) scoreboard introduced in Phase 4. Sensible de
 | `cascade_ttl`      | duration | `30s`   | negative TTL for a host where every upstream just failed; subsequent requests within the TTL get an immediate cascade error without burning through the pool |
 | `debounce_window`  | duration | `100ms` | identical `(host, upstream, kind)` failures arriving within this window collapse into one penalty event |
 
-The rate-limit, forbidden, and legal-block kinds get their penalty and cooldown from `[[failure.status]]` entries (Phase 5 wires them through the listener). Body-match policy lands in Phase 8.
+The rate-limit, forbidden, and legal-block kinds get their penalty and cooldown from `[[failure.status]]` entries. Phase 5 wires them through the plain-HTTP listener: when a 429, 403, or 451 lands, the listener records a failure of the matching kind and rotates to the next upstream within the same request, up to `failure.max_retries_per_request`. Body-match policy lands in Phase 8.
 
 ## `[[rule]]`
 
@@ -129,9 +129,20 @@ Optional per-host overrides. Phase 8 enables them in the router; Phase 1 just va
 
 Every id in `prefer` must match an `id` from a defined `[[upstream]]`.
 
-## CONNECT-mode caveat (forward note for Phase 5)
+## CONNECT and SOCKS5: what status detection cannot see
 
-Status-code inspection requires plain HTTP. CONNECT tunnels are encrypted between client and destination; Tunnelsmith cannot read status codes for those. Status-code rules apply only to plain HTTP traffic and to body-regex matches. CONNECT and SOCKS5 streams stay untouched.
+Status-code detection only runs on plain-HTTP forward-proxy requests. CONNECT tunnels are end-to-end TLS by design, so Tunnelsmith sees ciphertext after the 200 Connection Established line and cannot read status codes inside the tunnel. SOCKS5 is a byte stream from the protocol's first frame; nothing on that path is HTTP-shaped from Tunnelsmith's perspective.
+
+The same caveat applies to header injection, with the precise rule:
+
+- Plain-HTTP responses that an upstream served (any status the detector did not flag as a failure: 2xx, 3xx, 4xx-other, 5xx) carry `X-Tunnelsmith-Upstream` (which upstream served the request) and `X-Tunnelsmith-Retries` (count of failed attempts before success).
+- Cascade-failure 502s (the listener exhausted every upstream for the request) carry `X-Tunnelsmith-Cascade` with the host plus `X-Tunnelsmith-Retries`. They do not carry `X-Tunnelsmith-Upstream`: no upstream served, so there is nothing to attribute.
+- Listener-generated errors that do not even reach the dial loop (e.g. the 400 for a non-absolute or non-http(s) URL) carry no Tunnelsmith headers at all.
+- CONNECT and SOCKS5 paths inject nothing, because Tunnelsmith does not own the response framing on those paths.
+
+Practical consequence: a client that issues an HTTPS request through Tunnelsmith via CONNECT goes through the dial-loop part of the scoreboard (refused, timeout) but not the status part. If you want a host's HTTP and HTTPS traffic to share rate-limit cycling, send the HTTP traffic as a forward-proxy request (no CONNECT) and the HTTPS traffic via CONNECT to a destination that returns 429 over TLS - the HTTP side will rotate exits, the HTTPS side will not, until Phase 8 ships the body-regex hook for response-side inspection.
+
+Body-regex detection in Phase 8 will share this constraint: it can read response bodies on the plain-HTTP path only.
 
 ## See also
 

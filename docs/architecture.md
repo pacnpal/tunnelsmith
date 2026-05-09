@@ -59,9 +59,9 @@ Three things to notice:
 
 `RecordSuccess(host, upstream_id, latency)` adds `success_weight` to score (clamped at `score_cap`), clears `cooldown_until`, sets `last_seen`, increments `global_success_count`, and clears the host's cascade entry if any. A single success is enough to take a host out of cascade.
 
-`RecordFailure(host, upstream_id, kind, retry_after)` looks up the kind's policy (penalty + cooldown), subtracts penalty from score (clamped at `-score_cap`), bumps `cooldown_until` to `now + cooldown` (or `now + retry_after` when the caller passed one, used for HTTP 429 with a `Retry-After` header in Phase 5), sets `last_seen`, and increments `global_failure_count`.
+`RecordFailure(host, upstream_id, kind, cooldown_override)` looks up the kind's policy (penalty + cooldown), subtracts penalty from score (clamped at `-score_cap`), bumps `cooldown_until` to `now + cooldown`, sets `last_seen`, and increments `global_failure_count`. `cooldown_override` is `*time.Duration`: `nil` means use the kind's default cooldown, non-nil overrides it verbatim including a literal zero. The pointer shape exists so the listener can honor `Retry-After: 0` (a legal RFC 7231 §7.1.3 value meaning "retry immediately") without it being indistinguishable from "header absent".
 
-Phase 4 fires only `KindRefused` and `KindTimeout` from the dial path. The scoreboard is wired for `KindRateLimit`, `KindForbidden`, `KindLegalBlock`, and `KindBodyMatch` so Phase 5 (status-code rules) and Phase 8 (body regex) can plug in without changing the core.
+Phase 4 fires only `KindRefused` and `KindTimeout` from the dial path with a nil override. Phase 5 fires `KindRateLimit`, `KindForbidden`, and `KindLegalBlock` from the plain-HTTP listener: when the response status matches a configured `[[failure.status]]` rule, the listener calls `RecordFailure` with the matching kind plus the detector's `CooldownOverride` (non-nil when the rule honors `Retry-After` and the header parsed) and rotates to the next upstream within the same retry budget. `KindBodyMatch` stays unwired until Phase 8.
 
 ## Failure debounce
 
@@ -98,10 +98,22 @@ A single `sync.RWMutex` guards the entries map and the cascade map. Pick takes t
 
 The debounce map and the random source each have their own dedicated mutex so they do not block the main read path.
 
+## Where status detection lives
+
+Status detection is on the listener side, not the scoreboard side. `internal/failure.StatusDetector` reads `[[failure.status]]` once at boot and holds a `code -> Kind` map for the supported codes (429, 403, 451). The plain-HTTP forward path drives a pick-dial-detect loop:
+
+1. Pick an upstream. On cascade or pool exhaustion, fall through to a 502 with `X-Tunnelsmith-Cascade`.
+2. RoundTrip through the upstream's pinned `http.Transport`.
+3. If the RoundTrip returned an error, narrow it: only `failure.IsTimeout` and `failure.IsConnectionRefused` matches translate into a `RecordFailure` (with `KindTimeout` or `KindRefused`). Other RoundTrip errors (TLS verification, HTTP parse, server hangup mid-response, ...) might belong to the destination rather than the upstream, so the listener marks the upstream tried and rotates without penalizing it. The scoreboard's own `DialFor` (used by CONNECT / SOCKS5) operates one layer down, where every error is a real dial-level error, and there it still uses `failure.ClassifyDialError`'s "unknown defaults to refused" mapping.
+4. If a response came back, ask the detector. On a positive match, drain the body, `RecordFailure` with the matched Kind plus any honored `Retry-After`, mark tried, retry.
+5. On a non-match (the common path), `RecordSuccess` and write the response back to the client with `X-Tunnelsmith-Upstream` and `X-Tunnelsmith-Retries`.
+
+`failure.max_retries_per_request` caps total attempts per request, so dial failures and status failures share the budget. Each retried response drain is bounded two ways: `io.LimitReader` caps bytes (64 KiB), and `drainAndClose` caps wall time (250 ms) before closing the body, so a stalled upstream cannot block retries indefinitely.
+
+CONNECT and SOCKS5 paths skip steps 4 and 5 entirely - the listener cannot inspect a TLS tunnel or a SOCKS byte stream. They use `Scoreboard.DialFor` directly, which runs the dial-only loop.
+
 ## What is not here yet
 
-- HTTP status code inspection (Phase 5).
-- Honoring `Retry-After` (Phase 5; the API hook is already in `RecordFailure`).
 - Body-regex detection (Phase 8).
 - Per-host rules (`[[rule]]`) for `force` and `prefer` overrides (Phase 8).
 - Scoreboard persistence to disk (Phase 7).
