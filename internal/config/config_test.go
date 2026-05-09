@@ -118,6 +118,110 @@ kind = "direct"
 	}
 }
 
+func TestUpstreamPoolDefaultsApplied(t *testing.T) {
+	t.Parallel()
+	const src = `
+[[upstream_pool]]
+provider  = "mullvad"
+id_prefix = "mvd"
+countries = ["Sweden"]
+`
+	cfg, err := Parse([]byte(src), "pool-min.toml")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(cfg.UpstreamPools) != 1 {
+		t.Fatalf("want 1 upstream_pool, got %d", len(cfg.UpstreamPools))
+	}
+	p := cfg.UpstreamPools[0]
+	if p.Priority == nil || *p.Priority != 200 {
+		t.Errorf("Priority default = %v, want 200", p.Priority)
+	}
+	if p.PriorityValue() != 200 {
+		t.Errorf("PriorityValue = %d, want 200", p.PriorityValue())
+	}
+	if p.Refresh == nil || p.Refresh.Duration() != 12*time.Hour {
+		t.Errorf("Refresh default = %v, want 12h", p.Refresh)
+	}
+	if p.RefreshDuration() != 12*time.Hour {
+		t.Errorf("RefreshDuration = %v, want 12h", p.RefreshDuration())
+	}
+	if p.IncludeInactive {
+		t.Error("IncludeInactive default should be false")
+	}
+}
+
+func TestUpstreamPoolPriorityZeroIsHonored(t *testing.T) {
+	t.Parallel()
+	const src = `
+[[upstream_pool]]
+provider  = "mullvad"
+id_prefix = "mvd"
+countries = ["Sweden"]
+priority  = 0
+`
+	cfg, err := Parse([]byte(src), "pool-zero.toml")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	p := cfg.UpstreamPools[0]
+	if p.Priority == nil || *p.Priority != 0 {
+		t.Errorf("Priority = %v, want 0 (user-provided zero must not be overwritten)", p.Priority)
+	}
+}
+
+func TestUpstreamPoolReplacesNeedForUpstream(t *testing.T) {
+	t.Parallel()
+	const src = `
+[[upstream_pool]]
+provider  = "mullvad"
+id_prefix = "mvd"
+countries = ["Sweden"]
+`
+	if _, err := Parse([]byte(src), "pool-only.toml"); err != nil {
+		t.Fatalf("Parse: %v (a config with only upstream_pool entries should validate)", err)
+	}
+}
+
+func TestUpstreamPoolRefreshZeroDisablesPolling(t *testing.T) {
+	t.Parallel()
+	const src = `
+[[upstream_pool]]
+provider  = "mullvad"
+id_prefix = "mvd"
+countries = ["Sweden"]
+refresh   = "0s"
+`
+	cfg, err := Parse([]byte(src), "pool-zero-refresh.toml")
+	if err != nil {
+		t.Fatalf("Parse: %v (refresh = 0s must validate; the expander treats 0 as 'disabled')", err)
+	}
+	if cfg.UpstreamPools[0].RefreshDuration() != 0 {
+		t.Fatalf("RefreshDuration = %v, want 0", cfg.UpstreamPools[0].RefreshDuration())
+	}
+}
+
+func TestRulePreferIDCheckDeferredWhenUpstreamPoolPresent(t *testing.T) {
+	t.Parallel()
+	// "mvd-se-sto-wg-001" cannot exist at parse time but will after the
+	// Mullvad pool block expands at startup. config.Validate must accept
+	// the rule; cmd/tunnelsmith re-checks against the merged upstream set
+	// after expansion.
+	const src = `
+[[upstream_pool]]
+provider  = "mullvad"
+id_prefix = "mvd"
+countries = ["Sweden"]
+
+[[rule]]
+host_glob = "*.example.com"
+prefer    = ["mvd-se-sto-wg-001"]
+`
+	if _, err := Parse([]byte(src), "pool-rule.toml"); err != nil {
+		t.Fatalf("Parse: %v (rule preferring a pool-derived id should not fail at parse time)", err)
+	}
+}
+
 // TestExplicitZeroAndFalseSurviveDefaults locks in the bug fix from PR #6
 // review feedback: applyDefaults must not silently overwrite user-provided
 // false / 0 values. The earlier "value == zero" defaulting hid an explicit
@@ -216,7 +320,7 @@ func TestValidationFailures(t *testing.T) {
 [listener]
 http = ":8080"
 `,
-			contains: "at least one [[upstream]]",
+			contains: "at least one [[upstream]] or [[upstream_pool]]",
 		},
 		{
 			name: "missing upstream id",
@@ -401,6 +505,111 @@ id = "d"
 kind = "direct"
 `,
 			contains: "must be an absolute path",
+		},
+		{
+			name: "upstream_pool missing provider",
+			toml: `
+[[upstream_pool]]
+id_prefix = "mvd"
+countries = ["Sweden"]
+`,
+			contains: "provider is required",
+		},
+		{
+			name: "upstream_pool unsupported provider",
+			toml: `
+[[upstream_pool]]
+provider  = "nordvpn"
+id_prefix = "nrd"
+countries = ["Sweden"]
+`,
+			contains: "is not supported",
+		},
+		{
+			name: "upstream_pool missing id_prefix",
+			toml: `
+[[upstream_pool]]
+provider  = "mullvad"
+countries = ["Sweden"]
+`,
+			contains: "id_prefix is required",
+		},
+		{
+			name: "upstream_pool empty countries",
+			toml: `
+[[upstream_pool]]
+provider  = "mullvad"
+id_prefix = "mvd"
+countries = []
+`,
+			contains: "countries must list at least one country",
+		},
+		{
+			name: "upstream_pool refresh below 1m floor",
+			toml: `
+[[upstream_pool]]
+provider  = "mullvad"
+id_prefix = "mvd"
+countries = ["Sweden"]
+refresh   = "30s"
+`,
+			contains: "refresh must be 0 (to disable) or >= 1m",
+		},
+		{
+			name: "upstream_pool negative refresh rejected",
+			toml: `
+[[upstream_pool]]
+provider  = "mullvad"
+id_prefix = "mvd"
+countries = ["Sweden"]
+refresh   = "-1s"
+`,
+			contains: "refresh must be >= 0",
+		},
+		{
+			name: "upstream_pool empty country entry",
+			toml: `
+[[upstream_pool]]
+provider  = "mullvad"
+id_prefix = "mvd"
+countries = ["Sweden", ""]
+`,
+			contains: "countries[1] is empty or whitespace",
+		},
+		{
+			name: "upstream_pool whitespace-only country entry",
+			toml: `
+[[upstream_pool]]
+provider  = "mullvad"
+id_prefix = "mvd"
+countries = ["   "]
+`,
+			contains: "countries[0] is empty or whitespace",
+		},
+		{
+			name: "upstream_pool relative cache_path",
+			toml: `
+[[upstream_pool]]
+provider   = "mullvad"
+id_prefix  = "mvd"
+countries  = ["Sweden"]
+cache_path = "relative/path.json"
+`,
+			contains: "cache_path",
+		},
+		{
+			name: "upstream_pool duplicate id_prefix",
+			toml: `
+[[upstream_pool]]
+provider  = "mullvad"
+id_prefix = "mvd"
+countries = ["Sweden"]
+[[upstream_pool]]
+provider  = "mullvad"
+id_prefix = "mvd"
+countries = ["USA"]
+`,
+			contains: "duplicate id_prefix",
 		},
 	}
 

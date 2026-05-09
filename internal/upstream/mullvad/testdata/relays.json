@@ -1,0 +1,21 @@
+{
+  "locations": {
+    "se-sto": {"country": "Sweden", "city": "Stockholm", "latitude": 59.32, "longitude": 18.06},
+    "nl-ams": {"country": "Netherlands", "city": "Amsterdam", "latitude": 52.35, "longitude": 4.91},
+    "us-nyc": {"country": "USA", "city": "New York, NY", "latitude": 40.71, "longitude": -74.0},
+    "au-syd": {"country": "Australia", "city": "Sydney", "latitude": -33.86, "longitude": 151.20}
+  },
+  "wireguard": {
+    "ipv4_gateway": "10.64.0.1",
+    "ipv6_gateway": "fc00:bbbb:bbbb:bb01::1",
+    "port_ranges": [[51820, 51920]],
+    "relays": [
+      {"hostname": "se-sto-wg-001", "location": "se-sto", "active": true, "owned": true, "provider": "DataPacket", "ipv4_addr_in": "1.1.1.1", "include_in_country": true, "weight": 100, "public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="},
+      {"hostname": "se-sto-wg-002", "location": "se-sto", "active": true, "owned": true, "provider": "DataPacket", "ipv4_addr_in": "1.1.1.2", "include_in_country": true, "weight": 100, "public_key": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="},
+      {"hostname": "nl-ams-wg-001", "location": "nl-ams", "active": true, "owned": false, "provider": "M247", "ipv4_addr_in": "2.2.2.1", "include_in_country": true, "weight": 100, "public_key": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC="},
+      {"hostname": "us-nyc-wg-301", "location": "us-nyc", "active": true, "owned": false, "provider": "xtom", "ipv4_addr_in": "3.3.3.3", "include_in_country": true, "weight": 100, "public_key": "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD="},
+      {"hostname": "au-syd-wg-001", "location": "au-syd", "active": true, "owned": false, "provider": "iRegister", "ipv4_addr_in": "4.4.4.1", "include_in_country": true, "weight": 100, "public_key": "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE="},
+      {"hostname": "au-syd-wg-302", "location": "au-syd", "active": false, "owned": false, "provider": "hostuniversal", "ipv4_addr_in": "4.4.4.2", "include_in_country": true, "weight": 100, "public_key": "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF="}
+    ]
+  }
+}

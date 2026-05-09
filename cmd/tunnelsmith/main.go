@@ -24,6 +24,7 @@ import (
 	"github.com/pacnpal/tunnelsmith/internal/listener"
 	"github.com/pacnpal/tunnelsmith/internal/scoreboard"
 	"github.com/pacnpal/tunnelsmith/internal/upstream"
+	"github.com/pacnpal/tunnelsmith/internal/upstream/mullvad"
 )
 
 var (
@@ -96,9 +97,28 @@ func run(args []string, stdout, stderr *os.File) error {
 		return nil
 	}
 
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
 	dialTimeout := time.Duration(cfg.Failure.TimeoutMS) * time.Millisecond
-	entries := make([]upstream.PoolEntry, 0, len(cfg.Upstreams))
-	for _, uc := range cfg.Upstreams {
+	expandedPools, expanders, err := expandUpstreamPools(ctx, cfg.UpstreamPools, logger)
+	if err != nil {
+		return fmt.Errorf("expand upstream pools: %w", err)
+	}
+	allUpstreams := make([]config.UpstreamConfig, 0, len(cfg.Upstreams)+len(expandedPools))
+	allUpstreams = append(allUpstreams, cfg.Upstreams...)
+	allUpstreams = append(allUpstreams, expandedPools...)
+	if len(allUpstreams) == 0 {
+		return errors.New("no upstreams available after expanding [[upstream_pool]] (check provider connectivity and country filters)")
+	}
+	if err := assertUniqueUpstreamIDs(allUpstreams); err != nil {
+		return err
+	}
+	if err := assertRulePreferIDs(cfg.Rules, allUpstreams); err != nil {
+		return err
+	}
+	entries := make([]upstream.PoolEntry, 0, len(allUpstreams))
+	for _, uc := range allUpstreams {
 		up, err := upstream.New(uc, dialTimeout)
 		if err != nil {
 			return fmt.Errorf("build upstream %q: %w", uc.ID, err)
@@ -128,9 +148,6 @@ func run(args []string, stdout, stderr *os.File) error {
 		"debounce_window_ms", cfg.Failure.Scoring.DebounceWindow.Duration().Milliseconds(),
 	)
 
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
-
 	sb.Start(ctx)
 	defer sb.Stop()
 
@@ -147,6 +164,10 @@ func run(args []string, stdout, stderr *os.File) error {
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error { return httpSrv.Serve(gctx) })
 	g.Go(func() error { return socksSrv.Serve(gctx) })
+	for _, run := range expanders {
+		run := run
+		g.Go(func() error { return run(gctx) })
+	}
 
 	// Wait for either ctx cancellation (signal) or a listener error.
 	<-gctx.Done()
@@ -176,6 +197,179 @@ func contextReason(ctx context.Context) string {
 		return err.Error()
 	}
 	return "unknown"
+}
+
+// assertRulePreferIDs rejects [[rule]] entries whose prefer list names an
+// upstream id that does not exist in the merged upstream set. The set is
+// only known after [[upstream_pool]] expansion at startup, so this check
+// runs here rather than in config.Validate. config.Validate still does the
+// equivalent check itself when no pool blocks are configured (so a config
+// with only static [[upstream]] entries fails fast at parse time).
+func assertRulePreferIDs(rules []config.RuleConfig, upstreams []config.UpstreamConfig) error {
+	ids := make(map[string]struct{}, len(upstreams))
+	for _, u := range upstreams {
+		ids[u.ID] = struct{}{}
+	}
+	var errs []error
+	for i, r := range rules {
+		for _, id := range r.Prefer {
+			if _, ok := ids[id]; !ok {
+				errs = append(errs, fmt.Errorf("rule[%d] (host_glob=%q): prefer references unknown upstream id %q (after [[upstream_pool]] expansion)", i, r.HostGlob, id))
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// assertUniqueUpstreamIDs rejects a merged upstream list that contains
+// duplicate ids. The scoreboard and per-host bookkeeping key off
+// upstream_id, so two entries sharing one id would collapse into a single
+// logical upstream and produce incorrect routing and scoring. The error
+// message names every colliding id so the operator can point at the right
+// pool block or [[upstream]] entry.
+func assertUniqueUpstreamIDs(upstreams []config.UpstreamConfig) error {
+	seen := make(map[string]int, len(upstreams))
+	var duplicates []string
+	for i, u := range upstreams {
+		if prev, ok := seen[u.ID]; ok {
+			duplicates = append(duplicates, fmt.Sprintf("%q (entries %d and %d)", u.ID, prev, i))
+		} else {
+			seen[u.ID] = i
+		}
+	}
+	if len(duplicates) > 0 {
+		return fmt.Errorf("duplicate upstream ids after expanding [[upstream_pool]]: %s", strings.Join(duplicates, ", "))
+	}
+	return nil
+}
+
+// expandUpstreamPools turns each [[upstream_pool]] block into a slice of
+// synthetic upstream entries by calling the relevant provider's expander.
+// Only "mullvad" is implemented for Phase 6.
+//
+// Returns two parallel sets of values: the resolved upstream list (used
+// once at startup to build the priority pool), and a slice of refresh
+// callbacks the caller is expected to fire from the signal-context
+// errgroup. Each callback drives the expander's periodic refresh ticker,
+// which currently logs the diff between snapshots; Phase 7's hot-reload
+// path will swap the live pool in on each tick.
+//
+// Failures during the initial expansion are fatal at startup so the
+// operator notices a broken upstream_pool before traffic is sent.
+func expandUpstreamPools(ctx context.Context, blocks []config.UpstreamPoolConfig, logger *slog.Logger) ([]config.UpstreamConfig, []func(context.Context) error, error) {
+	var out []config.UpstreamConfig
+	var runs []func(context.Context) error
+	for i, block := range blocks {
+		switch block.Provider {
+		case config.UpstreamPoolMullvad:
+			expanded, run, err := expandMullvadPool(ctx, block, logger)
+			if err != nil {
+				return nil, nil, fmt.Errorf("upstream_pool[%d] (id_prefix=%q): %w", i, block.IDPrefix, err)
+			}
+			logger.Info("upstream_pool expanded",
+				"id_prefix", block.IDPrefix,
+				"provider", block.Provider,
+				"countries", block.Countries,
+				"upstreams", len(expanded),
+			)
+			out = append(out, expanded...)
+			runs = append(runs, run)
+		default:
+			return nil, nil, fmt.Errorf("upstream_pool[%d]: provider %q is not implemented", i, block.Provider)
+		}
+	}
+	return out, runs, nil
+}
+
+func expandMullvadPool(ctx context.Context, block config.UpstreamPoolConfig, logger *slog.Logger) ([]config.UpstreamConfig, func(context.Context) error, error) {
+	expLogger := logger.With("component", "mullvad-expander", "id_prefix", block.IDPrefix)
+	client := mullvad.NewClient()
+	client.Logger = expLogger
+	if block.CachePath != "" {
+		client.Cache = &mullvad.Cache{Path: block.CachePath}
+	}
+	exp, err := mullvad.NewExpander(mullvad.ExpanderConfig{
+		IDPrefix:        block.IDPrefix,
+		Priority:        block.PriorityValue(),
+		Countries:       block.Countries,
+		IncludeInactive: block.IncludeInactive,
+		Refresh:         block.RefreshDuration(),
+	}, client, expLogger)
+	if err != nil {
+		return nil, nil, err
+	}
+	initial, err := exp.Snapshot(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	// Phase 6 only logs diffs; Phase 7 will rewire this callback to
+	// hot-swap the live pool on every tick.
+	run := func(ctx context.Context) error {
+		return exp.RunRefresh(ctx, initial, func(prev, next []config.UpstreamConfig) {
+			added, removed := diffUpstreams(prev, next)
+			if len(added) == 0 && len(removed) == 0 {
+				expLogger.Debug("upstream_pool refresh: no change", "upstreams", len(next))
+				return
+			}
+			// INFO carries counts plus a small sample so a normal log
+			// line stays small even when Mullvad rolls out or removes
+			// dozens of relays at once. Operators who need the full
+			// diff can drop the level to DEBUG.
+			expLogger.Info("upstream_pool refresh",
+				"upstreams", len(next),
+				"added_count", len(added),
+				"removed_count", len(removed),
+				"added_sample", truncateIDs(added, refreshLogSampleSize),
+				"removed_sample", truncateIDs(removed, refreshLogSampleSize),
+			)
+			expLogger.Debug("upstream_pool refresh full diff",
+				"added", added,
+				"removed", removed,
+			)
+		})
+	}
+	return initial, run, nil
+}
+
+// refreshLogSampleSize bounds the number of upstream ids included in the
+// INFO refresh log line. The full diff is still emitted at DEBUG.
+const refreshLogSampleSize = 5
+
+// truncateIDs returns at most n entries from ids unchanged, plus an
+// ellipsis sentinel listing how many were elided so the log line is
+// self-describing without leaking the full slice.
+func truncateIDs(ids []string, n int) []string {
+	if len(ids) <= n {
+		return ids
+	}
+	out := make([]string, 0, n+1)
+	out = append(out, ids[:n]...)
+	out = append(out, fmt.Sprintf("... and %d more", len(ids)-n))
+	return out
+}
+
+// diffUpstreams returns the ids present in next but not in prev, and the
+// ids present in prev but not in next. Order is stable (input order).
+func diffUpstreams(prev, next []config.UpstreamConfig) (added, removed []string) {
+	prevSet := make(map[string]struct{}, len(prev))
+	for _, u := range prev {
+		prevSet[u.ID] = struct{}{}
+	}
+	nextSet := make(map[string]struct{}, len(next))
+	for _, u := range next {
+		nextSet[u.ID] = struct{}{}
+	}
+	for _, u := range next {
+		if _, ok := prevSet[u.ID]; !ok {
+			added = append(added, u.ID)
+		}
+	}
+	for _, u := range prev {
+		if _, ok := nextSet[u.ID]; !ok {
+			removed = append(removed, u.ID)
+		}
+	}
+	return added, removed
 }
 
 // newLogger builds the structured JSON logger. Level is read from the

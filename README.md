@@ -42,11 +42,23 @@ Tunnelsmith reads a TOML config from `--config` (default `/etc/tunnelsmith/confi
 
 `TUNNELSMITH_LOG_LEVEL` (`debug` | `info` | `warn` | `error`, default `info`) controls log verbosity. Logs are JSON, one line per event.
 
+## Use with Mullvad
+
+Tunnelsmith ships a reference deployment at [`deploy/docker-compose.mullvad.yml`](deploy/docker-compose.mullvad.yml) that runs gluetun in WireGuard mode against your Mullvad account, plus tunnelsmith joining the same network namespace. A single `[[upstream_pool]]` block in the config fans out into one synthetic socks5 upstream per active Mullvad WireGuard relay in the countries you list. The scoreboard then learns per-host which relay works best.
+
+Setup is a one-time keypair generation (counts against Mullvad's 5-device cap) plus two repo-secret-shaped env vars. See [`docs/deployment.md`](docs/deployment.md) for the full walkthrough.
+
+## For container maintainers
+
+If you build a container that benefits from outbound proxying (`*arr` apps, scrapers, downloaders, RSS pollers, federated services), [`docs/integration-guide.md`](docs/integration-guide.md) is a layered checklist for shipping Tunnelsmith support, from "document the standard env-var pattern" to "ship an official compose snippet". The lowest level is no code changes.
+
 ## Documentation
 
 - [`docs/configuration.md`](docs/configuration.md): every config key explained
 - [`docs/architecture.md`](docs/architecture.md): how the scoreboard works (Phase 4)
 - [`docs/deployment.md`](docs/deployment.md): running Tunnelsmith with Mullvad and other upstreams (Phase 6)
+- [`docs/request-lifecycle.md`](docs/request-lifecycle.md): end-to-end trace of a single request
+- [`docs/integration-guide.md`](docs/integration-guide.md): for container maintainers adding Tunnelsmith support
 - [`docs/decisions.md`](docs/decisions.md): architecture decision records
 
 ## License

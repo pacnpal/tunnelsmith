@@ -122,3 +122,70 @@ jobs:
       - name: integration - tear down
         if: always()
         run: docker compose -f deploy/docker-compose.example.yml down --volumes
+
+      - name: validate mullvad compose syntax
+        run: docker compose -f deploy/docker-compose.mullvad.yml --env-file deploy/.env.example config --quiet
+
+  mullvad-integration:
+    name: mullvad-integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: docker
+    env:
+      MULLVAD_WIREGUARD_PRIVATE_KEY: ${{ secrets.MULLVAD_WIREGUARD_PRIVATE_KEY }}
+      MULLVAD_WIREGUARD_ADDRESSES: ${{ secrets.MULLVAD_WIREGUARD_ADDRESSES }}
+    steps:
+      - name: check secrets
+        id: secrets
+        run: |
+          if [ -z "$MULLVAD_WIREGUARD_PRIVATE_KEY" ] || [ -z "$MULLVAD_WIREGUARD_ADDRESSES" ]; then
+            echo "::notice::[skip-ok] mullvad-integration: MULLVAD_WIREGUARD_PRIVATE_KEY and MULLVAD_WIREGUARD_ADDRESSES not set as repo secrets; integration suite needs both per ADR-003"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v6
+        if: steps.secrets.outputs.skip == 'false'
+      - uses: docker/setup-buildx-action@v4
+        if: steps.secrets.outputs.skip == 'false'
+
+      - name: build image
+        if: steps.secrets.outputs.skip == 'false'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: tunnelsmith:mullvad-ci
+          build-args: |
+            VERSION=ci-${{ github.sha }}
+            COMMIT=${{ github.sha }}
+            DATE=${{ github.event.head_commit.timestamp }}
+
+      - name: bring up stack
+        if: steps.secrets.outputs.skip == 'false'
+        env:
+          TUNNELSMITH_IMAGE: tunnelsmith:mullvad-ci
+        run: docker compose -f deploy/docker-compose.mullvad.yml up -d
+
+      - name: verify three countries
+        if: steps.secrets.outputs.skip == 'false'
+        timeout-minutes: 10
+        env:
+          VERIFY_COUNTRIES: Sweden,Netherlands,USA
+        run: scripts/verify-mullvad.sh
+
+      - name: gluetun logs (always)
+        if: always() && steps.secrets.outputs.skip == 'false'
+        run: docker compose -f deploy/docker-compose.mullvad.yml logs gluetun | tail -100
+
+      - name: tunnelsmith logs (always)
+        if: always() && steps.secrets.outputs.skip == 'false'
+        run: docker compose -f deploy/docker-compose.mullvad.yml logs tunnelsmith
+
+      - name: tear down (always)
+        if: always() && steps.secrets.outputs.skip == 'false'
+        run: docker compose -f deploy/docker-compose.mullvad.yml down --volumes --remove-orphans
