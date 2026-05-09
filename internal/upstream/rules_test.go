@@ -162,9 +162,6 @@ func TestRuleSetNilSafe(t *testing.T) {
 	if rs.Len() != 0 {
 		t.Error("Len on nil set != 0")
 	}
-	if got := rs.Rules(); got != nil {
-		t.Errorf("Rules on nil set = %v, want nil", got)
-	}
 	if err := rs.CheckPreferIDs(nil); err != nil {
 		t.Errorf("CheckPreferIDs on nil set = %v, want nil", err)
 	}

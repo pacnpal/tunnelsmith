@@ -512,24 +512,25 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 	// Resolve the rule and the body-inspect knobs once per request:
 	// the destination host is constant across retry attempts, the
 	// rule pointer is stable for the duration of the request (Reload
-	// installs a new pointer atomically), and rebuilding the
-	// failure.Pattern slice on every retry would just allocate the
-	// same content over and over. The slice is non-nil only when
-	// inspection is actually wired up for this host.
+	// installs a new pointer atomically), and re-resolving on every
+	// retry would just hand back the same rule pointer.
 	//
 	// Read both knobs under a single RLock via
 	// currentInspectionConfig so a concurrent ReloadRules /
 	// ReloadBodyBufferKB pair cannot interleave between the two
 	// reads and hand this request a mixed snapshot (new rules with
 	// the old buffer cap, or vice versa).
+	//
+	// rule.Patterns() returns the precomputed []failure.Pattern slice
+	// the rule built once at compile time, so the request path does
+	// no per-request allocation or interface boxing for body
+	// inspection. nil here (no matching rule, no body_regex on the
+	// matching rule, or buffer cap == 0) skips the inspector entirely.
 	liveRules, bodyBufferBytes := h.currentInspectionConfig()
 	rule := liveRules.Match(host)
 	var bodyPatterns []failure.Pattern
-	if rule.HasBodyRegex() && bodyBufferBytes > 0 {
-		bodyPatterns = make([]failure.Pattern, len(rule.BodyRegex))
-		for i, re := range rule.BodyRegex {
-			bodyPatterns[i] = re
-		}
+	if bodyBufferBytes > 0 {
+		bodyPatterns = rule.Patterns()
 	}
 	var (
 		retries        int

@@ -35,6 +35,7 @@ import (
 	"strings"
 
 	"github.com/pacnpal/tunnelsmith/internal/config"
+	"github.com/pacnpal/tunnelsmith/internal/failure"
 )
 
 // Rule is one compiled [[rule]] block. Glob is the lowercased host
@@ -44,13 +45,21 @@ import (
 // scoreboard's Pick can read O(1) ranks without rebuilding the map
 // per request; Force toggles the strict-membership behavior described
 // in the package doc; BodyRegex is the compiled set of patterns that
-// fire KindBodyMatch on a positive match.
+// fire KindBodyMatch on a positive match. patterns is the same set
+// boxed as []failure.Pattern once at compile time so the listener can
+// hand it to failure.BufferAndDecide without per-request boxing.
+//
+// Exported fields are read-only after NewRuleSet returns; the listener
+// and scoreboard read them under their own request-path locks. Mutating
+// any field, or any element of Prefer / PreferRank / BodyRegex /
+// patterns, races with every concurrent reader.
 type Rule struct {
 	Glob       string
 	Prefer     []string
 	PreferRank map[string]int
 	Force      bool
 	BodyRegex  []*regexp.Regexp
+	patterns   []failure.Pattern
 }
 
 // HasBodyRegex reports whether this rule asked the listener to buffer
@@ -78,6 +87,20 @@ func (r *Rule) MatchBody(buf []byte) (matched bool, pattern string) {
 		}
 	}
 	return false, ""
+}
+
+// Patterns returns the rule's compiled body-match patterns boxed as
+// []failure.Pattern. The slice is built once at compile time so the
+// listener can hand it to failure.BufferAndDecide on the request path
+// without per-request allocation or interface boxing. Returns nil for
+// a nil receiver or a rule without body_regex; the listener uses that
+// signal to skip body inspection entirely. Callers must treat the
+// returned slice as read-only.
+func (r *Rule) Patterns() []failure.Pattern {
+	if r == nil {
+		return nil
+	}
+	return r.patterns
 }
 
 // RuleSet is the compiled view of every [[rule]] block in config order.
@@ -115,6 +138,7 @@ func NewRuleSet(cfgs []config.RuleConfig) (*RuleSet, error) {
 			return nil, fmt.Errorf("rules: rule[%d] (host_glob=%q): prefer must list at least one upstream id", i, c.HostGlob)
 		}
 		var compiled []*regexp.Regexp
+		var patterns []failure.Pattern
 		for j, pat := range c.BodyRegex {
 			if pat == "" {
 				return nil, fmt.Errorf("rules: rule[%d] (host_glob=%q): body_regex[%d] is empty", i, c.HostGlob, j)
@@ -124,6 +148,16 @@ func NewRuleSet(cfgs []config.RuleConfig) (*RuleSet, error) {
 				return nil, fmt.Errorf("rules: rule[%d] (host_glob=%q): body_regex[%d]: %w", i, c.HostGlob, j, err)
 			}
 			compiled = append(compiled, re)
+		}
+		// Box the compiled regexps into failure.Pattern once at
+		// compile time. handleForward calls failure.BufferAndDecide
+		// with this exact slice, so doing the conversion here moves
+		// the per-request allocation off the hot path.
+		if len(compiled) > 0 {
+			patterns = make([]failure.Pattern, len(compiled))
+			for j, re := range compiled {
+				patterns[j] = re
+			}
 		}
 		// Copy Prefer so caller mutations to the source slice cannot
 		// race with request-path readers later. Pre-build the
@@ -144,6 +178,7 @@ func NewRuleSet(cfgs []config.RuleConfig) (*RuleSet, error) {
 			PreferRank: preferRank,
 			Force:      c.Force,
 			BodyRegex:  compiled,
+			patterns:   patterns,
 		})
 	}
 	return out, nil
@@ -164,18 +199,6 @@ func (rs *RuleSet) Match(host string) *Rule {
 		}
 	}
 	return nil
-}
-
-// Rules returns the compiled rules in declaration order. Callers must
-// treat the returned slice as read-only; mutating it would race with
-// every concurrent Match.
-func (rs *RuleSet) Rules() []*Rule {
-	if rs == nil {
-		return nil
-	}
-	out := make([]*Rule, len(rs.rules))
-	copy(out, rs.rules)
-	return out
 }
 
 // Len reports how many rules are compiled in this set. Useful for log
