@@ -1,5 +1,8 @@
 # Tunnelsmith
 
+[![CI](https://github.com/pacnpal/tunnelsmith/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/pacnpal/tunnelsmith/actions/workflows/ci.yml?query=branch%3Amain)
+[![Latest release](https://img.shields.io/github/v/release/pacnpal/tunnelsmith?sort=semver&display_name=tag)](https://github.com/pacnpal/tunnelsmith/releases/latest)
+[![Container image](https://img.shields.io/badge/ghcr.io-pacnpal%2Ftunnelsmith-blue?logo=docker)](https://github.com/pacnpal/tunnelsmith/pkgs/container/tunnelsmith)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A per-destination egress router for HTTP and SOCKS5. Picks the right exit for each URL based on what is actually working.
