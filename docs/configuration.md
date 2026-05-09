@@ -91,7 +91,7 @@ countries = ["Sweden", "Netherlands", "Switzerland"]
 
 A config that uses only `[[upstream_pool]]` and no `[[upstream]]` is valid; a config with neither is rejected.
 
-The expansion runs once at startup. The Phase 6 build does not yet hot-swap the live pool when the relay list changes; that wiring lands in Phase 7's SIGHUP hot-reload path. The 12h refresh ticker still runs and logs a warning if Mullvad's API becomes unreachable.
+The pool expansion runs at startup to seed the priority pool, and a per-block refresh goroutine keeps polling the relay list at the configured interval. In Phase 6 the refresh tick logs the diff (added / removed upstream ids) but does not yet swap the live pool; the running pool is whatever startup produced. Phase 7's SIGHUP hot-reload will rewire the diff handler to actually mutate the pool. The minimum refresh interval is 1 minute so a typo cannot hammer Mullvad's public relay-list API.
 
 ## `[failure]`
 

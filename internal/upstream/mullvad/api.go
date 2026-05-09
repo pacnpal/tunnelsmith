@@ -110,12 +110,19 @@ func (c *Client) fetchOnline(ctx context.Context) ([]byte, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("mullvad: get relays: unexpected status %d", resp.StatusCode)
 	}
-	body, err := io.ReadAll(resp.Body)
+	// Cap the response body so a runaway server (or a hostile redirect that
+	// somehow bypasses TLS verification) cannot OOM the binary. Mullvad's
+	// real response is around 158 KB at the time of this code; 8 MiB is
+	// orders of magnitude more headroom than we expect to ever need.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
 		return nil, fmt.Errorf("mullvad: read relays body: %w", err)
 	}
 	return body, nil
 }
+
+// maxResponseBytes caps the relay-list body. See fetchOnline for rationale.
+const maxResponseBytes = 8 * 1024 * 1024
 
 type rawResponse struct {
 	Locations map[string]rawLocation `json:"locations"`
@@ -185,16 +192,31 @@ func (c *Cache) Read() ([]byte, error) {
 
 // Write persists the raw JSON body to disk via a tmp-and-rename so an
 // interrupted write cannot leave a half-written cache file behind.
+//
+// The temp file is created with a unique suffix via os.CreateTemp so two
+// concurrent writers cannot race on the same tmp path. The deferred Remove
+// is a no-op once the rename has succeeded (the file no longer exists at
+// the tmp path).
 func (c *Cache) Write(data []byte) error {
 	if c == nil || c.Path == "" {
 		return ErrNoCache
 	}
-	if err := os.MkdirAll(filepath.Dir(c.Path), 0o755); err != nil {
+	dir := filepath.Dir(c.Path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	tmp := c.Path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	tmp, err := os.CreateTemp(dir, filepath.Base(c.Path)+".*.tmp")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, c.Path)
+	tmpPath := tmp.Name()
+	defer func() { _ = os.Remove(tmpPath) }()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, c.Path)
 }

@@ -64,7 +64,7 @@ Set `MULLVAD_WIREGUARD_PRIVATE_KEY` and `MULLVAD_WIREGUARD_ADDRESSES`. The file'
 
 ## Step 3: pick the countries
 
-Edit `deploy/tunnelsmith.mullvad.toml` and adjust the `countries` list to whatever subset of Mullvad's exit countries you want available. The relay-list refresh is 12 hours by default; if Mullvad adds or removes servers in those countries you pick them up automatically on the next refresh.
+Edit `deploy/tunnelsmith.mullvad.toml` and adjust the `countries` list to whatever subset of Mullvad's exit countries you want available. A background refresh goroutine polls the relay list every 12 hours by default; in Phase 6 the refresh logs the diff but the running pool is whatever the startup snapshot produced, so picking up newly-added relays requires a restart. Phase 7's hot-reload will pick them up automatically.
 
 ```toml
 [[upstream_pool]]

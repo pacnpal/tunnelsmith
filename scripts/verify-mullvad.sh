@@ -21,14 +21,28 @@ set -euo pipefail
 
 COMPOSE_FILE="${COMPOSE_FILE:-deploy/docker-compose.mullvad.yml}"
 CONFIG_FILE="${CONFIG_FILE:-deploy/tunnelsmith.mullvad.toml}"
-COUNTRIES=("${VERIFY_COUNTRIES:-Sweden,Netherlands,USA}")
+VERIFY_COUNTRIES="${VERIFY_COUNTRIES:-Sweden,Netherlands,USA}"
 SOCKS_HOST="${SOCKS_HOST:-localhost}"
 SOCKS_PORT="${SOCKS_PORT:-1080}"
 READY_TIMEOUT_S="${READY_TIMEOUT_S:-90}"
 
-# Split COUNTRIES by comma so callers can pass either VERIFY_COUNTRIES="A,B,C"
-# or one country per array element.
-IFS=',' read -r -a COUNTRY_LIST <<<"${COUNTRIES[*]}"
+# VERIFY_COUNTRIES is a comma-separated list. Split it, then trim each
+# element so values like "Sweden, Netherlands, USA" do not produce country
+# names with leading spaces (which would never match the Mullvad relay
+# list and silently expand to zero upstreams).
+IFS=',' read -r -a RAW_COUNTRY_LIST <<<"${VERIFY_COUNTRIES}"
+COUNTRY_LIST=()
+for raw in "${RAW_COUNTRY_LIST[@]}"; do
+  trimmed="${raw#"${raw%%[![:space:]]*}"}"   # strip leading whitespace
+  trimmed="${trimmed%"${trimmed##*[![:space:]]}"}" # strip trailing whitespace
+  if [ -n "${trimmed}" ]; then
+    COUNTRY_LIST+=("${trimmed}")
+  fi
+done
+if [ "${#COUNTRY_LIST[@]}" -eq 0 ]; then
+  echo "VERIFY_COUNTRIES yielded no usable entries after trimming: ${VERIFY_COUNTRIES}" >&2
+  exit 2
+fi
 
 write_config() {
   local country="$1"

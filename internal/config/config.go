@@ -450,8 +450,16 @@ func (c *Config) Validate() error {
 		if len(p.Countries) == 0 {
 			errs = append(errs, fmt.Errorf("%s (id_prefix=%q): countries must list at least one country", idx, p.IDPrefix))
 		}
-		if p.Refresh != nil && p.Refresh.Duration() <= 0 {
-			errs = append(errs, fmt.Errorf("%s (id_prefix=%q): refresh must be > 0, got %v", idx, p.IDPrefix, p.Refresh.Duration()))
+		for j, c := range p.Countries {
+			if strings.TrimSpace(c) == "" {
+				errs = append(errs, fmt.Errorf("%s (id_prefix=%q): countries[%d] is empty or whitespace", idx, p.IDPrefix, j))
+			}
+		}
+		// A 1-minute floor on refresh keeps a typo (e.g. "1s" or "0s")
+		// from hammering Mullvad's public relay API. The default of 12h is
+		// reasonable; anything below 1m is almost certainly unintentional.
+		if p.Refresh != nil && p.Refresh.Duration() < time.Minute {
+			errs = append(errs, fmt.Errorf("%s (id_prefix=%q): refresh must be >= 1m, got %v", idx, p.IDPrefix, p.Refresh.Duration()))
 		}
 		if p.CachePath != "" && !filepath.IsAbs(p.CachePath) {
 			errs = append(errs, fmt.Errorf("%s (id_prefix=%q): cache_path %q must be an absolute path", idx, p.IDPrefix, p.CachePath))

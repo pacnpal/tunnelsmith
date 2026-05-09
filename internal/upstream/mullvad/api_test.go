@@ -40,10 +40,12 @@ func TestParseResponseInvalidJSON(t *testing.T) {
 	}
 }
 
-func TestParseResponseSkipsMissingLocation(t *testing.T) {
-	// A relay that points at a location code the API did not include should
-	// still be returned with empty country and city, matching the API's
-	// implicit contract that locations is the source of truth for metadata.
+func TestParseResponseAllowsMissingLocation(t *testing.T) {
+	// A relay that points at a location code the API did not include is
+	// still returned, with empty country and city. The locations map is the
+	// source of truth for metadata; an absent key is treated as "no metadata
+	// available" rather than as a hard error, so a single rare orphaned
+	// relay does not break the entire fetch.
 	body := []byte(`{
 		"locations": {"se-sto": {"country": "Sweden", "city": "Stockholm"}},
 		"wireguard": {

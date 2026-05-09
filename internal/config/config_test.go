@@ -511,7 +511,38 @@ id_prefix = "mvd"
 countries = ["Sweden"]
 refresh   = "0s"
 `,
-			contains: "refresh must be > 0",
+			contains: "refresh must be >= 1m",
+		},
+		{
+			name: "upstream_pool refresh below 1m floor",
+			toml: `
+[[upstream_pool]]
+provider  = "mullvad"
+id_prefix = "mvd"
+countries = ["Sweden"]
+refresh   = "30s"
+`,
+			contains: "refresh must be >= 1m",
+		},
+		{
+			name: "upstream_pool empty country entry",
+			toml: `
+[[upstream_pool]]
+provider  = "mullvad"
+id_prefix = "mvd"
+countries = ["Sweden", ""]
+`,
+			contains: "countries[1] is empty or whitespace",
+		},
+		{
+			name: "upstream_pool whitespace-only country entry",
+			toml: `
+[[upstream_pool]]
+provider  = "mullvad"
+id_prefix = "mvd"
+countries = ["   "]
+`,
+			contains: "countries[0] is empty or whitespace",
 		},
 		{
 			name: "upstream_pool relative cache_path",
