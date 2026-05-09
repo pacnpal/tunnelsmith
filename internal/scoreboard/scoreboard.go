@@ -392,13 +392,47 @@ func (s *Scoreboard) ReplacePool(newPool *upstream.Pool) error {
 	entries := newPool.Entries()
 	retryCap := newPool.RetryCap()
 	poolLen := newPool.Len()
+	knownIDs := make(map[string]struct{}, len(entries))
+	for _, e := range entries {
+		knownIDs[e.Up.ID()] = struct{}{}
+	}
+
+	var evicted []evictedForce
 	s.mu.Lock()
 	s.pool = newPool
 	s.poolEntries = entries
 	s.poolRetryCap = retryCap
 	s.poolLen = poolLen
+	// Issue #19: evict any active Force pin whose upstream id is no
+	// longer in the new pool. pickForced already falls through to
+	// normal scoring for stale pins, so routing was correct without
+	// this; the eviction stops ForceSnapshot from continuing to render
+	// the dead pin in the UI table after a hot reload drops the
+	// upstream the pin referenced.
+	for host, f := range s.forces {
+		if _, ok := knownIDs[f.UpstreamID]; !ok {
+			delete(s.forces, host)
+			evicted = append(evicted, evictedForce{Host: host, UpstreamID: f.UpstreamID})
+		}
+	}
 	s.mu.Unlock()
+
+	for _, ev := range evicted {
+		s.logger.Info("scoreboard force evicted",
+			"host", ev.Host,
+			"upstream_id", ev.UpstreamID,
+			"reason", "upstream_removed_from_pool",
+		)
+	}
 	return nil
+}
+
+// evictedForce is a small carrier the ReplacePool path uses to defer
+// logging until after the lock is released; doing the slog calls under
+// s.mu would hold the write lock for as long as slog's handler takes.
+type evictedForce struct {
+	Host       string
+	UpstreamID string
 }
 
 // Reload updates the runtime tuning knobs in place. The new Config can
