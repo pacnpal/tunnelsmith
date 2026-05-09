@@ -10,8 +10,8 @@ stack.
 When `metrics.bind` is set (default `:9090`), Tunnelsmith serves two HTTP
 endpoints on that address:
 
-- `GET /metrics` — Prometheus exposition format.
-- `GET /healthz` — returns `200 OK` with the body `ok`. Suitable for a
+- `GET /metrics` - Prometheus exposition format.
+- `GET /healthz` - returns `200 OK` with the body `ok`. Suitable for a
   Docker `HEALTHCHECK` or a Kubernetes liveness probe.
 
 Setting `metrics.bind` to the empty string disables the listener
@@ -38,7 +38,8 @@ Tunnelsmith binds to.
 All names use the `tunnelsmith_` prefix. Cardinality is bounded on
 purpose: per-host labels are not emitted because thousands of
 destinations across 60+ Mullvad relays would blow out a small
-Prometheus instance. The Phase 9 web UI carries the per-host detail.
+Prometheus instance. The web UI on `:9091/` carries the per-host
+detail.
 
 ### Counters
 
@@ -148,19 +149,19 @@ What hot-reload changes:
   detector and retry budget)
 - `[failure.scoring]` penalty weights, cooldowns, probe chance, cascade
   TTL, debounce window, prune-after
-- `[[rule]]` block list (parsed and stored; Phase 8 will apply them)
+- `[[rule]]` block list (parsed, validated against the live pool, and applied to the request path)
 
 What hot-reload does NOT change (restart required):
 
-- `[listener]` bindings — the HTTP and SOCKS5 listen addresses are bound
+- `[listener]` bindings - the HTTP and SOCKS5 listen addresses are bound
   once at startup
-- `metrics.bind` — same reason as above
-- `cache.persist_path` and `cache.persist_interval` — the persistence
+- `metrics.bind` - same reason as above
+- `cache.persist_path` and `cache.persist_interval` - the persistence
   loop captures these at startup
-- `failure.scoring.decay_interval` — the decay goroutine reads its
+- `failure.scoring.decay_interval` - the decay goroutine reads its
   ticker once at start; retuning mid-flight is more risk than benefit
   for v1
-- `[[upstream_pool]]` (Mullvad refresh schedule) — pool blocks are
+- `[[upstream_pool]]` (Mullvad refresh schedule) - pool blocks are
   expanded once at startup; the periodic refresh inside each block uses
   its own ticker
 
@@ -172,13 +173,13 @@ is read from the `TUNNELSMITH_LOG_LEVEL` env var (`debug` / `info` /
 
 Events worth tagging in a log forwarder:
 
-- `msg=upstream dial outcome=failure` — one upstream failed a single
+- `msg=upstream dial outcome=failure` - one upstream failed a single
   dial attempt. `kind` carries the classification.
-- `msg=cascade tripped` — a host went into cascade-failure cooldown.
-- `msg=forward status failure` — the HTTP plain-HTTP path treated a
+- `msg=cascade tripped` - a host went into cascade-failure cooldown.
+- `msg=forward status failure` - the HTTP plain-HTTP path treated a
   response as a failure and rotated to the next upstream.
-- `msg=config reloaded` — a SIGHUP reload landed cleanly. `msg=config
+- `msg=config reloaded` - a SIGHUP reload landed cleanly. `msg=config
   reload failed` covers the error path.
-- `msg=scoreboard snapshot written` (DEBUG) — one persistence-tick flush
+- `msg=scoreboard snapshot written` (DEBUG) - one persistence-tick flush
   succeeded. The error path is `msg=scoreboard snapshot failed`
   (WARN).

@@ -89,7 +89,7 @@ A representative session:
 3. You click "Forget" on `news.example.com` to clear the bad-state, and "Pin" the host to `direct-b` for 30 minutes so the next request lands on the upstream you want.
 4. You watch `cooled_by_upstream.direct-a` tick back to zero on the next refresh and call it done.
 
-For long-lived "this host always uses that exit" decisions, prefer a `[[rule]]` block in the config file. Force pins are for the in-the-moment fix; rules survive restarts, force pins do not (Phase 7's persistence layer keeps the scoreboard, not the pins).
+For long-lived "this host always uses that exit" decisions, prefer a `[[rule]]` block in the config file. Force pins are for the in-the-moment fix; rules survive restarts, force pins do not (the persistence layer keeps the scoreboard, not the pins).
 
 ## See also
 

@@ -94,7 +94,7 @@ The probe roll uses a `*rand.Rand` instance owned by the scoreboard. Tests pass 
 
 ## Locking
 
-A single `sync.RWMutex` guards the entries map and the cascade map. Pick takes the read lock; `RecordSuccess`, `RecordFailure`, and the decay tick take the write lock. Lock pressure is one acquire per request (Pick) plus one per outcome (Record*), so on a busy proxy that is two acquires per request. For v1 homelab use this is fine; Phase 7 metrics work may revisit if profiling shows contention.
+A single `sync.RWMutex` guards the entries map and the cascade map. Pick takes the read lock; `RecordSuccess`, `RecordFailure`, and the decay tick take the write lock. Lock pressure is one acquire per request (Pick) plus one per outcome (Record*), so on a busy proxy that is two acquires per request. The Phase 7 `BenchmarkScoreboardWriterContention` measured ~3.3 microseconds per op at homelab scale (1k hosts, 20 upstreams) under concurrent Pick + RecordSuccess writers; v1 is fine without further mitigation.
 
 The debounce map and the random source each have their own dedicated mutex so they do not block the main read path.
 
@@ -123,9 +123,6 @@ Body-regex inspection is separately gated by `failure.body_buffer_kb` and runs o
 
 The RuleSet is hot-reloadable: `Scoreboard.ReplaceRules` and `HTTPServer.ReloadRules` install the same compiled set sequentially, each under its own component's write lock. Both calls take their write lock for the swap, so a request reading either component's pointer sees one self-consistent rule set, never a half-written state. Across components the swap is sequential, not atomic: a request mid-reload may briefly observe the new rules in one component and the old in the other (for example, the listener could route through the old prefer set while inspecting bodies with the new patterns). The window is short and bounded; routing decisions converge on the next request once both swaps complete.
 
-## What is not here yet
+## What v1.0.0 deliberately does not have
 
-- Scoreboard persistence to disk (Phase 7).
-- Prometheus metrics (Phase 7; `Snapshot` is the data source).
-- Web UI (Phase 9).
-- Global degradation detection ("upstream X is failing for every host, mark it globally degraded"). The proposal lists this as a refinement; it is not in the Phase 4 plan.
+- Global degradation detection ("upstream X is failing for every host, mark it globally degraded"). The proposal lists this as a refinement; it is tracked for v2 in `docs/roadmap.md` (or the build plan's "Out of scope for v1" list, depending on which lands first).

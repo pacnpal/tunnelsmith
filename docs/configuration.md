@@ -53,7 +53,7 @@ Durations use Go's `time.ParseDuration` syntax (`120s`, `15m`, `6h`, etc.).
 
 ## `[metrics]`
 
-Prometheus exposition surface added in Phase 7.
+Prometheus exposition surface.
 
 | key    | type   | default   | notes |
 |--------|--------|-----------|-------|
@@ -63,7 +63,7 @@ When set, `bind` must parse via `net.SplitHostPort` with a port in `1-65535`. Th
 
 ## `[ui]`
 
-Web UI added in Phase 9. Renders the scoreboard, the upstream pool, and the active force pins, plus four JSON action endpoints for managing state by hand.
+Web UI. Renders the scoreboard, the upstream pool, and the active force pins, plus four JSON action endpoints for managing state by hand.
 
 | key    | type   | default | notes |
 |--------|--------|---------|-------|
@@ -113,17 +113,16 @@ countries = ["Sweden", "Netherlands", "Switzerland"]
 
 A config that uses only `[[upstream_pool]]` and no `[[upstream]]` is valid; a config with neither is rejected.
 
-The pool expansion runs at startup to seed the priority pool, and a per-block refresh goroutine keeps polling the relay list at the configured interval. In Phase 6 the refresh tick logs the diff (added / removed upstream ids) but does not yet swap the live pool; the running pool is whatever startup produced. Phase 7's SIGHUP hot-reload will rewire the diff handler to actually mutate the pool. `refresh = "0s"` is allowed and disables periodic refresh entirely; any positive value below 1m is rejected so a typo cannot hammer Mullvad's public relay-list API.
+The pool expansion runs at startup to seed the priority pool, and a per-block refresh goroutine keeps polling the relay list at the configured interval. In v1.0.0 the refresh tick logs the diff (added / removed upstream ids) so operators can see relay churn; the live running pool is whatever startup produced. To pick up a refreshed pool, restart the binary. SIGHUP re-reads the config file, but pools backed by `[[upstream_pool]]` are deliberately frozen across SIGHUP because re-fetching the relay list under signal would block the reload on Mullvad's API. `refresh = "0s"` is allowed and disables periodic refresh entirely; any positive value below 1m is rejected so a typo cannot hammer Mullvad's public relay-list API.
 
 ## `[failure]`
 
-Failure-detection settings. The signals are wired to scoring in Phase 4 onward.
+Failure-detection settings. The signals feed the scoreboard's penalty / cooldown logic. In v1.0.0, dial-side `ECONNREFUSED` is always classified as `KindRefused` and scored against the configured `[failure.scoring]` policy; the `connection_refused` config key is parsed for forward compatibility but the runtime does not yet consult it.
 
 | key                          | type             | default       | notes |
 |------------------------------|------------------|---------------|-------|
-| `connection_refused`         | bool             | `true`        | always on for Phase 1; opt-out lands in Phase 5 |
 | `timeout_ms`                 | int (ms)         | `8000`        | per-attempt timeout; must be > 0 |
-| `body_regex`                 | array of strings | `[]`          | deprecated in Phase 8; the parser still accepts the field but the runtime ignores it. Move patterns into `[[rule]].body_regex` instead. A non-empty value at startup triggers a one-line warning |
+| `body_regex`                 | array of strings | `[]`          | deprecated; the parser still accepts the field but the runtime ignores it. Move patterns into `[[rule]].body_regex` instead. A non-empty value at startup triggers a one-line warning |
 | `body_buffer_kb`             | int              | `32`          | per-response cap (in KiB) on the body prefix the listener buffers for `[[rule]].body_regex` matching. Must be >= 0 and <= 1024. Set to `0` to disable body inspection regardless of any `[[rule]].body_regex` entries; SIGHUP applies the new value live |
 | `max_retries_per_request`    | int              | `5`           | retry cap per incoming request; must be >= 1 |
 | `status` (`[[failure.status]]`) | array of tables | see below | per-status-code rules |
@@ -170,12 +169,12 @@ Knobs for the per-(host, upstream) scoreboard introduced in Phase 4. Sensible de
 | `body_match_cooldown` | duration | `60s`  | cooldown applied to the `(host, upstream)` after a body-regex match |
 | `prune_after`      | duration | `24h`   | the persistence-tick prune pass drops entries with `score == 0` and `lastSeen` older than this; `0s` disables entry pruning (cascade and debounce eviction still run) |
 
-The rate-limit, forbidden, and legal-block kinds get their penalty and cooldown from `[[failure.status]]` entries. Phase 5 wires them through the plain-HTTP listener: when a 429, 403, or 451 lands, the listener records a failure of the matching kind and rotates to the next upstream within the same request, up to `failure.max_retries_per_request`. Body-match policy lands in Phase 8.
+The rate-limit, forbidden, and legal-block kinds get their penalty and cooldown from `[[failure.status]]` entries. The plain-HTTP listener records the matching kind and rotates to the next upstream within the same request, up to `failure.max_retries_per_request`. Body-match scoring uses `body_match_penalty` and `body_match_cooldown` and is driven by `[[rule]].body_regex`.
 
 ## `[[rule]]`
 
-Optional per-host overrides. Phase 8 wires the routing semantics and the
-body-regex inspector through the live request path.
+Optional per-host overrides. The routing semantics and the body-regex
+inspector run live through the request path.
 
 | key         | type             | default | notes |
 |-------------|------------------|---------|-------|
@@ -259,6 +258,6 @@ The reload outcome is reported on `tunnelsmith_config_reloads_total{result="succ
 
 ## See also
 
-- [Architecture](architecture.md): how the scoreboard uses these settings (filled in during Phase 4).
+- [Architecture](architecture.md): how the scoreboard uses these settings.
 - [Observability](observability.md): the metric surface, scrape config, hot-reload behavior, and Grafana dashboard import.
 - [Decisions](decisions.md): the running ADR log.

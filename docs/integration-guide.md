@@ -199,4 +199,4 @@ myapp:
 - Stop the upstream the app's request was using; the app's next request still succeeds (failover works).
 - Set `NO_PROXY` to include a known-internal hostname; verify that traffic skips Tunnelsmith (check Tunnelsmith logs for absence).
 - Configure a fake destination that returns 429 with `Retry-After: 5`; verify your app gets either a transparent retry success (Tunnelsmith handled it) or sees the 429 and respects `Retry-After` itself (HTTPS case or cascade).
-- Phase 7 will add a `/metrics` endpoint that exposes per-upstream counters; once that lands, watch `tunnelsmith_requests_total{upstream=...}` increment as your app makes requests.
+- The `/metrics` endpoint (default `:9090`) exposes per-upstream counters. Watch `tunnelsmith_dial_attempts_total{upstream_id=...,outcome=...}` and `tunnelsmith_request_outcomes_total{outcome=...}` increment as your app makes requests; see [observability.md](observability.md) for the full metric reference.
