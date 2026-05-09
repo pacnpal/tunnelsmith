@@ -55,11 +55,12 @@ const (
 
 // Config is the top-level Tunnelsmith configuration.
 type Config struct {
-	Listener  ListenerConfig   `toml:"listener"`
-	Cache     CacheConfig      `toml:"cache"`
-	Upstreams []UpstreamConfig `toml:"upstream"`
-	Failure   FailureConfig    `toml:"failure"`
-	Rules     []RuleConfig     `toml:"rule"`
+	Listener      ListenerConfig       `toml:"listener"`
+	Cache         CacheConfig          `toml:"cache"`
+	Upstreams     []UpstreamConfig     `toml:"upstream"`
+	UpstreamPools []UpstreamPoolConfig `toml:"upstream_pool"`
+	Failure       FailureConfig        `toml:"failure"`
+	Rules         []RuleConfig         `toml:"rule"`
 
 	// UnknownKeys collects TOML keys that were present in the file but did
 	// not map to any known struct field. Surfacing these as warnings helps
@@ -105,6 +106,51 @@ func (u UpstreamConfig) PriorityValue() int {
 		return 100
 	}
 	return *u.Priority
+}
+
+// UpstreamPoolKind enumerates the providers an [[upstream_pool]] block can
+// expand. Only "mullvad" is implemented in Phase 6.
+type UpstreamPoolKind string
+
+const (
+	UpstreamPoolMullvad UpstreamPoolKind = "mullvad"
+)
+
+// UpstreamPoolConfig declares a synthetic group of upstreams the binary
+// will expand at startup. Phase 6 only knows how to expand provider
+// "mullvad", which fans the configured countries out into one socks5
+// upstream per active Mullvad WireGuard relay (see ADR-004).
+//
+// Priority and Refresh use *int / *Duration sentinels so applyDefaults
+// can tell "field omitted" from "user wrote 0" / "user wrote 0s". After
+// Parse both pointers are always populated.
+type UpstreamPoolConfig struct {
+	Provider        UpstreamPoolKind `toml:"provider"`
+	IDPrefix        string           `toml:"id_prefix"`
+	Priority        *int             `toml:"priority,omitempty"` // default: 200
+	Countries       []string         `toml:"countries"`          // required, non-empty
+	IncludeInactive bool             `toml:"include_inactive"`   // default: false
+	Refresh         *Duration        `toml:"refresh,omitempty"`  // default: 12h
+	CachePath       string           `toml:"cache_path"`         // default: "" (no cache)
+}
+
+// PriorityValue returns the resolved priority for the synthetic upstreams
+// produced by this pool block. Defaults to 200 so user-defined [[upstream]]
+// entries (default 100) take precedence over auto-discovered relays.
+func (p UpstreamPoolConfig) PriorityValue() int {
+	if p.Priority == nil {
+		return 200
+	}
+	return *p.Priority
+}
+
+// RefreshDuration returns the resolved refresh interval as a time.Duration.
+// Defaults to 12h.
+func (p UpstreamPoolConfig) RefreshDuration() time.Duration {
+	if p.Refresh == nil {
+		return 12 * time.Hour
+	}
+	return p.Refresh.Duration()
 }
 
 // StatusRule says how a single HTTP status code maps to a failure-detection
@@ -260,6 +306,19 @@ func (c *Config) applyDefaults(md toml.MetaData) {
 			c.Upstreams[i].Priority = &v
 		}
 	}
+	// [[upstream_pool]] uses the same sentinel pattern for priority and
+	// refresh. Defaults: priority 200 (so synthetic pool upstreams sit
+	// below user-defined upstreams), refresh 12h.
+	for i := range c.UpstreamPools {
+		if c.UpstreamPools[i].Priority == nil {
+			v := 200
+			c.UpstreamPools[i].Priority = &v
+		}
+		if c.UpstreamPools[i].Refresh == nil {
+			d := Duration(12 * time.Hour)
+			c.UpstreamPools[i].Refresh = &d
+		}
+	}
 }
 
 // applyScoringDefaults fills any [failure.scoring] field the user omitted
@@ -321,8 +380,8 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	if len(c.Upstreams) == 0 {
-		errs = append(errs, errors.New("at least one [[upstream]] must be defined"))
+	if len(c.Upstreams) == 0 && len(c.UpstreamPools) == 0 {
+		errs = append(errs, errors.New("at least one [[upstream]] or [[upstream_pool]] must be defined"))
 	}
 	seenIDs := make(map[string]int, len(c.Upstreams))
 	for i, u := range c.Upstreams {
@@ -369,6 +428,34 @@ func (c *Config) Validate() error {
 
 	if err := c.Failure.Scoring.validate(); err != nil {
 		errs = append(errs, err)
+	}
+
+	seenPoolPrefixes := make(map[string]int, len(c.UpstreamPools))
+	for i, p := range c.UpstreamPools {
+		idx := fmt.Sprintf("upstream_pool[%d]", i)
+		switch p.Provider {
+		case UpstreamPoolMullvad:
+		case "":
+			errs = append(errs, fmt.Errorf("%s: provider is required", idx))
+		default:
+			errs = append(errs, fmt.Errorf("%s: provider %q is not supported (only %q in this version)", idx, p.Provider, UpstreamPoolMullvad))
+		}
+		if p.IDPrefix == "" {
+			errs = append(errs, fmt.Errorf("%s: id_prefix is required", idx))
+		} else if prev, ok := seenPoolPrefixes[p.IDPrefix]; ok {
+			errs = append(errs, fmt.Errorf("%s: duplicate id_prefix %q (also at upstream_pool[%d])", idx, p.IDPrefix, prev))
+		} else {
+			seenPoolPrefixes[p.IDPrefix] = i
+		}
+		if len(p.Countries) == 0 {
+			errs = append(errs, fmt.Errorf("%s (id_prefix=%q): countries must list at least one country", idx, p.IDPrefix))
+		}
+		if p.Refresh != nil && p.Refresh.Duration() <= 0 {
+			errs = append(errs, fmt.Errorf("%s (id_prefix=%q): refresh must be > 0, got %v", idx, p.IDPrefix, p.Refresh.Duration()))
+		}
+		if p.CachePath != "" && !filepath.IsAbs(p.CachePath) {
+			errs = append(errs, fmt.Errorf("%s (id_prefix=%q): cache_path %q must be an absolute path", idx, p.IDPrefix, p.CachePath))
+		}
 	}
 
 	for i, r := range c.Rules {

@@ -24,6 +24,7 @@ import (
 	"github.com/pacnpal/tunnelsmith/internal/listener"
 	"github.com/pacnpal/tunnelsmith/internal/scoreboard"
 	"github.com/pacnpal/tunnelsmith/internal/upstream"
+	"github.com/pacnpal/tunnelsmith/internal/upstream/mullvad"
 )
 
 var (
@@ -96,9 +97,22 @@ func run(args []string, stdout, stderr *os.File) error {
 		return nil
 	}
 
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
 	dialTimeout := time.Duration(cfg.Failure.TimeoutMS) * time.Millisecond
-	entries := make([]upstream.PoolEntry, 0, len(cfg.Upstreams))
-	for _, uc := range cfg.Upstreams {
+	expandedPools, err := expandUpstreamPools(ctx, cfg.UpstreamPools, logger)
+	if err != nil {
+		return fmt.Errorf("expand upstream pools: %w", err)
+	}
+	allUpstreams := make([]config.UpstreamConfig, 0, len(cfg.Upstreams)+len(expandedPools))
+	allUpstreams = append(allUpstreams, cfg.Upstreams...)
+	allUpstreams = append(allUpstreams, expandedPools...)
+	if len(allUpstreams) == 0 {
+		return errors.New("no upstreams available after expanding [[upstream_pool]] (check provider connectivity and country filters)")
+	}
+	entries := make([]upstream.PoolEntry, 0, len(allUpstreams))
+	for _, uc := range allUpstreams {
 		up, err := upstream.New(uc, dialTimeout)
 		if err != nil {
 			return fmt.Errorf("build upstream %q: %w", uc.ID, err)
@@ -127,9 +141,6 @@ func run(args []string, stdout, stderr *os.File) error {
 		"cascade_ttl_ms", cfg.Failure.Scoring.CascadeTTL.Duration().Milliseconds(),
 		"debounce_window_ms", cfg.Failure.Scoring.DebounceWindow.Duration().Milliseconds(),
 	)
-
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
 
 	sb.Start(ctx)
 	defer sb.Stop()
@@ -176,6 +187,53 @@ func contextReason(ctx context.Context) string {
 		return err.Error()
 	}
 	return "unknown"
+}
+
+// expandUpstreamPools turns each [[upstream_pool]] block into a slice of
+// synthetic upstream entries by calling the relevant provider's expander
+// (only "mullvad" is implemented for Phase 6). Failures during expansion
+// are fatal at startup so the operator notices a broken upstream_pool
+// before traffic is sent. Phase 7 will move the runtime refresh into the
+// signal-handler hot-reload path.
+func expandUpstreamPools(ctx context.Context, blocks []config.UpstreamPoolConfig, logger *slog.Logger) ([]config.UpstreamConfig, error) {
+	var out []config.UpstreamConfig
+	for i, block := range blocks {
+		switch block.Provider {
+		case config.UpstreamPoolMullvad:
+			expanded, err := expandMullvadPool(ctx, block, logger)
+			if err != nil {
+				return nil, fmt.Errorf("upstream_pool[%d] (id_prefix=%q): %w", i, block.IDPrefix, err)
+			}
+			logger.Info("upstream_pool expanded",
+				"id_prefix", block.IDPrefix,
+				"provider", block.Provider,
+				"countries", block.Countries,
+				"upstreams", len(expanded),
+			)
+			out = append(out, expanded...)
+		default:
+			return nil, fmt.Errorf("upstream_pool[%d]: provider %q is not implemented", i, block.Provider)
+		}
+	}
+	return out, nil
+}
+
+func expandMullvadPool(ctx context.Context, block config.UpstreamPoolConfig, logger *slog.Logger) ([]config.UpstreamConfig, error) {
+	client := mullvad.NewClient()
+	if block.CachePath != "" {
+		client.Cache = &mullvad.Cache{Path: block.CachePath}
+	}
+	exp, err := mullvad.NewExpander(mullvad.ExpanderConfig{
+		IDPrefix:        block.IDPrefix,
+		Priority:        block.PriorityValue(),
+		Countries:       block.Countries,
+		IncludeInactive: block.IncludeInactive,
+		Refresh:         block.RefreshDuration(),
+	}, client, logger.With("component", "mullvad-expander", "id_prefix", block.IDPrefix))
+	if err != nil {
+		return nil, err
+	}
+	return exp.Snapshot(ctx)
 }
 
 // newLogger builds the structured JSON logger. Level is read from the
