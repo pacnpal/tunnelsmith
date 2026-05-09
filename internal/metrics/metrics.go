@@ -76,12 +76,12 @@ func New() *Registry {
 		DialAttempts: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "tunnelsmith",
 			Name:      "dial_attempts_total",
-			Help:      "Number of dial attempts the scoreboard issued, labelled by upstream and outcome.",
+			Help:      "Number of upstream dial attempts, emitted by the scoreboard's DialFor (CONNECT and SOCKS5 paths) and by the HTTP plain-HTTP forward path. A status-detected failure (429/403/451) still records a successful dial here because the connection succeeded; the failure dimension is captured by status_failures_total. Labelled by upstream and outcome.",
 		}, []string{"upstream_id", "outcome"}),
 		DialLatency: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: "tunnelsmith",
 			Name:      "dial_latency_seconds",
-			Help:      "Wall-clock latency of dial attempts, labelled by upstream and outcome.",
+			Help:      "Wall-clock latency of upstream dial attempts. On the scoreboard's DialFor it measures the TCP / SOCKS5 handshake; on the HTTP plain-HTTP forward path it measures the full RoundTrip (handshake plus request / response headers). Labelled by upstream and outcome.",
 			Buckets:   prometheus.ExponentialBuckets(0.005, 2, 12),
 		}, []string{"upstream_id", "outcome"}),
 		StatusFailures: prometheus.NewCounterVec(prometheus.CounterOpts{

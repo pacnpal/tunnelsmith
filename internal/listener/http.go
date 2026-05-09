@@ -539,6 +539,12 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 		}
 		if isFail {
 			h.sb.RecordFailure(host, up.ID(), det.Kind, det.CooldownOverride)
+			// The dial itself succeeded (the upstream answered with a
+			// status code); the failure signal is the response body, not
+			// the connection. Record dial success so dial_attempts_total
+			// stays consistent with the retry loop, and let
+			// status_failures_total carry the failure-shaped dimension.
+			h.observeForwardDial(up.ID(), "success", latency)
 			h.observeStatusFailure(up.ID(), resp.StatusCode)
 			drainAndClose(resp.Body)
 			tried[up.ID()] = true

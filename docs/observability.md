@@ -44,7 +44,7 @@ Prometheus instance. The Phase 9 web UI carries the per-host detail.
 
 | Name | Labels | Meaning |
 | --- | --- | --- |
-| `tunnelsmith_dial_attempts_total` | `upstream_id`, `outcome` | One increment per dial attempt the scoreboard issues. Outcome is `success`, `refused`, `timeout`, or `other`. |
+| `tunnelsmith_dial_attempts_total` | `upstream_id`, `outcome` | One increment per upstream dial attempt. Emitted by the scoreboard's `DialFor` (CONNECT and SOCKS5 paths) and by the HTTP plain-HTTP forward path. A response that the status detector flagged as a failure (429 / 403 / 451) still records `outcome=success` here because the connection itself succeeded; the failure dimension lives on `status_failures_total`. Outcome is `success`, `refused`, `timeout`, or `other`. |
 | `tunnelsmith_status_failures_total` | `upstream_id`, `code` | One increment per HTTP response the listener treated as a failure. Code is the upstream's HTTP status as a decimal string (`429`, `403`, `451`). |
 | `tunnelsmith_request_outcomes_total` | `outcome` | One increment per terminal client-request outcome. Outcome is `success`, `cascade`, or `exhausted`. |
 | `tunnelsmith_cascade_trips_total` | none | Number of times the scoreboard tripped cascade for a host after every upstream failed. |
@@ -56,7 +56,7 @@ Prometheus instance. The Phase 9 web UI carries the per-host detail.
 
 | Name | Labels | Meaning |
 | --- | --- | --- |
-| `tunnelsmith_dial_latency_seconds` | `upstream_id`, `outcome` | Wall-clock latency of dial attempts. Buckets are 12 exponentially-spaced bins from 5ms to ~10s. Outcome matches the dial attempts counter. |
+| `tunnelsmith_dial_latency_seconds` | `upstream_id`, `outcome` | Wall-clock latency of dial attempts. On the scoreboard's `DialFor` it measures the TCP / SOCKS5 handshake; on the HTTP plain-HTTP forward path it measures the full RoundTrip (handshake plus request / response headers), so its values run higher than the scoreboard path. Buckets are 12 exponentially-spaced bins from 5ms to ~10s. Outcome matches the dial attempts counter. |
 
 ### Gauges
 
