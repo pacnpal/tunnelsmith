@@ -42,6 +42,53 @@ func TestReplacePoolPreservesEntries(t *testing.T) {
 	}
 }
 
+// TestReplacePoolEvictsForcePinsForRemovedUpstreams confirms a hot
+// reload that drops an upstream from the pool also drops any active
+// Force pin pointing at that upstream. The routing path already fell
+// through to normal scoring (pickForced ignores stale pins), but
+// ForceSnapshot would keep surfacing the dead pin in the UI table
+// until an operator clicked Clear; this is issue #19.
+func TestReplacePoolEvictsForcePinsForRemovedUpstreams(t *testing.T) {
+	t.Parallel()
+
+	clock := &fixedClock{now: time.Date(2026, 5, 9, 0, 0, 0, 0, time.UTC)}
+	sb := newPersistTestScoreboard(t, clock) // pool: alpha, beta, gamma
+
+	until := clock.Now().Add(time.Hour)
+	if err := sb.Force("survives.example.com", "alpha", until); err != nil {
+		t.Fatalf("Force survives: %v", err)
+	}
+	if err := sb.Force("evicted.example.com", "beta", until); err != nil {
+		t.Fatalf("Force evicted: %v", err)
+	}
+	if err := sb.Force("also-evicted.example.com", "gamma", until); err != nil {
+		t.Fatalf("Force also-evicted: %v", err)
+	}
+	if got := len(sb.ForceSnapshot()); got != 3 {
+		t.Fatalf("ForceSnapshot before swap = %d, want 3", got)
+	}
+
+	// New pool keeps alpha, drops beta and gamma, adds delta.
+	newPool := buildPersistTestPool(t, "alpha", "delta")
+	if err := sb.ReplacePool(newPool); err != nil {
+		t.Fatalf("ReplacePool: %v", err)
+	}
+
+	snap := sb.ForceSnapshot()
+	if len(snap) != 1 {
+		t.Fatalf("ForceSnapshot after swap = %d, want 1 (only alpha-pin survives)", len(snap))
+	}
+	if snap[0].Host != "survives.example.com" || snap[0].UpstreamID != "alpha" {
+		t.Errorf("surviving pin = %+v, want survives.example.com/alpha", snap[0])
+	}
+	if _, ok := sb.ForcedFor("evicted.example.com"); ok {
+		t.Error("ForcedFor still reports beta-pin as active after pool swap")
+	}
+	if _, ok := sb.ForcedFor("also-evicted.example.com"); ok {
+		t.Error("ForcedFor still reports gamma-pin as active after pool swap")
+	}
+}
+
 // TestReplacePoolNilRejected catches the contract violation up front.
 func TestReplacePoolNilRejected(t *testing.T) {
 	t.Parallel()

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-05-09
+
+First public release. Tunnelsmith ships as a per-destination egress router for HTTP and SOCKS5: the proxy listeners, the per-(host, upstream) scoreboard with cooldowns and decay, Mullvad WireGuard pool integration, status- and body-regex failure detection, per-host rules, Prometheus metrics with persistence and SIGHUP hot-reload, and the embedded web UI for inspection and admin actions. ADR-005 records that release-image verification runs in CI.
+
+### Added (Phase 10)
+
+- `docs/decisions.md` ADR-005: release-image verification (`docker pull`, `--version` smoke, multi-arch manifest check, `:latest` digest match) moved into `release.yml` so a broken image cannot reach a v* tag without failing the workflow first. Resolves the open question ADR-001 left for Phase 10.
+- `.github/workflows/release.yml`: new `verify pushed image runs and is multi-arch` step that pulls the freshly pushed tag, runs `--version` inside it, asserts both `linux/amd64` and `linux/arm64` are in the manifest, and compares the `:latest` index digest to the tag's when `:latest` was emitted by `metadata-action`.
+- `internal/ui.Backend.Now()` and `*scoreboard.Scoreboard.Now()`: the UI handlers' `generated_at`, `force` duration math, and `until in the past` check now read the scoreboard's injected clock (closes #18). A manual-clock scoreboard test now sees the same instant through both layers; the fake backend in `internal/ui/handlers_test.go` exposes an injectable `now` field.
+- `internal/scoreboard.ReplacePool` evicts force pins whose upstream id is no longer in the new pool (closes #19) and logs each eviction at info level. Routing already fell through to normal scoring for stale pins; this stops the pin from continuing to render in the UI table after a hot reload.
+- `README.md`: CI status, latest release, and container-image badges; license badge already present.
+
 ### Added (Phase 9)
 
 - `internal/ui` package: embedded HTML / JS / CSS via `embed.FS` plus a `net/http`-based server that exposes the page at `/`, four JSON action endpoints (`/api/forget`, `/api/force`, `/api/force/clear`, `/api/reset`), the read-only `/api/scoreboard`, and a cheap `/healthz` probe. The `Backend` interface lets handler tests drive every endpoint with a fake; the live wiring uses `*scoreboard.Scoreboard` directly because it satisfies the interface 1:1.

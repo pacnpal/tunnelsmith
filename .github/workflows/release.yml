@@ -45,6 +45,7 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: build and push
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -57,6 +58,90 @@ jobs:
             VERSION=${{ github.ref_name }}
             COMMIT=${{ github.sha }}
             DATE=${{ github.event.head_commit.timestamp }}
+
+      # Per ADR-005, release-image verification runs in CI rather than on
+      # the host. Pull the freshly pushed image, run --version inside it,
+      # and confirm the manifest index carries both architectures the
+      # build step asked for. If `:latest` was also pushed
+      # (default-branch tag), confirm its index digest matches the
+      # version tag's. Any failure here aborts the release before the
+      # GitHub release is created, so a broken image cannot reach v*
+      # tags.
+      #
+      # PULL_TAG vs GIT_REF: metadata-action's `type=semver,pattern={{version}}`
+      # strips the leading `v`, so a push of git tag `v1.0.0` produces
+      # image tag `1.0.0`. The pull and digest checks therefore use
+      # `steps.meta.outputs.version` (the canonical resolved version,
+      # e.g. `1.0.0`). The binary's --version output, on the other hand,
+      # is built with `VERSION=${{ github.ref_name }}` and so contains
+      # the v-prefixed git ref. The substring check anchors on that.
+      - name: verify pushed image runs and is multi-arch
+        env:
+          PULL_TAG: ${{ steps.meta.outputs.version }}
+          GIT_REF: ${{ github.ref_name }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          EMITTED_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          echo "verifying ${IMAGE}:${PULL_TAG} (git ref: ${GIT_REF})"
+          docker pull "${IMAGE}:${PULL_TAG}"
+          out="$(docker run --rm "${IMAGE}:${PULL_TAG}" --version)"
+          echo "image --version: ${out}"
+          case "${out}" in
+            *"${GIT_REF}"*) ;;
+            *)
+              echo "image --version output does not contain git ref ${GIT_REF}" >&2
+              exit 1
+              ;;
+          esac
+          # build-push-action@v7 ships BuildKit provenance attestations
+          # by default (mode=max for public repos). Provenance entries
+          # land in the same image index with platform.architecture and
+          # platform.os set to "unknown" and the annotation
+          # vnd.docker.reference.type=attestation-manifest. Filter them
+          # out so the equality assertions only see the real platform
+          # manifests. Keeping provenance enabled is the v1 default.
+          docker manifest inspect "${IMAGE}:${PULL_TAG}" | jq -e '
+            ([.manifests[]
+              | select((.annotations["vnd.docker.reference.type"] // "") != "attestation-manifest")
+              | select(.platform.architecture != "unknown")]
+             | (map(.platform.architecture) | sort)  == ["amd64","arm64"]
+               and (map(.platform.os)        | unique) == ["linux"])
+          ' > /dev/null
+          echo "multi-arch manifest verified: linux/amd64 + linux/arm64 (attestations excluded)"
+          # buildx imagetools exposes the descriptor digest as
+          # `.Manifest.Digest`. Use the template field directly rather
+          # than `{{json .Manifest}}` plus `jq '.digest'`, which depends
+          # on the marshaled struct still carrying a top-level `digest`
+          # field; the templated form is unambiguous.
+          version_digest="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "${IMAGE}:${PULL_TAG}")"
+          if [ -z "${version_digest}" ] || [ "${version_digest}" = "<no value>" ]; then
+            echo "buildx imagetools returned an empty digest for ${IMAGE}:${PULL_TAG}" >&2
+            exit 1
+          fi
+          echo "${PULL_TAG} index digest: ${version_digest}"
+          # Gate the :latest digest comparison on whether metadata-action
+          # actually emitted :latest for THIS push (steps.meta.outputs.tags
+          # is the authoritative source). Gating on registry existence
+          # would compare against a stale :latest from a prior release
+          # when this run was cut from a non-default branch and
+          # metadata-action's `enable={{is_default_branch}}` evaluated
+          # false, which would fail the release on a phantom mismatch.
+          if echo "${EMITTED_TAGS}" | grep -Fxq "${IMAGE}:latest"; then
+            latest_digest="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "${IMAGE}:latest")"
+            if [ -z "${latest_digest}" ] || [ "${latest_digest}" = "<no value>" ]; then
+              echo "buildx imagetools returned an empty digest for ${IMAGE}:latest" >&2
+              exit 1
+            fi
+            echo ":latest index digest:    ${latest_digest}"
+            if [ "${version_digest}" != "${latest_digest}" ]; then
+              echo ":latest index digest does not match ${PULL_TAG}" >&2
+              exit 1
+            fi
+            echo ":latest matches ${PULL_TAG}"
+          else
+            echo "::notice::metadata-action did not emit :latest for this push (likely not on the default branch); skipping :latest digest match"
+          fi
 
       - name: create github release
         env:
