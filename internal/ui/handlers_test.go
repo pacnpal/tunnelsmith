@@ -424,10 +424,3 @@ func timeoutCtx(t *testing.T, d time.Duration) context.Context {
 	t.Cleanup(cancel)
 	return ctx
 }
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}

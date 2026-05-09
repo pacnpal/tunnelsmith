@@ -66,7 +66,7 @@ The page polls `GET /api/scoreboard`; the four action buttons POST to the four e
 }
 ```
 
-`pool_ids` is the live pool order. `entries` is one element per (host, upstream); zero-value timestamps mean "never set" (`cooldown_until: "0001-01-01T00:00:00Z"` for an upstream that has never failed for the host, for example). `forces` lists every active pin, sorted by host. `cooled_by_upstream` mirrors the `tunnelsmith_upstream_cooled_hosts` gauge. `cascade_active` is the count of hosts currently in cascade-failure cooldown. `generated_at` is the wall-clock instant the snapshot was taken (for "is this stale?" checks).
+`pool_ids` is the live pool order. `entries` is one element per (host, upstream); zero-value timestamps are omitted from the wire payload entirely, so a missing `cooldown_until` or `last_seen` field means "never set" (an upstream that has never failed for the host has no `cooldown_until`, for example). `forces` lists every active pin, sorted by host. `cooled_by_upstream` mirrors the `tunnelsmith_upstream_cooled_hosts` gauge. `cascade_active` is the count of hosts currently in cascade-failure cooldown. `generated_at` is the wall-clock instant the snapshot was taken (for "is this stale?" checks).
 
 `POST /api/forget` -> `200 application/json`. Body: `{"host": "..."}`. Returns `{"removed": true|false}`; `false` means the host had no scoreboard footprint and the call was a no-op.
 

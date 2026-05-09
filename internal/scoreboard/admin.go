@@ -71,7 +71,10 @@ func (s *Scoreboard) Forget(host string) bool {
 // host should ForgetHost first, then Force.
 //
 // Force returns ErrUnknownUpstream if upstreamID is not currently in
-// the live pool. until in the past clears any existing pin for host.
+// the live pool. until in the past clears any existing pin for host;
+// the clear path runs before pool-membership validation so an operator
+// can drop a stale pin even after a hot reload removes the upstream
+// the pin originally referenced.
 func (s *Scoreboard) Force(host, upstreamID string, until time.Time) error {
 	if host == "" {
 		return errors.New("scoreboard: Force requires a non-empty host")
@@ -81,6 +84,17 @@ func (s *Scoreboard) Force(host, upstreamID string, until time.Time) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := s.clock()
+	if !until.After(now) {
+		// Clear path: drop any active pin for host regardless of
+		// whether upstreamID is still in the live pool. If there was no
+		// pin to clear this is a no-op.
+		if _, ok := s.forces[host]; ok {
+			delete(s.forces, host)
+			s.logger.Info("scoreboard force cleared", "host", host, "reason", "until_in_past")
+		}
+		return nil
+	}
 	known := false
 	for _, c := range s.poolEntries {
 		if c.Up.ID() == upstreamID {
@@ -90,12 +104,6 @@ func (s *Scoreboard) Force(host, upstreamID string, until time.Time) error {
 	}
 	if !known {
 		return ErrUnknownUpstream
-	}
-	now := s.clock()
-	if !until.After(now) {
-		delete(s.forces, host)
-		s.logger.Info("scoreboard force cleared", "host", host, "reason", "until_in_past")
-		return nil
 	}
 	if s.forces == nil {
 		s.forces = make(map[string]ForceEntry)
@@ -124,29 +132,41 @@ func (s *Scoreboard) ClearForce(host string) bool {
 
 // ForcedFor returns the live force pin for host, or zero-value plus
 // false if none is active. An expired pin is treated as absent and
-// removed lazily on the next Pick.
+// pruned in place so Pick is not the only path that evicts dead state.
 func (s *Scoreboard) ForcedFor(host string) (ForceEntry, bool) {
+	now := s.clock()
 	s.mu.RLock()
 	entry, ok := s.forces[host]
 	s.mu.RUnlock()
 	if !ok {
 		return ForceEntry{}, false
 	}
-	if !entry.Until.After(s.clock()) {
+	if !entry.Until.After(now) {
+		s.mu.Lock()
+		// Re-check under the write lock so a concurrent Force that
+		// installed a fresh pin between the RUnlock and Lock is not
+		// clobbered.
+		if cur, stillThere := s.forces[host]; stillThere && !cur.Until.After(now) {
+			delete(s.forces, host)
+		}
+		s.mu.Unlock()
 		return ForceEntry{}, false
 	}
 	return entry, true
 }
 
 // ForceSnapshot returns every active Force pin sorted by host. Expired
-// pins are excluded. Used by the UI handler to render the current force
-// table.
+// pins are excluded from the result and evicted from s.forces in the
+// same call so a host that was pinned and then never picked again does
+// not leak the entry forever.
 func (s *Scoreboard) ForceSnapshot() []ForceSnapshotEntry {
 	now := s.clock()
 	s.mu.RLock()
 	out := make([]ForceSnapshotEntry, 0, len(s.forces))
+	expired := make([]string, 0)
 	for host, f := range s.forces {
 		if !f.Until.After(now) {
+			expired = append(expired, host)
 			continue
 		}
 		out = append(out, ForceSnapshotEntry{
@@ -156,6 +176,18 @@ func (s *Scoreboard) ForceSnapshot() []ForceSnapshotEntry {
 		})
 	}
 	s.mu.RUnlock()
+	if len(expired) > 0 {
+		s.mu.Lock()
+		for _, host := range expired {
+			// Re-check under the write lock so a concurrent Force that
+			// installed a fresh pin between the RUnlock and Lock is not
+			// clobbered.
+			if cur, ok := s.forces[host]; ok && !cur.Until.After(now) {
+				delete(s.forces, host)
+			}
+		}
+		s.mu.Unlock()
+	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Host < out[j].Host })
 	return out
 }

@@ -103,7 +103,7 @@ func mountHandlers(mux *http.ServeMux, backend Backend, logger *slog.Logger) {
 		var body struct {
 			Host string `json:"host"`
 		}
-		if err := decodeJSONBody(r, &body); err != nil {
+		if err := decodeJSONBody(w, r, &body); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -128,7 +128,7 @@ func mountHandlers(mux *http.ServeMux, backend Backend, logger *slog.Logger) {
 			Duration   string `json:"duration"`
 			Until      string `json:"until"`
 		}
-		if err := decodeJSONBody(r, &body); err != nil {
+		if err := decodeJSONBody(w, r, &body); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -167,7 +167,7 @@ func mountHandlers(mux *http.ServeMux, backend Backend, logger *slog.Logger) {
 		var body struct {
 			Host string `json:"host"`
 		}
-		if err := decodeJSONBody(r, &body); err != nil {
+		if err := decodeJSONBody(w, r, &body); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -187,11 +187,13 @@ func mountHandlers(mux *http.ServeMux, backend Backend, logger *slog.Logger) {
 			return
 		}
 		// Body is optional. Accept and discard so a client that posts a
-		// JSON object does not see a 400.
+		// JSON object does not see a 400. We always call decodeJSONBody
+		// rather than gating on ContentLength because chunked-encoded
+		// requests report ContentLength as -1, and an unread body can
+		// interfere with HTTP/1.1 keep-alive reuse. decodeJSONBody
+		// itself caps the read at 1 MiB, so this is safe.
 		var body map[string]any
-		if r.ContentLength > 0 {
-			_ = decodeJSONBody(r, &body)
-		}
+		_ = decodeJSONBody(w, r, &body)
 		backend.Reset()
 		logger.Warn("ui reset", "remote_addr", r.RemoteAddr)
 		w.WriteHeader(http.StatusNoContent)
@@ -282,7 +284,11 @@ func resolveForceUntil(durationStr, untilStr string) (time.Time, error) {
 		}
 		return time.Now().Add(d), nil
 	}
-	t, err := time.Parse(time.RFC3339, untilStr)
+	// Accept RFC3339Nano so a client that round-trips a Go time.Time as
+	// JSON does not get rejected for fractional seconds. RFC3339Nano is
+	// a strict superset of RFC3339, so plain "2026-05-09T13:00:00Z"
+	// still parses.
+	t, err := time.Parse(time.RFC3339Nano, untilStr)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("invalid until %q: %s", untilStr, err.Error())
 	}
@@ -296,11 +302,16 @@ func resolveForceUntil(durationStr, untilStr string) (time.Time, error) {
 // decodes into dst. The cap protects the binary from a client that
 // streams an unbounded body; the real payload here is a few hundred
 // bytes at most.
-func decodeJSONBody(r *http.Request, dst any) error {
+//
+// w is threaded through so http.MaxBytesReader can issue a 413 with
+// the right headers when a caller blows past the cap. Passing nil
+// instead would have callers surface oversized bodies as a generic
+// 400 "invalid JSON", which is a misleading status code.
+func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any) error {
 	if r.Body == nil {
 		return errors.New("empty body")
 	}
-	limited := http.MaxBytesReader(nil, r.Body, 1<<20)
+	limited := http.MaxBytesReader(w, r.Body, 1<<20)
 	dec := json.NewDecoder(limited)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {
