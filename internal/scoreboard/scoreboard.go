@@ -183,6 +183,12 @@ type Scoreboard struct {
 	poolRetryCap int
 	poolLen      int
 
+	// rules carries Phase 8's compiled per-host routing rules. nil
+	// means "no rules configured"; Pick treats every host as
+	// pool-wide. The pointer is swapped atomically by ReplaceRules
+	// under mu, so a hot reload cannot tear concurrent reads.
+	rules *upstream.RuleSet
+
 	// mu guards entries and cascade. Pick takes RLock; Record* and the
 	// decay loop take Lock.
 	mu      sync.RWMutex
@@ -278,6 +284,16 @@ func WithMetrics(m MetricsSink) Option {
 	}
 }
 
+// WithRules attaches Phase 8's per-host routing rules. Pass nil (or no
+// option at all) to disable rule-aware routing; Pick will treat every
+// host as pool-wide. The hot-reload path uses ReplaceRules to swap an
+// already-running scoreboard's rule set without rebuilding it.
+func WithRules(rs *upstream.RuleSet) Option {
+	return func(s *Scoreboard) {
+		s.rules = rs
+	}
+}
+
 // New builds a Scoreboard wrapping pool. Pool must be non-nil. Pass options
 // to override the default logger, clock, or random source.
 func New(pool *upstream.Pool, cfg Config, opts ...Option) (*Scoreboard, error) {
@@ -323,6 +339,17 @@ func (s *Scoreboard) poolSnapshot() (entries []upstream.PoolEntry, retryCap, poo
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.poolEntries, s.poolRetryCap, s.poolLen
+}
+
+// ReplaceRules swaps the per-host rule set in place. Used by the SIGHUP
+// hot-reload path: the request path's reads of s.rules happen under
+// the same RLock that ReplaceRules takes for its write, so a Pick in
+// flight either sees the old rule set fully (single coherent
+// snapshot) or the new one. Pass nil to clear all rules.
+func (s *Scoreboard) ReplaceRules(rs *upstream.RuleSet) {
+	s.mu.Lock()
+	s.rules = rs
+	s.mu.Unlock()
 }
 
 // ReplacePool swaps the wrapped pool for a new one. Used by the SIGHUP
@@ -489,6 +516,17 @@ func (s *Scoreboard) decayTick() {
 // the one whose cooldown expires soonest (cooldown is advisory rather than
 // hard exclusion when there is nothing else to try).
 //
+// Phase 8: Pick consults the configured RuleSet. A rule whose host_glob
+// matches host applies in two ways:
+//   - Force=true narrows candidates to the rule's Prefer ids before
+//     scoring. Every non-Prefer upstream is filtered out, even from
+//     the cooldown-fallback path. ErrPoolExhausted fires if every
+//     forced candidate is in tried.
+//   - Force=false adds a "preferred ranking" that wins over score:
+//     preferred upstreams sort to the top in the rule's declaration
+//     order; everything else falls in by the existing (score desc,
+//     base priority asc) tiebreak.
+//
 // tried may be nil; nil and empty are equivalent.
 func (s *Scoreboard) Pick(host string, tried map[string]bool) (upstream.Upstream, error) {
 	now := s.clock()
@@ -496,29 +534,52 @@ func (s *Scoreboard) Pick(host string, tried map[string]bool) (upstream.Upstream
 		return nil, &CascadeError{Host: host}
 	}
 	type ranked struct {
-		up       upstream.Upstream
-		basePri  int
-		score    float64
-		cooled   bool
-		untilT   time.Time
-		untilSet bool
+		up        upstream.Upstream
+		basePri   int
+		score     float64
+		cooled    bool
+		untilT    time.Time
+		untilSet  bool
+		preferRank int // 0 = not preferred; 1+ = position in rule.Prefer
 	}
 	// Take one read lock around every field that hot-reload can swap
-	// (poolEntries, cfg.ProbeChance) plus the entries map iteration. A
-	// concurrent ReplacePool / Reload waits behind this RLock; a
-	// concurrent reader runs without contention.
+	// (poolEntries, cfg.ProbeChance, rules) plus the entries map
+	// iteration. A concurrent ReplacePool / Reload / ReplaceRules waits
+	// behind this RLock; a concurrent reader runs without contention.
 	s.mu.RLock()
 	candidates := s.poolEntries
 	probeChance := s.cfg.ProbeChance
+	rule := s.rules.Match(host)
 	if len(candidates) == 0 {
 		s.mu.RUnlock()
 		return nil, ErrPoolExhausted
 	}
+
+	// Build the prefer-rank lookup once per Pick. Position is 1-based
+	// so 0 stays "not preferred" and the smallest non-zero value wins.
+	var preferRank map[string]int
+	if rule != nil && len(rule.Prefer) > 0 {
+		preferRank = make(map[string]int, len(rule.Prefer))
+		for i, id := range rule.Prefer {
+			if _, dup := preferRank[id]; dup {
+				continue
+			}
+			preferRank[id] = i + 1
+		}
+	}
+
 	pool := make([]ranked, 0, len(candidates))
 	for _, c := range candidates {
 		id := c.Up.ID()
 		if tried[id] {
 			continue
+		}
+		// Force=true filters non-prefer ids out before they ever get
+		// scored. Cascade fires when every forced candidate is tried.
+		if rule != nil && rule.Force {
+			if _, ok := preferRank[id]; !ok {
+				continue
+			}
 		}
 		var (
 			score    float64
@@ -535,12 +596,13 @@ func (s *Scoreboard) Pick(host string, tried map[string]bool) (upstream.Upstream
 			}
 		}
 		pool = append(pool, ranked{
-			up:       c.Up,
-			basePri:  c.Priority,
-			score:    score,
-			cooled:   cooled,
-			untilT:   untilT,
-			untilSet: untilSet,
+			up:        c.Up,
+			basePri:   c.Priority,
+			score:     score,
+			cooled:    cooled,
+			untilT:    untilT,
+			untilSet:  untilSet,
+			preferRank: preferRank[id],
 		})
 	}
 	s.mu.RUnlock()
@@ -562,17 +624,33 @@ func (s *Scoreboard) Pick(host string, tried map[string]bool) (upstream.Upstream
 	if len(eligible) == 0 {
 		// Every untried upstream is on cooldown. Pick the one closest to
 		// warming up rather than 502'ing the request: cooldown is advisory
-		// when nothing else is available.
+		// when nothing else is available. Force=true already pruned
+		// non-prefer ids out of cooled above, so this still respects the
+		// rule.
 		sort.Slice(cooled, func(i, j int) bool {
 			return cooled[i].untilT.Before(cooled[j].untilT)
 		})
 		return cooled[0].up, nil
 	}
 
-	// Sort by score desc, base priority asc. Stable so the input order
-	// (priority order from the pool) is the tiebreaker for entries with
-	// no prior data.
+	// Sort by (preferRank asc with 0 last, score desc, base priority asc).
+	// Stable so the input order (priority order from the pool) is the
+	// tiebreaker for entries with no prior data. preferRank == 0 sorts
+	// after every ranked candidate, so non-preferred upstreams keep
+	// their existing order behind the prefer list.
 	sort.SliceStable(eligible, func(i, j int) bool {
+		ri, rj := eligible[i].preferRank, eligible[j].preferRank
+		if ri != rj {
+			// Both 0 falls through to score/priority below.
+			// One zero, one non-zero: the non-zero wins.
+			if ri == 0 {
+				return false
+			}
+			if rj == 0 {
+				return true
+			}
+			return ri < rj
+		}
 		if eligible[i].score != eligible[j].score {
 			return eligible[i].score > eligible[j].score
 		}
