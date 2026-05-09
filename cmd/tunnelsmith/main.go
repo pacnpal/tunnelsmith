@@ -146,6 +146,19 @@ func run(args []string, stdout, stderr *os.File) error {
 	if err != nil {
 		return fmt.Errorf("build scoreboard: %w", err)
 	}
+	if cfg.Cache.PersistPath != "" {
+		if err := sb.LoadSnapshot(cfg.Cache.PersistPath); err != nil {
+			logger.Warn("scoreboard snapshot load failed, starting from empty state",
+				"path", cfg.Cache.PersistPath,
+				"err", err,
+			)
+		} else {
+			logger.Info("scoreboard snapshot loaded",
+				"path", cfg.Cache.PersistPath,
+				"entries", sb.EntriesCount(),
+			)
+		}
+	}
 	logger.Info("scoreboard built",
 		"probe_chance", cfg.Failure.Scoring.ProbeChance,
 		"decay_interval_ms", cfg.Failure.Scoring.DecayInterval.Duration().Milliseconds(),
@@ -179,6 +192,22 @@ func run(args []string, stdout, stderr *os.File) error {
 	g.Go(func() error { return socksSrv.Serve(gctx) })
 	if metricsSrv != nil {
 		g.Go(func() error { return metricsSrv.Serve(gctx) })
+	}
+	if cfg.Cache.PersistPath != "" {
+		persistLoop := scoreboard.NewPersistenceLoop(sb, scoreboard.PersistenceConfig{
+			Path:     cfg.Cache.PersistPath,
+			Interval: cfg.Cache.PersistInterval.Duration(),
+		}, logger, metricsRegistry)
+		g.Go(func() error { return persistLoop.Run(gctx) })
+	}
+	if metricsSrv != nil {
+		// Refresh the scoreboard-shape gauges on every metrics scrape
+		// would be more accurate, but Prometheus client_golang does not
+		// expose a "before-collect" hook for arbitrary gauges. A light
+		// background ticker mirrors the scoreboard state into the gauge
+		// vectors at a reasonable cadence.
+		gaugeRefresh := newScoreboardGaugeRefresher(sb, metricsRegistry, pool.IDs())
+		g.Go(func() error { return gaugeRefresh.run(gctx) })
 	}
 	for _, run := range expanders {
 		run := run
@@ -391,6 +420,45 @@ func diffUpstreams(prev, next []config.UpstreamConfig) (added, removed []string)
 		}
 	}
 	return added, removed
+}
+
+// scoreboardGaugeRefresher periodically copies the scoreboard's
+// shape-only state (total entries, per-upstream cooled hosts, cascade
+// active count) into the metrics registry. The refresh interval is
+// independent of the persistence loop so the metrics gauges stay
+// reasonably fresh even when persistence is disabled.
+type scoreboardGaugeRefresher struct {
+	sb       *scoreboard.Scoreboard
+	registry *metrics.Registry
+	poolIDs  []string
+	interval time.Duration
+}
+
+func newScoreboardGaugeRefresher(sb *scoreboard.Scoreboard, reg *metrics.Registry, poolIDs []string) *scoreboardGaugeRefresher {
+	return &scoreboardGaugeRefresher{sb: sb, registry: reg, poolIDs: poolIDs, interval: 5 * time.Second}
+}
+
+func (r *scoreboardGaugeRefresher) run(ctx context.Context) error {
+	t := time.NewTicker(r.interval)
+	defer t.Stop()
+	r.tick()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-t.C:
+			r.tick()
+		}
+	}
+}
+
+func (r *scoreboardGaugeRefresher) tick() {
+	r.registry.SetScoreboardSnapshot(
+		r.sb.EntriesCount(),
+		r.sb.CooledHostsByUpstream(),
+		r.sb.CascadeActiveCount(),
+		r.poolIDs,
+	)
 }
 
 // newLogger builds the structured JSON logger. Level is read from the

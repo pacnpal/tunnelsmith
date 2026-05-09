@@ -80,6 +80,12 @@ type Config struct {
 	// concurrent client requests from over-penalizing one rate-limit event
 	// into N penalties.
 	DebounceWindow time.Duration
+
+	// PruneAfter governs the persistence-tick prune pass. An entry whose
+	// score has decayed to zero and whose lastSeen is older than
+	// PruneAfter is dropped during the next snapshot. <= 0 disables
+	// entry pruning; cascade and debounce eviction always run.
+	PruneAfter time.Duration
 }
 
 // FromConfig builds a scoreboard Config from the parsed [failure.scoring]
@@ -126,6 +132,7 @@ func FromConfig(s config.ScoringConfig, status []config.StatusRule) Config {
 		DecayStep:      s.DecayStep,
 		CascadeTTL:     s.CascadeTTL.Duration(),
 		DebounceWindow: s.DebounceWindow.Duration(),
+		PruneAfter:     s.PruneAfter.Duration(),
 	}
 }
 
