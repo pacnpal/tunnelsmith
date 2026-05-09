@@ -98,12 +98,27 @@ wait_ready() {
 verify_country() {
   local expected="$1"
   local body
-  body=$(curl -fsS --socks5-hostname "${SOCKS_HOST}:${SOCKS_PORT}" \
-    --connect-timeout 10 --max-time 20 \
-    https://am.i.mullvad.net/json)
+  # Capture curl failures explicitly so a transient SOCKS5 hiccup or
+  # am.i.mullvad.net timeout exits with the documented code 1 ("a country
+  # mismatched expectations") rather than letting `set -e` propagate
+  # curl's exit status. Same for the two jq calls below.
+  if ! body=$(curl -fsS --socks5-hostname "${SOCKS_HOST}:${SOCKS_PORT}" \
+      --connect-timeout 10 --max-time 20 \
+      https://am.i.mullvad.net/json); then
+    echo "verify failed: curl could not reach am.i.mullvad.net through tunnelsmith for ${expected}" >&2
+    return 1
+  fi
   local got_country got_exit
-  got_country=$(printf '%s' "${body}" | jq -r .country)
-  got_exit=$(printf '%s' "${body}" | jq -r .mullvad_exit_ip)
+  if ! got_country=$(printf '%s' "${body}" | jq -r .country); then
+    echo "verify failed: jq could not parse country from am.i.mullvad.net response for ${expected}" >&2
+    echo "${body}" >&2
+    return 1
+  fi
+  if ! got_exit=$(printf '%s' "${body}" | jq -r .mullvad_exit_ip); then
+    echo "verify failed: jq could not parse mullvad_exit_ip from am.i.mullvad.net response for ${expected}" >&2
+    echo "${body}" >&2
+    return 1
+  fi
   if [[ "${got_exit}" != "true" ]]; then
     echo "verify failed: am.i.mullvad.net says we are not exiting through Mullvad" >&2
     echo "${body}" | jq . >&2

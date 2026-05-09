@@ -62,7 +62,13 @@ func (e *Expander) Snapshot(ctx context.Context) ([]config.UpstreamConfig, error
 func (e *Expander) transform(relays []Relay) []config.UpstreamConfig {
 	allowed := buildCountryFilter(e.cfg.Countries)
 	out := make([]config.UpstreamConfig, 0, len(relays))
+	// Allocate the priority pointer once for the whole snapshot. The value
+	// is constant across every expanded upstream in this pool, and
+	// UpstreamConfig.Priority is read-only after construction, so sharing
+	// is safe. This avoids ~N heap allocations per refresh tick at
+	// Mullvad's scale (560+ relays).
 	priority := e.cfg.Priority
+	priorityPtr := &priority
 	for _, r := range relays {
 		if !e.cfg.IncludeInactive && !r.Active {
 			continue
@@ -80,12 +86,11 @@ func (e *Expander) transform(relays []Relay) []config.UpstreamConfig {
 			)
 			continue
 		}
-		p := priority
 		out = append(out, config.UpstreamConfig{
 			ID:       e.cfg.IDPrefix + "-" + r.Hostname,
 			Kind:     config.KindSOCKS5,
 			Addr:     addr,
-			Priority: &p,
+			Priority: priorityPtr,
 		})
 	}
 	// Sort by upstream id so the slice's order is independent of the
