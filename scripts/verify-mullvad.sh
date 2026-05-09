@@ -16,6 +16,7 @@
 #   0  every country verified
 #   1  a country mismatched expectations
 #   2  tunnelsmith never became ready in time
+#   3  VERIFY_COUNTRIES is empty or invalid after trimming
 
 set -euo pipefail
 
@@ -41,7 +42,7 @@ for raw in "${RAW_COUNTRY_LIST[@]}"; do
 done
 if [ "${#COUNTRY_LIST[@]}" -eq 0 ]; then
   echo "VERIFY_COUNTRIES yielded no usable entries after trimming: ${VERIFY_COUNTRIES}" >&2
-  exit 2
+  exit 3
 fi
 
 write_config() {

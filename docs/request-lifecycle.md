@@ -28,7 +28,7 @@ services:
 
 `curl http://api.example.com/data`. Because `HTTP_PROXY` is set, curl sends:
 
-```
+```http
 GET http://api.example.com/data HTTP/1.1
 Host: api.example.com
 ```
@@ -49,7 +49,7 @@ That upstream is a SOCKS5 proxy at `nl-ams-wg-socks5-001.relays.mullvad.net:1080
 
 **5. The destination responds:**
 
-```
+```http
 HTTP/1.1 429 Too Many Requests
 Retry-After: 47
 Content-Type: application/json
@@ -65,7 +65,7 @@ Content-Type: application/json
 
 **7. Scoreboard records the failure for THIS host only.**
 
-```
+```text
 RecordFailure("api.example.com", "mullvad-nl-ams", KindRateLimit, 47s)
 ```
 
@@ -88,7 +88,7 @@ Different exit IP, fresh rate-limit budget at the destination.
 
 **Outcome A (success):**
 
-```
+```http
 HTTP/1.1 200 OK
 Content-Type: application/json
 
@@ -97,7 +97,7 @@ Content-Type: application/json
 
 Tunnelsmith records success for `(api.example.com, mullvad-se-got)`, score bumps up. Two response headers are added before forwarding to the client:
 
-```
+```http
 X-Tunnelsmith-Upstream: mullvad-se-got
 X-Tunnelsmith-Retries: 1
 ```
@@ -140,7 +140,7 @@ But its score is now lower than `mullvad-se-got`'s, so it isn't picked first. It
 
 When myapp does `curl https://api.example.com/data`, curl sends:
 
-```
+```http
 CONNECT api.example.com:443 HTTP/1.1
 ```
 

@@ -276,43 +276,21 @@ func expandMullvadPool(ctx context.Context, block config.UpstreamPoolConfig, log
 	if err != nil {
 		return nil, nil, err
 	}
-	refresh := block.RefreshDuration()
-	previous := initial
+	// Phase 6 only logs diffs; Phase 7 will rewire this callback to
+	// hot-swap the live pool on every tick.
 	run := func(ctx context.Context) error {
-		// Phase 6 only logs diffs; Phase 7 will rewire this callback to
-		// hot-swap the live pool on every tick. The initial snapshot was
-		// already delivered to the caller, so this loop only fires on
-		// the ticker.
-		if refresh <= 0 {
-			return nil
-		}
-		ticker := time.NewTicker(refresh)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return nil
-			case <-ticker.C:
-				next, err := exp.Snapshot(ctx)
-				if err != nil {
-					expLogger.Warn("upstream_pool refresh failed; keeping previous snapshot",
-						"err", err,
-					)
-					continue
-				}
-				added, removed := diffUpstreams(previous, next)
-				if len(added) == 0 && len(removed) == 0 {
-					expLogger.Debug("upstream_pool refresh: no change", "upstreams", len(next))
-				} else {
-					expLogger.Info("upstream_pool refresh",
-						"upstreams", len(next),
-						"added", added,
-						"removed", removed,
-					)
-				}
-				previous = next
+		return exp.RunRefresh(ctx, initial, func(prev, next []config.UpstreamConfig) {
+			added, removed := diffUpstreams(prev, next)
+			if len(added) == 0 && len(removed) == 0 {
+				expLogger.Debug("upstream_pool refresh: no change", "upstreams", len(next))
+				return
 			}
-		}
+			expLogger.Info("upstream_pool refresh",
+				"upstreams", len(next),
+				"added", added,
+				"removed", removed,
+			)
+		})
 	}
 	return initial, run, nil
 }

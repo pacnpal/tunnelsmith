@@ -108,7 +108,7 @@ If your app makes many automated requests (scraper, indexer poller, federation c
 
 Optional and only worth doing for high-volume scrapers. Tunnelsmith adds two response headers to every plain-HTTP response it serves:
 
-```
+```http
 X-Tunnelsmith-Upstream: mullvad-se-got
 X-Tunnelsmith-Retries: 2
 ```
@@ -141,7 +141,7 @@ if response.status_code == 502 and 'X-Tunnelsmith-Cascade' in response.headers:
 
 If you ship docker-compose templates with your app, ship one variant that includes a Tunnelsmith stack pre-configured:
 
-```
+```text
 deploy/
 ├── docker-compose.yml                    # standard, no VPN
 ├── docker-compose.with-tunnelsmith.yml   # with full Tunnelsmith + Mullvad stack
@@ -158,7 +158,7 @@ These show up repeatedly and are worth calling out.
 
 **Forgetting `NO_PROXY` for internal services.** If your app talks to a sidecar database, message queue, or local API, those connections will be sent through Tunnelsmith too unless you exclude them:
 
-```
+```bash
 NO_PROXY="localhost,127.0.0.1,db,redis,*.local,*.internal"
 ```
 

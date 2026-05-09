@@ -234,3 +234,62 @@ func TestRunReturnsErrorOnInitialFetchFailure(t *testing.T) {
 		t.Fatal("expected error on initial fetch failure")
 	}
 }
+
+func TestRunRefreshDeliversPrevAndNextEachTick(t *testing.T) {
+	client := newTestClient(t)
+	exp, err := NewExpander(ExpanderConfig{
+		IDPrefix:  "mvd",
+		Priority:  200,
+		Countries: []string{"Sweden"},
+		Refresh:   50 * time.Millisecond,
+	}, client, quietLogger())
+	if err != nil {
+		t.Fatalf("NewExpander: %v", err)
+	}
+	seed, err := exp.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	var calls atomic.Int64
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- exp.RunRefresh(ctx, seed, func(prev, next []config.UpstreamConfig) {
+			calls.Add(1)
+			if len(prev) != 2 || len(next) != 2 {
+				t.Errorf("prev=%d next=%d, want 2 and 2", len(prev), len(next))
+			}
+		})
+	}()
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	for calls.Load() < 1 {
+		select {
+		case <-deadline.C:
+			cancel()
+			t.Fatalf("RunRefresh never fired; calls=%d", calls.Load())
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("RunRefresh: %v", err)
+	}
+}
+
+func TestRunRefreshExitsImmediatelyWhenRefreshDisabled(t *testing.T) {
+	client := newTestClient(t)
+	exp, err := NewExpander(ExpanderConfig{
+		IDPrefix:  "mvd",
+		Priority:  200,
+		Countries: []string{"Sweden"},
+	}, client, quietLogger())
+	if err != nil {
+		t.Fatalf("NewExpander: %v", err)
+	}
+	if err := exp.RunRefresh(context.Background(), nil, func(prev, next []config.UpstreamConfig) {
+		t.Error("RunRefresh should not invoke onChange when refresh is 0")
+	}); err != nil {
+		t.Fatalf("RunRefresh: %v", err)
+	}
+}

@@ -10,7 +10,7 @@ The companion ADRs are:
 
 ## Topology
 
-```
+```text
 +----------------------+                        +-------------------+
 |        client        |                        |      gluetun      |
 | (Sonarr, yt-dlp, ..) |   HTTP / SOCKS5        |  (Mullvad WG)     |
@@ -43,7 +43,7 @@ Mullvad does not expose the WireGuard private key after key generation, so this 
 2. Open [mullvad.net/en/account/wireguard-config](https://mullvad.net/en/account/wireguard-config) and click **Generate key**.
 3. Pick any country (gluetun re-resolves the actual server later), then **Download zip**. You will get one or more `.conf` files.
 4. Open one `.conf` file in a text editor. The interesting lines are:
-   ```
+   ```ini
    [Interface]
    PrivateKey = wK7n...long base64 string...=
    Address    = 10.65.123.45/32,fc00:bbbb:bbbb:bb01::1:6b2d/128

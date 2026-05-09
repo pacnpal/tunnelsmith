@@ -173,6 +173,7 @@ jobs:
 
       - name: verify three countries
         if: steps.secrets.outputs.skip == 'false'
+        timeout-minutes: 10
         env:
           VERIFY_COUNTRIES: Sweden,Netherlands,USA
         run: scripts/verify-mullvad.sh

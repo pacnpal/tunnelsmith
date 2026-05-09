@@ -118,6 +118,30 @@ func (e *Expander) Run(ctx context.Context, onSnapshot func([]config.UpstreamCon
 		return err
 	}
 	onSnapshot(snap)
+	return e.runRefreshLoop(ctx, snap, func(_, next []config.UpstreamConfig) {
+		onSnapshot(next)
+	})
+}
+
+// RunRefresh drives the periodic refresh ticker without taking an initial
+// snapshot. The caller is expected to have already called Snapshot to seed
+// the priority pool and passes that snapshot as prev. On each tick a fresh
+// snapshot is fetched and onChange is invoked with (prev, next); prev is
+// then updated to next so the next tick compares against the latest. Tick
+// fetch failures log a warning, do NOT call onChange, and do not advance
+// prev. Returns nil on ctx cancel; returns immediately with nil if
+// refresh is <= 0.
+func (e *Expander) RunRefresh(ctx context.Context, prev []config.UpstreamConfig, onChange func(prev, next []config.UpstreamConfig)) error {
+	if onChange == nil {
+		return errors.New("mullvad: onChange callback is required")
+	}
+	return e.runRefreshLoop(ctx, prev, onChange)
+}
+
+// runRefreshLoop is the shared ticker implementation behind Run and
+// RunRefresh. The seed prev is what new ticks are compared against; after
+// a successful tick prev is rebound to the new snapshot.
+func (e *Expander) runRefreshLoop(ctx context.Context, prev []config.UpstreamConfig, onChange func(prev, next []config.UpstreamConfig)) error {
 	if e.cfg.Refresh <= 0 {
 		return nil
 	}
@@ -135,7 +159,8 @@ func (e *Expander) Run(ctx context.Context, onSnapshot func([]config.UpstreamCon
 				)
 				continue
 			}
-			onSnapshot(next)
+			onChange(prev, next)
+			prev = next
 		}
 	}
 }

@@ -119,6 +119,7 @@ kind = "direct"
 }
 
 func TestUpstreamPoolDefaultsApplied(t *testing.T) {
+	t.Parallel()
 	const src = `
 [[upstream_pool]]
 provider  = "mullvad"
@@ -151,6 +152,7 @@ countries = ["Sweden"]
 }
 
 func TestUpstreamPoolPriorityZeroIsHonored(t *testing.T) {
+	t.Parallel()
 	const src = `
 [[upstream_pool]]
 provider  = "mullvad"
@@ -169,6 +171,7 @@ priority  = 0
 }
 
 func TestUpstreamPoolReplacesNeedForUpstream(t *testing.T) {
+	t.Parallel()
 	const src = `
 [[upstream_pool]]
 provider  = "mullvad"
