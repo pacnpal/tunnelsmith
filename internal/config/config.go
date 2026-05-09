@@ -60,6 +60,7 @@ type Config struct {
 	Listener      ListenerConfig       `toml:"listener"`
 	Cache         CacheConfig          `toml:"cache"`
 	Metrics       MetricsConfig        `toml:"metrics"`
+	UI            UIConfig             `toml:"ui"`
 	Upstreams     []UpstreamConfig     `toml:"upstream"`
 	UpstreamPools []UpstreamPoolConfig `toml:"upstream_pool"`
 	Failure       FailureConfig        `toml:"failure"`
@@ -100,6 +101,17 @@ type CacheConfig struct {
 // at /metrics.
 type MetricsConfig struct {
 	Bind string `toml:"bind"` // default: ":9090"; "" disables
+}
+
+// UIConfig controls the read-and-act web UI added in Phase 9. Bind sets the
+// host:port the UI HTTP listener serves on. Setting Bind to the empty
+// string disables the UI entirely; the static assets and API handlers are
+// inert and the binary does not open the port. The UI exposes scoreboard
+// state and four POST action endpoints (forget, force, reset, plus the
+// scoreboard read). There is no auth on the port; the security boundary is
+// the Docker / host network, documented in docs/ui.md.
+type UIConfig struct {
+	Bind string `toml:"bind"` // default: ":9091"; "" disables
 }
 
 // UpstreamConfig declares one egress option that the router can pick.
@@ -338,6 +350,9 @@ func (c *Config) applyDefaults(md toml.MetaData) {
 	if !md.IsDefined("metrics", "bind") {
 		c.Metrics.Bind = ":9090"
 	}
+	if !md.IsDefined("ui", "bind") {
+		c.UI.Bind = ":9091"
+	}
 	if !md.IsDefined("failure", "timeout_ms") {
 		c.Failure.TimeoutMS = 8000
 	}
@@ -455,6 +470,12 @@ func (c *Config) Validate() error {
 
 	if c.Metrics.Bind != "" {
 		if err := validateAddr(c.Metrics.Bind, "metrics.bind"); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	if c.UI.Bind != "" {
+		if err := validateAddr(c.UI.Bind, "ui.bind"); err != nil {
 			errs = append(errs, err)
 		}
 	}

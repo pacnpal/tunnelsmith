@@ -104,6 +104,9 @@ kind = "direct"
 	if cfg.Metrics.Bind != ":9090" {
 		t.Errorf("Metrics.Bind default = %q, want :9090", cfg.Metrics.Bind)
 	}
+	if cfg.UI.Bind != ":9091" {
+		t.Errorf("UI.Bind default = %q, want :9091", cfg.UI.Bind)
+	}
 	if cfg.Failure.TimeoutMS != 8000 {
 		t.Errorf("Failure.TimeoutMS default = %d, want 8000", cfg.Failure.TimeoutMS)
 	}
@@ -609,6 +612,17 @@ id = "d"
 kind = "direct"
 `,
 			contains: "outside the 1-65535 range",
+		},
+		{
+			name: "ui.bind rejects malformed addr",
+			toml: `
+[ui]
+bind = "not-a-host-port"
+[[upstream]]
+id = "d"
+kind = "direct"
+`,
+			contains: "ui.bind",
 		},
 		{
 			name: "upstream_pool missing provider",
