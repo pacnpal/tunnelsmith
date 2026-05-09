@@ -89,10 +89,11 @@ type Config struct {
 }
 
 // FromConfig builds a scoreboard Config from the parsed [failure.scoring]
-// section plus the [[failure.status]] entries. Phase 4 only fires the
-// refused and timeout kinds from the dial path; the status-rule kinds and
-// body-match kind are populated here for forward-compat so the kind→policy
-// table is complete before Phase 5 wires them through the listener.
+// section plus the [[failure.status]] entries. Phase 4 fires refused and
+// timeout from the dial path; Phase 5 wires the status-rule kinds; Phase 8
+// fires KindBodyMatch from the listener's response-body inspector. The
+// kind→policy table is complete at construction so a missing kind never
+// records a penalty silently.
 func FromConfig(s config.ScoringConfig, status []config.StatusRule) Config {
 	policy := map[failure.Kind]Policy{
 		failure.KindRefused: {
@@ -102,6 +103,10 @@ func FromConfig(s config.ScoringConfig, status []config.StatusRule) Config {
 		failure.KindTimeout: {
 			Penalty:  s.TimeoutPenalty,
 			Cooldown: s.TimeoutCooldown.Duration(),
+		},
+		failure.KindBodyMatch: {
+			Penalty:  s.BodyMatchPenalty,
+			Cooldown: s.BodyMatchCooldown.Duration(),
 		},
 	}
 	for _, sr := range status {
