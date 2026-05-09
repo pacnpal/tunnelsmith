@@ -167,21 +167,16 @@ func (h *HTTPServer) currentRetryCap() int {
 	return h.retryCap
 }
 
-// currentRules returns the live per-host rule set. Reads are guarded
-// by runtimeMu so a concurrent ReloadRules cannot tear the pointer.
-func (h *HTTPServer) currentRules() *upstream.RuleSet {
+// currentInspectionConfig returns the live rule set and the body
+// buffer cap together under a single RLock so a request reads a
+// coherent snapshot. Without the combined read, two separate Lock
+// acquisitions could interleave with a SIGHUP-driven ReloadRules /
+// ReloadBodyBufferKB pair and produce a mixed view (new rules with
+// the old cap, or vice versa) within a single request.
+func (h *HTTPServer) currentInspectionConfig() (*upstream.RuleSet, int) {
 	h.runtimeMu.RLock()
 	defer h.runtimeMu.RUnlock()
-	return h.rules
-}
-
-// currentBodyBufferBytes returns the live per-response body buffer
-// cap in bytes. Zero means body inspection is disabled regardless of
-// the rule set.
-func (h *HTTPServer) currentBodyBufferBytes() int {
-	h.runtimeMu.RLock()
-	defer h.runtimeMu.RUnlock()
-	return h.bodyBufferBytes
+	return h.rules, h.bodyBufferBytes
 }
 
 // Reload swaps the live detector and retry cap. Called from the SIGHUP
@@ -521,8 +516,14 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 	// failure.Pattern slice on every retry would just allocate the
 	// same content over and over. The slice is non-nil only when
 	// inspection is actually wired up for this host.
-	rule := h.currentRules().Match(host)
-	bodyBufferBytes := h.currentBodyBufferBytes()
+	//
+	// Read both knobs under a single RLock via
+	// currentInspectionConfig so a concurrent ReloadRules /
+	// ReloadBodyBufferKB pair cannot interleave between the two
+	// reads and hand this request a mixed snapshot (new rules with
+	// the old buffer cap, or vice versa).
+	liveRules, bodyBufferBytes := h.currentInspectionConfig()
+	rule := liveRules.Match(host)
 	var bodyPatterns []failure.Pattern
 	if rule.HasBodyRegex() && bodyBufferBytes > 0 {
 		bodyPatterns = make([]failure.Pattern, len(rule.BodyRegex))

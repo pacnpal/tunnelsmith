@@ -11,7 +11,7 @@
 // TLS payloads the proxy cannot decrypt; the listener guards body
 // inspection at its call site so this package never has to think about
 // transport. Likewise, content encodings (gzip, br, ...) are out of
-// scope for v1: BufferedReader honors Content-Encoding by skipping
+// scope for v1: BufferAndDecide honors Content-Encoding by skipping
 // inspection entirely when the body is encoded, so a regex is never
 // run against bytes it cannot interpret.
 
@@ -52,8 +52,8 @@ type BodyInspectionDecision struct {
 // with a Replay reader the caller can use to forward the body to the
 // client when nothing matched.
 //
-// Behavior (Replay is always non-nil so the caller can drain or
-// forward without a nil check):
+// Behavior (when err == nil, Replay is always non-nil so the caller
+// can drain or forward without a nil check):
 //   - body == nil: no inspection, Replay is http.NoBody, Skipped=true.
 //   - body != nil and limit <= 0: no inspection, Replay is body
 //     itself so the caller can still stream the response untouched,
@@ -67,6 +67,12 @@ type BodyInspectionDecision struct {
 //     against each pattern in order. On hit, Matched=true and Replay
 //     yields the buffered prefix plus rest of body. On miss,
 //     Matched=false with the same Replay shape.
+//
+// On the err != nil path the body has already been closed and the
+// returned decision is the zero value: Replay is nil and Matched /
+// Skipped are false. Callers that want to fall back to streaming the
+// body unmodified must own a separate copy of the upstream response;
+// once BufferAndDecide hits a read error there is nothing to replay.
 //
 // In every "matched or no-match" path, Replay is built so a caller
 // that copies it to the client sees the exact bytes the upstream
