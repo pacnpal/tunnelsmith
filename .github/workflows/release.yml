@@ -80,6 +80,7 @@ jobs:
           PULL_TAG: ${{ steps.meta.outputs.version }}
           GIT_REF: ${{ github.ref_name }}
           IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          EMITTED_TAGS: ${{ steps.meta.outputs.tags }}
         run: |
           set -euo pipefail
           echo "verifying ${IMAGE}:${PULL_TAG} (git ref: ${GIT_REF})"
@@ -93,11 +94,21 @@ jobs:
               exit 1
               ;;
           esac
+          # build-push-action@v7 ships BuildKit provenance attestations
+          # by default (mode=max for public repos). Provenance entries
+          # land in the same image index with platform.architecture and
+          # platform.os set to "unknown" and the annotation
+          # vnd.docker.reference.type=attestation-manifest. Filter them
+          # out so the equality assertions only see the real platform
+          # manifests. Keeping provenance enabled is the v1 default.
           docker manifest inspect "${IMAGE}:${PULL_TAG}" | jq -e '
-            (.manifests | map(.platform.architecture) | sort) == ["amd64","arm64"]
-            and (.manifests | map(.platform.os)         | unique) == ["linux"]
+            ([.manifests[]
+              | select((.annotations["vnd.docker.reference.type"] // "") != "attestation-manifest")
+              | select(.platform.architecture != "unknown")]
+             | (map(.platform.architecture) | sort)  == ["amd64","arm64"]
+               and (map(.platform.os)        | unique) == ["linux"])
           ' > /dev/null
-          echo "multi-arch manifest verified: linux/amd64 + linux/arm64"
+          echo "multi-arch manifest verified: linux/amd64 + linux/arm64 (attestations excluded)"
           # buildx imagetools exposes the descriptor digest as
           # `.Manifest.Digest`. Use the template field directly rather
           # than `{{json .Manifest}}` plus `jq '.digest'`, which depends
@@ -109,7 +120,14 @@ jobs:
             exit 1
           fi
           echo "${PULL_TAG} index digest: ${version_digest}"
-          if docker buildx imagetools inspect "${IMAGE}:latest" > /dev/null 2>&1; then
+          # Gate the :latest digest comparison on whether metadata-action
+          # actually emitted :latest for THIS push (steps.meta.outputs.tags
+          # is the authoritative source). Gating on registry existence
+          # would compare against a stale :latest from a prior release
+          # when this run was cut from a non-default branch and
+          # metadata-action's `enable={{is_default_branch}}` evaluated
+          # false, which would fail the release on a phantom mismatch.
+          if echo "${EMITTED_TAGS}" | grep -Fxq "${IMAGE}:latest"; then
             latest_digest="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "${IMAGE}:latest")"
             if [ -z "${latest_digest}" ] || [ "${latest_digest}" = "<no value>" ]; then
               echo "buildx imagetools returned an empty digest for ${IMAGE}:latest" >&2
@@ -122,7 +140,7 @@ jobs:
             fi
             echo ":latest matches ${PULL_TAG}"
           else
-            echo "::notice::no :latest tag in registry; metadata-action did not emit latest for this push"
+            echo "::notice::metadata-action did not emit :latest for this push (likely not on the default branch); skipping :latest digest match"
           fi
 
       - name: create github release
