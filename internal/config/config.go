@@ -473,9 +473,16 @@ func (c *Config) Validate() error {
 		if len(r.Prefer) == 0 {
 			errs = append(errs, fmt.Errorf("rule[%d] (host_glob=%q): prefer must list at least one upstream id", i, r.HostGlob))
 		}
-		for _, id := range r.Prefer {
-			if _, ok := seenIDs[id]; !ok {
-				errs = append(errs, fmt.Errorf("rule[%d] (host_glob=%q): prefer references unknown upstream id %q", i, r.HostGlob, id))
+		// When [[upstream_pool]] blocks are present, the set of valid
+		// upstream ids is not known until startup expansion. Defer the
+		// prefer-id existence check to the binary's startup path
+		// (cmd/tunnelsmith asserts it against the merged upstream list)
+		// rather than wrongly rejecting pool-derived ids here.
+		if len(c.UpstreamPools) == 0 {
+			for _, id := range r.Prefer {
+				if _, ok := seenIDs[id]; !ok {
+					errs = append(errs, fmt.Errorf("rule[%d] (host_glob=%q): prefer references unknown upstream id %q", i, r.HostGlob, id))
+				}
 			}
 		}
 	}

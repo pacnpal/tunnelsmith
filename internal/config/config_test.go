@@ -183,6 +183,27 @@ countries = ["Sweden"]
 	}
 }
 
+func TestRulePreferIDCheckDeferredWhenUpstreamPoolPresent(t *testing.T) {
+	t.Parallel()
+	// "mvd-se-sto-wg-001" cannot exist at parse time but will after the
+	// Mullvad pool block expands at startup. config.Validate must accept
+	// the rule; cmd/tunnelsmith re-checks against the merged upstream set
+	// after expansion.
+	const src = `
+[[upstream_pool]]
+provider  = "mullvad"
+id_prefix = "mvd"
+countries = ["Sweden"]
+
+[[rule]]
+host_glob = "*.example.com"
+prefer    = ["mvd-se-sto-wg-001"]
+`
+	if _, err := Parse([]byte(src), "pool-rule.toml"); err != nil {
+		t.Fatalf("Parse: %v (rule preferring a pool-derived id should not fail at parse time)", err)
+	}
+}
+
 // TestExplicitZeroAndFalseSurviveDefaults locks in the bug fix from PR #6
 // review feedback: applyDefaults must not silently overwrite user-provided
 // false / 0 values. The earlier "value == zero" defaulting hid an explicit

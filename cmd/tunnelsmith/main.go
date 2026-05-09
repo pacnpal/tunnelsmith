@@ -114,6 +114,9 @@ func run(args []string, stdout, stderr *os.File) error {
 	if err := assertUniqueUpstreamIDs(allUpstreams); err != nil {
 		return err
 	}
+	if err := assertRulePreferIDs(cfg.Rules, allUpstreams); err != nil {
+		return err
+	}
 	entries := make([]upstream.PoolEntry, 0, len(allUpstreams))
 	for _, uc := range allUpstreams {
 		up, err := upstream.New(uc, dialTimeout)
@@ -194,6 +197,28 @@ func contextReason(ctx context.Context) string {
 		return err.Error()
 	}
 	return "unknown"
+}
+
+// assertRulePreferIDs rejects [[rule]] entries whose prefer list names an
+// upstream id that does not exist in the merged upstream set. The set is
+// only known after [[upstream_pool]] expansion at startup, so this check
+// runs here rather than in config.Validate. config.Validate still does the
+// equivalent check itself when no pool blocks are configured (so a config
+// with only static [[upstream]] entries fails fast at parse time).
+func assertRulePreferIDs(rules []config.RuleConfig, upstreams []config.UpstreamConfig) error {
+	ids := make(map[string]struct{}, len(upstreams))
+	for _, u := range upstreams {
+		ids[u.ID] = struct{}{}
+	}
+	var errs []error
+	for i, r := range rules {
+		for _, id := range r.Prefer {
+			if _, ok := ids[id]; !ok {
+				errs = append(errs, fmt.Errorf("rule[%d] (host_glob=%q): prefer references unknown upstream id %q (after [[upstream_pool]] expansion)", i, r.HostGlob, id))
+			}
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // assertUniqueUpstreamIDs rejects a merged upstream list that contains
