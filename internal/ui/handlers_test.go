@@ -30,6 +30,13 @@ type fakeBackend struct {
 	cascade  int
 	forceErr error
 
+	// now, when set, is the value Now() returns. Tests that need
+	// deterministic timestamps in /api/scoreboard or that exercise the
+	// duration / until math in /api/force pin this. Zero value means
+	// fall back to the real wall clock so tests that do not care about
+	// time keep working without changes.
+	now time.Time
+
 	forgotten   []string
 	cleared     []string
 	forced      []forceCall
@@ -104,6 +111,15 @@ func (f *fakeBackend) Reset() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.resetCalled++
+}
+
+func (f *fakeBackend) Now() time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.now.IsZero() {
+		return time.Now()
+	}
+	return f.now
 }
 
 func newTestServer(backend Backend) *httptest.Server {
@@ -213,6 +229,81 @@ func TestScoreboardEndpointShape(t *testing.T) {
 	}
 	if len(got.Forces) != 1 || got.Forces[0].Host != "b.example.com" {
 		t.Errorf("forces = %+v, want one entry for b.example.com", got.Forces)
+	}
+}
+
+func TestScoreboardEndpointGeneratedAtFromBackendClock(t *testing.T) {
+	// /api/scoreboard's generated_at must come from backend.Now(), not
+	// time.Now(), so a manual-clock scoreboard test sees the same
+	// timestamp through both layers (issue #18).
+	pinned := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
+	backend := &fakeBackend{now: pinned}
+	srv := newTestServer(backend)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/api/scoreboard")
+	if err != nil {
+		t.Fatalf("GET /api/scoreboard: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var got struct {
+		GeneratedAt time.Time `json:"generated_at"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !got.GeneratedAt.Equal(pinned) {
+		t.Errorf("generated_at = %v, want %v (backend.Now())", got.GeneratedAt, pinned)
+	}
+}
+
+func TestForceEndpointDurationUsesBackendClock(t *testing.T) {
+	// POST /api/force with a duration must compute until on backend.Now(),
+	// not time.Now() (issue #18). Pinning the backend clock to a fixed
+	// instant lets us assert exact equality on the resolved Until.
+	pinned := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
+	backend := &fakeBackend{now: pinned}
+	srv := newTestServer(backend)
+	defer srv.Close()
+
+	body := `{"host":"a.example.com","upstream_id":"u1","duration":"30m"}`
+	resp, err := http.Post(srv.URL+"/api/force", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /api/force: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", resp.StatusCode)
+	}
+	if len(backend.forced) != 1 {
+		t.Fatalf("backend.forced = %v, want 1 entry", backend.forced)
+	}
+	want := pinned.Add(30 * time.Minute)
+	if !backend.forced[0].Until.Equal(want) {
+		t.Errorf("until = %v, want %v (pinned + 30m)", backend.forced[0].Until, want)
+	}
+}
+
+func TestForceEndpointUntilCheckedAgainstBackendClock(t *testing.T) {
+	// "until in the past" must be evaluated against backend.Now(), not
+	// time.Now(). Send an until that is in the wall-clock future but
+	// before the pinned backend clock; the handler should reject it.
+	pinned := time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC)
+	backend := &fakeBackend{now: pinned}
+	srv := newTestServer(backend)
+	defer srv.Close()
+
+	until := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	body, _ := json.Marshal(map[string]string{
+		"host": "a.example.com", "upstream_id": "u1", "until": until,
+	})
+	resp, err := http.Post(srv.URL+"/api/force", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 (until in past relative to pinned now)", resp.StatusCode)
 	}
 }
 

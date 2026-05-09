@@ -342,6 +342,15 @@ func (s *Scoreboard) poolSnapshot() (entries []upstream.PoolEntry, retryCap, poo
 	return s.poolEntries, s.poolRetryCap, s.poolLen
 }
 
+// Now returns the scoreboard's current time per its injected clock.
+// The Phase 9 web UI handlers use this to keep a manual-clock test
+// deterministic across both the scoreboard and the UI layer; if the
+// production scoreboard never had WithClock called, this returns the
+// real wall clock.
+func (s *Scoreboard) Now() time.Time {
+	return s.clock()
+}
+
 // PoolIDs returns the upstream ids from the live pool snapshot. Used
 // by the SIGHUP hot-reload path to validate rule.Prefer entries
 // against the running pool before installing a new rule set.

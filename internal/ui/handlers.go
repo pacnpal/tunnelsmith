@@ -24,14 +24,21 @@ var staticFS embed.FS
 // Backend is the surface mountHandlers needs from the rest of the
 // binary. Splitting it out lets tests pass a fake without dragging in
 // the live scoreboard. The methods match the scoreboard's public
-// admin surface 1:1; cmd/tunnelsmith adapts the live scoreboard via
-// scoreboardBackend below.
+// admin surface 1:1; cmd/tunnelsmith passes *scoreboard.Scoreboard
+// directly because it satisfies the interface.
+//
+// Now returns the backend's current time. Production passes the
+// scoreboard's injected clock through, so a manual-clock test of the
+// scoreboard and a UI handler test see the same now() across both
+// layers (issue #18). A backend that never sets a clock returns the
+// real wall clock.
 type Backend interface {
 	Snapshot() []scoreboard.EntrySnapshot
 	ForceSnapshot() []scoreboard.ForceSnapshotEntry
 	CooledHostsByUpstream() map[string]int
 	CascadeActiveCount() int
 	PoolIDs() []string
+	Now() time.Time
 
 	Forget(host string) bool
 	Force(host, upstreamID string, until time.Time) error
@@ -138,7 +145,7 @@ func mountHandlers(mux *http.ServeMux, backend Backend, logger *slog.Logger) {
 			http.Error(w, "host and upstream_id are required", http.StatusBadRequest)
 			return
 		}
-		until, err := resolveForceUntil(body.Duration, body.Until)
+		until, err := resolveForceUntil(body.Duration, body.Until, backend.Now())
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -256,7 +263,7 @@ func writeScoreboard(w http.ResponseWriter, backend Backend) {
 		Forces:        forces,
 		CooledByID:    backend.CooledHostsByUpstream(),
 		CascadeActive: backend.CascadeActiveCount(),
-		GeneratedAt:   time.Now().UTC(),
+		GeneratedAt:   backend.Now().UTC(),
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -264,8 +271,10 @@ func writeScoreboard(w http.ResponseWriter, backend Backend) {
 // resolveForceUntil parses the "duration" / "until" pair POST /api/force
 // accepts. Exactly one must be set; passing both is an error so a
 // client cannot post conflicting values. duration is a Go time string
-// ("30m", "2h"); until is RFC3339.
-func resolveForceUntil(durationStr, untilStr string) (time.Time, error) {
+// ("30m", "2h"); until is RFC3339. now anchors both the duration-add
+// and the until-must-be-in-the-future check on the backend's clock so
+// a manual-clock test sees deterministic behavior end-to-end.
+func resolveForceUntil(durationStr, untilStr string, now time.Time) (time.Time, error) {
 	durationStr = strings.TrimSpace(durationStr)
 	untilStr = strings.TrimSpace(untilStr)
 	if durationStr == "" && untilStr == "" {
@@ -282,7 +291,7 @@ func resolveForceUntil(durationStr, untilStr string) (time.Time, error) {
 		if d <= 0 {
 			return time.Time{}, fmt.Errorf("duration must be > 0, got %v", d)
 		}
-		return time.Now().Add(d), nil
+		return now.Add(d), nil
 	}
 	// Accept RFC3339Nano so a client that round-trips a Go time.Time as
 	// JSON does not get rejected for fractional seconds. RFC3339Nano is
@@ -292,7 +301,7 @@ func resolveForceUntil(durationStr, untilStr string) (time.Time, error) {
 	if err != nil {
 		return time.Time{}, fmt.Errorf("invalid until %q: %s", untilStr, err.Error())
 	}
-	if !t.After(time.Now()) {
+	if !t.After(now) {
 		return time.Time{}, fmt.Errorf("until %q must be in the future", untilStr)
 	}
 	return t, nil
