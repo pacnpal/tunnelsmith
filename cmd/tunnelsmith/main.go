@@ -123,6 +123,19 @@ func run(args []string, stdout, stderr *os.File) error {
 	if err := assertRulePreferIDs(cfg.Rules, allUpstreams); err != nil {
 		return err
 	}
+	if len(cfg.Failure.BodyRegex) > 0 {
+		// Phase 8 moved body-regex detection to per-rule BodyRegex.
+		// The top-level field is parsed for forward compatibility but
+		// does nothing at runtime. Surface a single startup warning so
+		// operators know to move their patterns into a [[rule]] block.
+		logger.Warn("failure.body_regex is deprecated; move patterns into [[rule]].body_regex (Phase 8)",
+			"top_level_patterns", len(cfg.Failure.BodyRegex),
+		)
+	}
+	rules, err := upstream.NewRuleSet(cfg.Rules)
+	if err != nil {
+		return fmt.Errorf("compile [[rule]] entries: %w", err)
+	}
 	entries := make([]upstream.PoolEntry, 0, len(allUpstreams))
 	for _, uc := range allUpstreams {
 		up, err := upstream.New(uc, dialTimeout)
@@ -147,6 +160,7 @@ func run(args []string, stdout, stderr *os.File) error {
 	sb, err := scoreboard.New(pool, scoreboard.FromConfig(cfg.Failure.Scoring, cfg.Failure.Status),
 		scoreboard.WithLogger(logger),
 		scoreboard.WithMetrics(metricsRegistry),
+		scoreboard.WithRules(rules),
 	)
 	if err != nil {
 		return fmt.Errorf("build scoreboard: %w", err)
@@ -177,6 +191,8 @@ func run(args []string, stdout, stderr *os.File) error {
 	detector := failure.NewStatusDetector(cfg.Failure.Status)
 	httpSrv, err := listener.NewHTTP(cfg.Listener.HTTP, sb, detector, cfg.Failure.MaxRetriesPerRequest, logger,
 		listener.WithHTTPMetrics(metricsRegistry),
+		listener.WithHTTPRules(rules),
+		listener.WithHTTPBodyBufferKB(cfg.Failure.BodyBufferKB),
 	)
 	if err != nil {
 		return fmt.Errorf("build http listener: %w", err)
@@ -473,6 +489,29 @@ type reloader struct {
 	runningHasPool bool
 }
 
+// projectedUpstreamIDs returns the upstream id set the reload pass
+// will end up with, used to validate rule.Prefer entries before any
+// partial state is installed. Pool-shape changes are restart-frozen
+// for v1, so when either the running config or the new config carries
+// an [[upstream_pool]] block, the projection is the live pool's ids.
+// Without pool blocks, the projection is newCfg.Upstreams (which is
+// what swapStaticPool will install).
+func (r *reloader) projectedUpstreamIDs(newCfg *config.Config) map[string]struct{} {
+	if r.runningHasPool || len(newCfg.UpstreamPools) > 0 {
+		ids := r.sb.PoolIDs()
+		out := make(map[string]struct{}, len(ids))
+		for _, id := range ids {
+			out[id] = struct{}{}
+		}
+		return out
+	}
+	out := make(map[string]struct{}, len(newCfg.Upstreams))
+	for _, u := range newCfg.Upstreams {
+		out[u.ID] = struct{}{}
+	}
+	return out
+}
+
 func (r *reloader) reload(ctx context.Context) {
 	r.logger.Info("config reload requested", "path", r.path)
 	newCfg, err := config.Load(r.path)
@@ -486,6 +525,26 @@ func (r *reloader) reload(ctx context.Context) {
 			"path", r.path,
 			"keys", newCfg.UnknownKeys,
 		)
+	}
+
+	// Phase 8: pre-validate the [[rule]] block so a malformed pattern
+	// or unknown prefer id aborts the reload BEFORE any partial state
+	// is installed. Pool changes happen later, so prefer-id validation
+	// uses the projected pool: when the running config has no pool
+	// blocks and the new config also has none, the projected ids come
+	// from newCfg.Upstreams; otherwise validate against the live pool
+	// (pool-shape changes are restart-frozen for v1).
+	newRules, ruleErr := upstream.NewRuleSet(newCfg.Rules)
+	if ruleErr != nil {
+		r.logger.Warn("config reload failed (rule compile)", "err", ruleErr)
+		r.registry.ObserveConfigReload(metrics.ResultError)
+		return
+	}
+	projectedIDs := r.projectedUpstreamIDs(newCfg)
+	if err := newRules.CheckPreferIDs(projectedIDs); err != nil {
+		r.logger.Warn("config reload failed (rule prefer ids unknown)", "err", err)
+		r.registry.ObserveConfigReload(metrics.ResultError)
+		return
 	}
 
 	// Always hot-reload scoring tunings and the status detector. They
@@ -513,6 +572,12 @@ func (r *reloader) reload(ctx context.Context) {
 			return
 		}
 	}
+
+	// Pool swap is done. Install the new rule set on both the
+	// scoreboard and the listener, plus update the body-buffer cap.
+	r.sb.ReplaceRules(newRules)
+	r.httpSrv.ReloadRules(newRules)
+	r.httpSrv.ReloadBodyBufferKB(newCfg.Failure.BodyBufferKB)
 
 	r.registry.ObserveConfigReload(metrics.ResultSuccess)
 	r.logger.Info("config reloaded",

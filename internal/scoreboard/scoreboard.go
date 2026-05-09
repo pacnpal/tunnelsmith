@@ -341,6 +341,19 @@ func (s *Scoreboard) poolSnapshot() (entries []upstream.PoolEntry, retryCap, poo
 	return s.poolEntries, s.poolRetryCap, s.poolLen
 }
 
+// PoolIDs returns the upstream ids from the live pool snapshot. Used
+// by the SIGHUP hot-reload path to validate rule.Prefer entries
+// against the running pool before installing a new rule set.
+func (s *Scoreboard) PoolIDs() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]string, len(s.poolEntries))
+	for i, e := range s.poolEntries {
+		out[i] = e.Up.ID()
+	}
+	return out
+}
+
 // ReplaceRules swaps the per-host rule set in place. Used by the SIGHUP
 // hot-reload path: the request path's reads of s.rules happen under
 // the same RLock that ReplaceRules takes for its write, so a Pick in
@@ -534,12 +547,12 @@ func (s *Scoreboard) Pick(host string, tried map[string]bool) (upstream.Upstream
 		return nil, &CascadeError{Host: host}
 	}
 	type ranked struct {
-		up        upstream.Upstream
-		basePri   int
-		score     float64
-		cooled    bool
-		untilT    time.Time
-		untilSet  bool
+		up         upstream.Upstream
+		basePri    int
+		score      float64
+		cooled     bool
+		untilT     time.Time
+		untilSet   bool
 		preferRank int // 0 = not preferred; 1+ = position in rule.Prefer
 	}
 	// Take one read lock around every field that hot-reload can swap
@@ -596,12 +609,12 @@ func (s *Scoreboard) Pick(host string, tried map[string]bool) (upstream.Upstream
 			}
 		}
 		pool = append(pool, ranked{
-			up:        c.Up,
-			basePri:   c.Priority,
-			score:     score,
-			cooled:    cooled,
-			untilT:    untilT,
-			untilSet:  untilSet,
+			up:         c.Up,
+			basePri:    c.Priority,
+			score:      score,
+			cooled:     cooled,
+			untilT:     untilT,
+			untilSet:   untilSet,
 			preferRank: preferRank[id],
 		})
 	}

@@ -168,7 +168,7 @@ type errReader struct {
 }
 
 func (e *errReader) Read(p []byte) (int, error) { return 0, e.err }
-func (e *errReader) Close() error                { e.closed = true; return nil }
+func (e *errReader) Close() error               { e.closed = true; return nil }
 
 func TestBufferAndDecideReadErrorClosesBody(t *testing.T) {
 	t.Parallel()

@@ -601,7 +601,6 @@ func (c *Config) Validate() error {
 	return errors.Join(errs...)
 }
 
-
 // validate joins every [failure.scoring] field violation it finds. The
 // scoreboard relies on every field being non-negative (penalties, cooldowns,
 // decay step, debounce window) and on probe_chance falling in [0,1]; values
