@@ -63,7 +63,7 @@ Prometheus instance. The Phase 9 web UI carries the per-host detail.
 | Name | Labels | Meaning |
 | --- | --- | --- |
 | `tunnelsmith_upstream_pool_size` | none | Number of upstreams currently in the pool. Updates at startup and after a SIGHUP reload. |
-| `tunnelsmith_scoreboard_entries_total` | none | Total number of (host, upstream) entries the scoreboard is tracking. Refreshes every 5 seconds. |
+| `tunnelsmith_scoreboard_entries` | none | Total number of (host, upstream) entries the scoreboard is tracking. Refreshes every 5 seconds. |
 | `tunnelsmith_upstream_cooled_hosts` | `upstream_id` | Number of hosts currently on cooldown for the labelled upstream. Refreshes every 5 seconds. |
 | `tunnelsmith_cascade_active_hosts` | none | Number of hosts currently in cascade-failure cooldown. Refreshes every 5 seconds. |
 

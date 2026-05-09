@@ -42,7 +42,7 @@ func TestRegistryExpositionShape(t *testing.T) {
 		"tunnelsmith_persistence_writes_total",
 		"tunnelsmith_config_reloads_total",
 		"tunnelsmith_upstream_pool_size",
-		"tunnelsmith_scoreboard_entries_total",
+		"tunnelsmith_scoreboard_entries",
 		"tunnelsmith_upstream_cooled_hosts",
 		"tunnelsmith_cascade_active_hosts",
 	}

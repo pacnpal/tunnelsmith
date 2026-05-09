@@ -101,7 +101,7 @@
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "tunnelsmith_scoreboard_entries_total",
+          "expr": "tunnelsmith_scoreboard_entries",
           "legendFormat": "entries",
           "refId": "A"
         },

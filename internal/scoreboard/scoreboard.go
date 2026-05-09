@@ -381,7 +381,12 @@ func (s *Scoreboard) Start(ctx context.Context) {
 	if s.decayCancel != nil {
 		return
 	}
-	if s.cfg.DecayInterval <= 0 {
+	// Snapshot DecayInterval under s.mu so a SIGHUP-driven Reload that
+	// runs concurrently with Start cannot race the field read. Reload
+	// preserves the value, but the byte-level swap of s.cfg is still
+	// non-atomic.
+	interval := s.configSnapshot().DecayInterval
+	if interval <= 0 {
 		// No decay configured; nothing to start. Keep Stop a no-op.
 		return
 	}
@@ -392,7 +397,7 @@ func (s *Scoreboard) Start(ctx context.Context) {
 	// Pass done as an argument so the goroutine never has to read
 	// s.decayDone after Stop nils it. Without this, Stop and the goroutine
 	// race on the struct field and Stop can hang on the receive.
-	go s.decayLoop(dctx, done)
+	go s.decayLoop(dctx, done, interval)
 }
 
 // Stop cancels the decay goroutine and waits for it to exit. Safe to call
@@ -413,7 +418,7 @@ func (s *Scoreboard) Stop() {
 	}
 }
 
-func (s *Scoreboard) decayLoop(ctx context.Context, done chan struct{}) {
+func (s *Scoreboard) decayLoop(ctx context.Context, done chan struct{}, interval time.Duration) {
 	defer close(done)
 	defer func() {
 		// Clear the lifecycle fields when the goroutine exits. Stop may
@@ -425,7 +430,11 @@ func (s *Scoreboard) decayLoop(ctx context.Context, done chan struct{}) {
 		s.decayDone = nil
 		s.decayMu.Unlock()
 	}()
-	t := time.NewTicker(s.cfg.DecayInterval)
+	// interval is captured at Start time and frozen for the lifetime of
+	// the goroutine; Reload deliberately preserves DecayInterval so that
+	// changing it requires a process restart (documented in
+	// docs/configuration.md).
+	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
 		select {
@@ -758,7 +767,7 @@ func (s *Scoreboard) DialFor(ctx context.Context, network, addr string) (net.Con
 		attempts++
 		if dialErr == nil {
 			s.RecordSuccess(host, up.ID(), latency)
-			s.observeDialMetric(up.ID(), "", latency)
+			s.observeDialSuccess(up.ID(), latency)
 			s.logger.Info("upstream dial",
 				"upstream_id", up.ID(),
 				"host", host,
@@ -786,7 +795,7 @@ func (s *Scoreboard) DialFor(ctx context.Context, network, addr string) (net.Con
 		if kind != "" {
 			s.RecordFailure(host, up.ID(), kind, nil)
 		}
-		s.observeDialMetric(up.ID(), kind, latency)
+		s.observeDialFailure(up.ID(), kind, latency)
 		s.logger.Warn("upstream dial",
 			"upstream_id", up.ID(),
 			"host", host,
@@ -830,17 +839,27 @@ func (s *Scoreboard) Snapshot() []EntrySnapshot {
 	return out
 }
 
-// observeDialMetric translates a (host, upstream, kind) outcome into the
-// label values metrics.Registry expects. An empty kind means success;
-// known dial-failure kinds map to refused / timeout / other.
-func (s *Scoreboard) observeDialMetric(upstreamID string, kind failure.Kind, latency time.Duration) {
+// observeDialSuccess records a successful dial against the metrics sink.
+// Split from the failure path so a post-dial failure that
+// ClassifyDialError cannot tag (kind == "") is reported as "other"
+// instead of being silently miscounted as a success.
+func (s *Scoreboard) observeDialSuccess(upstreamID string, latency time.Duration) {
+	if s.metrics == nil {
+		return
+	}
+	s.metrics.ObserveDial(upstreamID, "success", latency)
+}
+
+// observeDialFailure records a failed dial against the metrics sink.
+// Known kinds (KindRefused, KindTimeout) map to their named outcomes;
+// any other value, including the empty Kind ClassifyDialError returns
+// for unrecognized errors, falls into "other".
+func (s *Scoreboard) observeDialFailure(upstreamID string, kind failure.Kind, latency time.Duration) {
 	if s.metrics == nil {
 		return
 	}
 	var outcome string
 	switch kind {
-	case "":
-		outcome = "success"
 	case failure.KindRefused:
 		outcome = "refused"
 	case failure.KindTimeout:

@@ -227,7 +227,6 @@ func run(args []string, stdout, stderr *os.File) error {
 		httpSrv:        httpSrv,
 		registry:       metricsRegistry,
 		gauges:         gaugeRefresh,
-		poolIDs:        pool.IDs(),
 		runningHasPool: len(cfg.UpstreamPools) > 0,
 	}
 	g.Go(func() error {
@@ -472,9 +471,6 @@ type reloader struct {
 	registry       *metrics.Registry
 	gauges         *scoreboardGaugeRefresher
 	runningHasPool bool
-
-	mu      sync.Mutex
-	poolIDs []string
 }
 
 func (r *reloader) reload(ctx context.Context) {
@@ -562,12 +558,9 @@ func (r *reloader) swapStaticPool(newCfg *config.Config) error {
 	// dial through the previous Upstream's closure.
 	r.httpSrv.CloseTransportsExcept(map[string]struct{}{})
 
-	r.mu.Lock()
-	r.poolIDs = newIDs
 	if r.gauges != nil {
 		r.gauges.setPoolIDs(newIDs)
 	}
-	r.mu.Unlock()
 
 	r.registry.SetUpstreamPoolSize(newPool.Len())
 	return nil

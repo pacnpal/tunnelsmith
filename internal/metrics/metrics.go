@@ -121,8 +121,10 @@ func New() *Registry {
 		}),
 		ScoreboardEntries: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: "tunnelsmith",
-			Name:      "scoreboard_entries_total",
-			Help:      "Total number of (host, upstream) entries the scoreboard is tracking.",
+			// Prometheus convention reserves the _total suffix for
+			// counters; this is a gauge, so it stays plain.
+			Name: "scoreboard_entries",
+			Help: "Number of (host, upstream) entries the scoreboard is tracking.",
 		}),
 		UpstreamCooledHosts: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: "tunnelsmith",
