@@ -113,13 +113,16 @@ func buildCountryFilter(countries []string) map[string]struct{} {
 }
 
 // Run takes a Snapshot at startup and on every refresh interval, calling
-// onSnapshot with the new list. It blocks until ctx is canceled. Errors
-// from individual ticks are logged and do not stop the loop, so a
-// transient API outage cannot kill the refresher.
+// onSnapshot with the new list. The first snapshot is delivered
+// synchronously so the caller can fail fast if Mullvad's API is
+// unreachable at startup; subsequent failures are logged and the
+// previous list stays in effect.
 //
-// The first snapshot is delivered synchronously so the caller can fail
-// fast if Mullvad's API is unreachable at startup. Subsequent failures
-// are logged and the previous list stays in effect.
+// When ExpanderConfig.Refresh is > 0, Run blocks until ctx is canceled,
+// looping the ticker. When Refresh is <= 0 (polling disabled), Run
+// returns nil right after delivering the initial snapshot. Errors from
+// individual ticks are logged and do not stop the loop, so a transient
+// API outage cannot kill the refresher.
 func (e *Expander) Run(ctx context.Context, onSnapshot func([]config.UpstreamConfig)) error {
 	if onSnapshot == nil {
 		return errors.New("mullvad: onSnapshot callback is required")

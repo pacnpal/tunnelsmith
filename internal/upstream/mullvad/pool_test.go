@@ -109,34 +109,34 @@ func TestExpanderSnapshotIncludeInactive(t *testing.T) {
 	}
 }
 
-func TestExpanderSnapshotIsSortedByID(t *testing.T) {
-	// Even when the underlying client returns relays in a non-sorted order,
-	// Snapshot must produce a deterministic id-sorted slice. Tests use a
-	// custom client that emits relays in reverse hostname order to guard
-	// against the previous implicit reliance on parseResponse's sort.
-	body, err := os.ReadFile(filepath.Join("testdata", "relays.json"))
-	if err != nil {
-		t.Fatalf("read testdata: %v", err)
-	}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write(body)
-	}))
-	t.Cleanup(srv.Close)
+func TestExpanderTransformIsSortedByID(t *testing.T) {
+	// Feed transform a deliberately-reversed []Relay so the test exercises
+	// the explicit sort in transform, independent of parseResponse's
+	// hostname ordering. Calling transform directly bypasses Client and
+	// Fetch entirely, so this test breaks if a future refactor moves the
+	// sort somewhere else and forgets to keep transform's contract.
 	exp, err := NewExpander(ExpanderConfig{
 		IDPrefix:  "zzz",
 		Priority:  200,
 		Countries: []string{"Sweden", "Netherlands", "USA", "Australia"},
-	}, &Client{URL: srv.URL, HTTPClient: srv.Client()}, quietLogger())
+	}, newTestClient(t), quietLogger())
 	if err != nil {
 		t.Fatalf("NewExpander: %v", err)
 	}
-	got, err := exp.Snapshot(context.Background())
-	if err != nil {
-		t.Fatalf("Snapshot: %v", err)
+	relays := []Relay{
+		{Hostname: "us-nyc-wg-301", Country: "USA", City: "New York, NY", Active: true},
+		{Hostname: "se-sto-wg-002", Country: "Sweden", City: "Stockholm", Active: true},
+		{Hostname: "se-sto-wg-001", Country: "Sweden", City: "Stockholm", Active: true},
+		{Hostname: "nl-ams-wg-001", Country: "Netherlands", City: "Amsterdam", Active: true},
+		{Hostname: "au-syd-wg-001", Country: "Australia", City: "Sydney", Active: true},
+	}
+	got := exp.transform(relays)
+	if len(got) != len(relays) {
+		t.Fatalf("transform dropped relays: got %d, want %d", len(got), len(relays))
 	}
 	for i := 1; i < len(got); i++ {
 		if got[i-1].ID > got[i].ID {
-			t.Fatalf("Snapshot output is not sorted by ID at index %d: %q > %q", i, got[i-1].ID, got[i].ID)
+			t.Fatalf("transform output is not sorted by ID at index %d: %q > %q", i, got[i-1].ID, got[i].ID)
 		}
 	}
 }
