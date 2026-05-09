@@ -16,7 +16,7 @@
 #
 # Exit codes:
 #   0  every country verified
-#   1  a country mismatched expectations
+#   1  verification failed (country mismatch, curl error, or jq parse error)
 #   2  tunnelsmith never became ready in time
 #   3  VERIFY_COUNTRIES is empty or invalid after trimming
 #   4  a required external tool (jq, curl, docker) is missing

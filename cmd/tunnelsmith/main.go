@@ -311,14 +311,41 @@ func expandMullvadPool(ctx context.Context, block config.UpstreamPoolConfig, log
 				expLogger.Debug("upstream_pool refresh: no change", "upstreams", len(next))
 				return
 			}
+			// INFO carries counts plus a small sample so a normal log
+			// line stays small even when Mullvad rolls out or removes
+			// dozens of relays at once. Operators who need the full
+			// diff can drop the level to DEBUG.
 			expLogger.Info("upstream_pool refresh",
 				"upstreams", len(next),
+				"added_count", len(added),
+				"removed_count", len(removed),
+				"added_sample", truncateIDs(added, refreshLogSampleSize),
+				"removed_sample", truncateIDs(removed, refreshLogSampleSize),
+			)
+			expLogger.Debug("upstream_pool refresh full diff",
 				"added", added,
 				"removed", removed,
 			)
 		})
 	}
 	return initial, run, nil
+}
+
+// refreshLogSampleSize bounds the number of upstream ids included in the
+// INFO refresh log line. The full diff is still emitted at DEBUG.
+const refreshLogSampleSize = 5
+
+// truncateIDs returns at most n entries from ids unchanged, plus an
+// ellipsis sentinel listing how many were elided so the log line is
+// self-describing without leaking the full slice.
+func truncateIDs(ids []string, n int) []string {
+	if len(ids) <= n {
+		return ids
+	}
+	out := make([]string, 0, n+1)
+	out = append(out, ids[:n]...)
+	out = append(out, fmt.Sprintf("... and %d more", len(ids)-n))
+	return out
 }
 
 // diffUpstreams returns the ids present in next but not in prev, and the

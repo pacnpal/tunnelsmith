@@ -16,12 +16,18 @@ import (
 // the Mullvad relay list into a slice of synthetic config.UpstreamConfig
 // entries that the priority pool can consume. The fields are populated
 // from the user's TOML by config.UpstreamPoolConfig.
+//
+// Countries is non-empty in production: config.Validate rejects an
+// [[upstream_pool]] block without at least one country so operators cannot
+// accidentally turn on all 50 Mullvad exit countries. Tests that drive
+// ExpanderConfig directly may pass an empty list, in which case every
+// relay matches.
 type ExpanderConfig struct {
 	IDPrefix        string        // required, prepended to each generated upstream id
 	Priority        int           // applied to every expanded upstream
-	Countries       []string      // case-insensitive country filter; empty means accept all
+	Countries       []string      // required (post-Validate); empty accepts all (tests only)
 	IncludeInactive bool          // false drops relays with active=false
-	Refresh         time.Duration // refresh interval for Run; <= 0 means refresh once and exit
+	Refresh         time.Duration // refresh interval for Run; <= 0 disables polling
 }
 
 // Expander pulls Mullvad's relay list and turns it into a deterministic
