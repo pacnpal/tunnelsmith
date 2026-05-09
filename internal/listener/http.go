@@ -653,9 +653,14 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 		// Phase 8: response-body inspection. Skip the call entirely
 		// when bodyPatterns is nil (no rule matched the host, no
 		// patterns on the matching rule, or the buffer cap is 0).
-		// Status-code path above already consumed any failure shape,
-		// so a body match here is a fresh signal: the destination
-		// served 2xx but the page itself looks like a soft block.
+		// Status-code detection ran above and any flagged failure
+		// already continued past this block, so the responses that
+		// reach here are anything the detector did NOT flag: 2xx and
+		// 3xx, plus any 4xx/5xx the operator did not configure as a
+		// status failure. The headline use case is the 200 soft-block
+		// page (geo-block / "not available in your region"), but the
+		// inspector itself is status-agnostic by design - users who
+		// want a tighter scope can constrain via host_glob.
 		// failure.BufferAndDecide handles the encoded-body skip, the
 		// limit, and the replay reader so the listener stays simple.
 		if len(bodyPatterns) > 0 {
