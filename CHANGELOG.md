@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (Phase 6)
+
+- `internal/upstream/mullvad` package: relay-list parser, disk-cache fallback, SOCKS5 hostname derivation per ADR-004, and an `Expander` that turns `[[upstream_pool]]` blocks into `config.UpstreamConfig` entries the priority pool consumes. Country filter is case-insensitive, inactive relays are dropped by default, malformed hostnames are skipped with a warn-level log line. The `Run` method drives a refresh ticker; the first snapshot is delivered synchronously so a missing API at startup is fatal.
+- `internal/config`: new `[[upstream_pool]]` top-level array. Fields: `provider` ("mullvad" only), `id_prefix`, `priority` (default 200), `countries` (required, non-empty), `include_inactive` (default false), `refresh` (default 12h), `cache_path`. The "at least one upstream defined" rule now accepts either `[[upstream]]` or `[[upstream_pool]]`. Pool priority and refresh use the same `*int` / `*Duration` sentinel pattern as `UpstreamConfig.Priority` so explicit zeros reach `Validate`.
+- `cmd/tunnelsmith` expands every `[[upstream_pool]]` block at startup before the priority pool is built. Failures during expansion are fatal so a misconfigured pool surfaces immediately. Phase 7 will move runtime refresh into the SIGHUP hot-reload path.
+- `deploy/docker-compose.mullvad.yml`: gluetun (qmcgaw/gluetun:v3.41.1) in WireGuard mode + tunnelsmith joining via `network_mode: "service:gluetun"`. Per ADR-003 the integration uses WireGuard, not OpenVPN.
+- `deploy/tunnelsmith.mullvad.toml`: reference runtime config showing a single `[[upstream_pool]]` block.
+- `deploy/.env.example`: documents `MULLVAD_WIREGUARD_PRIVATE_KEY` and `MULLVAD_WIREGUARD_ADDRESSES`, including how to generate the keypair, the 5-device cap, and the no-resale ToS note. Real values never live in the file.
+- `scripts/verify-mullvad.sh`: writes a single-country tunnelsmith config, restarts the tunnelsmith container, curls `am.i.mullvad.net/json` through the proxy, and asserts `mullvad_exit_ip == true` plus `country == expected`. Defaults to Sweden / Netherlands / USA; configurable via `VERIFY_COUNTRIES`.
+- `Makefile` `test-integration` target plus a CI `mullvad-integration` job. Both gate on `MULLVAD_WIREGUARD_PRIVATE_KEY` and `MULLVAD_WIREGUARD_ADDRESSES` being set; without either, the integration step logs a `[skip-ok]` reason and exits 0.
+- `docs/deployment.md`: Mullvad WG keypair setup, the 5-device cap, the no-resale ToS clause, end-to-end smoke test, and a troubleshooting checklist.
+- `docs/request-lifecycle.md`: end-to-end trace of a single request through Tunnelsmith, including 429 handling, cascade behavior, and the HTTPS opacity caveat.
+- `docs/integration-guide.md`: Levels 1-7 for container maintainers who want to ship Tunnelsmith support, plus the common-mistakes and verification checklists.
+- `docs/configuration.md`: new `[[upstream_pool]]` table; expanded `[[upstream]]` validation note that pool entries also count toward the "must have at least one upstream" rule.
+- README: "Use with Mullvad" callout linking deployment.md, "For container maintainers" callout linking integration-guide.md, plus links to the new request-lifecycle and integration-guide docs.
+- ADR-003: Mullvad integration uses WireGuard, not OpenVPN. ADR-004: SOCKS5 hostname pattern is per-server multihop, with the transformation rule documented and the original plan's pattern explicitly superseded.
+
 ### Added (Phase 5)
 
 - `internal/failure`: `ParseRetryAfter` covers RFC 7231 §7.1.3 in both shapes (non-negative integer seconds and any of the three HTTP-date forms `net/http.ParseTime` accepts), and `StatusDetector` maps configured `[[failure.status]]` rules to a `failure.Kind` plus an optional honored `Retry-After` duration. Codes outside the supported set (429 / 403 / 451) are skipped silently because no `failure.Kind` exists for them yet.

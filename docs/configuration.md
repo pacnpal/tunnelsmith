@@ -19,10 +19,11 @@ This page lists every key, its type, default, and what it does. The defaults mat
 ```toml
 [listener]
 [cache]
-[[upstream]]    # one or more
+[[upstream]]         # zero or more (must have at least one upstream OR upstream_pool)
+[[upstream_pool]]    # zero or more (Phase 6: provider = "mullvad")
 [failure]
 [[failure.status]]   # zero or more
-[[rule]]        # zero or more
+[[rule]]             # zero or more
 ```
 
 ## `[listener]`
@@ -50,7 +51,7 @@ Durations use Go's `time.ParseDuration` syntax (`120s`, `15m`, `6h`, etc.).
 
 ## `[[upstream]]`
 
-At least one is required. Lower priority wins ties; scores from the Phase 4 scoreboard dominate priority once they exist. Every upstream needs a unique `id`.
+The config must define at least one upstream, either directly via `[[upstream]]` or by expansion via `[[upstream_pool]]`. Lower priority wins ties; scores from the Phase 4 scoreboard dominate priority once they exist. Every upstream needs a unique `id`.
 
 | key        | type        | default | notes |
 |------------|-------------|---------|-------|
@@ -60,9 +61,37 @@ At least one is required. Lower priority wins ties; scores from the Phase 4 scor
 | `priority` | int         | `100`   | tiebreaker only; lower wins |
 
 Validation:
-- IDs must be unique across the file.
+- IDs must be unique across the file (including those produced by `[[upstream_pool]]` expansion).
 - `kind = "direct"` must not set `addr`.
 - `kind = "http"` and `kind = "socks5"` require `addr` to parse as `host:port` with a non-empty host and a port in `1-65535`.
+
+## `[[upstream_pool]]`
+
+`[[upstream_pool]]` expands at startup into one or more synthetic `[[upstream]]` entries. Phase 6 only knows how to expand `provider = "mullvad"`, which fans the configured countries out into one socks5 upstream per active Mullvad WireGuard relay. The hostname transformation is documented in [ADR-004](decisions.md#adr-004-mullvad-socks5-hostname-pattern-is-per-server-multihop-not-the-form-in-the-original-plan); operators only name countries.
+
+| key                | type             | default | notes |
+|--------------------|------------------|---------|-------|
+| `provider`         | string enum      | none    | required; only `"mullvad"` is implemented |
+| `id_prefix`        | string           | none    | required; prepended to every generated upstream id (e.g. `mvd` -> `mvd-se-sto-wg-001`); must be unique across pool blocks |
+| `priority`         | int              | `200`   | applied to every expanded upstream; default puts pool entries below user-defined `[[upstream]]` (default 100) |
+| `countries`        | array of strings | none    | required, non-empty; case-insensitive match against the Mullvad relay-list `country` field (`Sweden`, `USA`, ...) |
+| `include_inactive` | bool             | `false` | `true` admits relays Mullvad has flagged inactive (rare; mostly for debugging) |
+| `refresh`          | duration         | `12h`   | background relay-list refresh interval |
+| `cache_path`       | string           | `""`    | absolute path for a disk fallback used when the relay-list API is unreachable |
+
+Example:
+
+```toml
+[[upstream_pool]]
+provider  = "mullvad"
+id_prefix = "mvd"
+priority  = 100
+countries = ["Sweden", "Netherlands", "Switzerland"]
+```
+
+A config that uses only `[[upstream_pool]]` and no `[[upstream]]` is valid; a config with neither is rejected.
+
+The expansion runs once at startup. The Phase 6 build does not yet hot-swap the live pool when the relay list changes; that wiring lands in Phase 7's SIGHUP hot-reload path. The 12h refresh ticker still runs and logs a warning if Mullvad's API becomes unreachable.
 
 ## `[failure]`
 
