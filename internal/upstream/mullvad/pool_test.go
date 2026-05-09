@@ -109,6 +109,38 @@ func TestExpanderSnapshotIncludeInactive(t *testing.T) {
 	}
 }
 
+func TestExpanderSnapshotIsSortedByID(t *testing.T) {
+	// Even when the underlying client returns relays in a non-sorted order,
+	// Snapshot must produce a deterministic id-sorted slice. Tests use a
+	// custom client that emits relays in reverse hostname order to guard
+	// against the previous implicit reliance on parseResponse's sort.
+	body, err := os.ReadFile(filepath.Join("testdata", "relays.json"))
+	if err != nil {
+		t.Fatalf("read testdata: %v", err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(srv.Close)
+	exp, err := NewExpander(ExpanderConfig{
+		IDPrefix:  "zzz",
+		Priority:  200,
+		Countries: []string{"Sweden", "Netherlands", "USA", "Australia"},
+	}, &Client{URL: srv.URL, HTTPClient: srv.Client()}, quietLogger())
+	if err != nil {
+		t.Fatalf("NewExpander: %v", err)
+	}
+	got, err := exp.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	for i := 1; i < len(got); i++ {
+		if got[i-1].ID > got[i].ID {
+			t.Fatalf("Snapshot output is not sorted by ID at index %d: %q > %q", i, got[i-1].ID, got[i].ID)
+		}
+	}
+}
+
 func TestExpanderSnapshotEmptyCountriesAcceptsAll(t *testing.T) {
 	client := newTestClient(t)
 	exp, err := NewExpander(ExpanderConfig{

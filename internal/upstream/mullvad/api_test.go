@@ -3,11 +3,13 @@ package mullvad
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -142,6 +144,43 @@ func TestClientFetchWritesCacheOnSuccess(t *testing.T) {
 	}
 	if _, err := os.Stat(cachePath); err != nil {
 		t.Fatalf("cache not written: %v", err)
+	}
+}
+
+func TestClientFetchLogsCacheWriteFailure(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join("testdata", "relays.json"))
+	if err != nil {
+		t.Fatalf("read testdata: %v", err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	// Point the cache at a path inside a regular file so MkdirAll fails and
+	// Cache.Write returns an error. Fetch must still succeed (the live
+	// fetch worked) but the failure must be logged through the wired
+	// logger so an operator can see the misconfiguration.
+	regularFile := filepath.Join(t.TempDir(), "blocking-file")
+	if err := os.WriteFile(regularFile, []byte("not a dir"), 0o644); err != nil {
+		t.Fatalf("seed regular file: %v", err)
+	}
+	cachePath := filepath.Join(regularFile, "cache.json")
+
+	var sb strings.Builder
+	logger := slog.New(slog.NewTextHandler(&sb, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	c := &Client{
+		URL:        srv.URL,
+		HTTPClient: srv.Client(),
+		Cache:      &Cache{Path: cachePath},
+		Logger:     logger,
+	}
+	if _, err := c.Fetch(context.Background()); err != nil {
+		t.Fatalf("Fetch: %v (cache write failure must not fail the live fetch)", err)
+	}
+	logged := sb.String()
+	if !strings.Contains(logged, "cache write failed") {
+		t.Fatalf("expected log line to mention cache write failure, got: %q", logged)
 	}
 }
 

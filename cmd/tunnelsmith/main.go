@@ -282,11 +282,12 @@ func expandUpstreamPools(ctx context.Context, blocks []config.UpstreamPoolConfig
 }
 
 func expandMullvadPool(ctx context.Context, block config.UpstreamPoolConfig, logger *slog.Logger) ([]config.UpstreamConfig, func(context.Context) error, error) {
+	expLogger := logger.With("component", "mullvad-expander", "id_prefix", block.IDPrefix)
 	client := mullvad.NewClient()
+	client.Logger = expLogger
 	if block.CachePath != "" {
 		client.Cache = &mullvad.Cache{Path: block.CachePath}
 	}
-	expLogger := logger.With("component", "mullvad-expander", "id_prefix", block.IDPrefix)
 	exp, err := mullvad.NewExpander(mullvad.ExpanderConfig{
 		IDPrefix:        block.IDPrefix,
 		Priority:        block.PriorityValue(),

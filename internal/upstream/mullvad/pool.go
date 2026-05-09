@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"time"
 
@@ -87,6 +88,11 @@ func (e *Expander) transform(relays []Relay) []config.UpstreamConfig {
 			Priority: &p,
 		})
 	}
+	// Sort by upstream id so the slice's order is independent of the
+	// Client implementation's relay ordering. parseResponse already sorts
+	// by hostname, but a future Client could return relays in any order
+	// and downstream code (and unit tests) want a deterministic answer.
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
 }
 

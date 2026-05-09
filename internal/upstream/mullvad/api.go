@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -33,16 +34,19 @@ type Relay struct {
 
 // Client fetches and parses the Mullvad relay list. Construct one with
 // NewClient and call Fetch. If Cache is non-nil, successful responses are
-// written to disk and read back when the API is unreachable.
+// written to disk and read back when the API is unreachable. If Logger is
+// non-nil, cache-write failures (which are otherwise non-fatal) are logged
+// at WARN so a misconfigured cache_path surfaces before a real outage.
 type Client struct {
 	URL        string
 	HTTPClient *http.Client
 	Cache      *Cache
+	Logger     *slog.Logger
 }
 
 // NewClient returns a Client wired to the production endpoint and a small
-// HTTP timeout. Override URL or HTTPClient on the returned struct for
-// tests.
+// HTTP timeout. Override URL, HTTPClient, Cache, or Logger on the returned
+// struct for tests or to surface cache write failures to operators.
 func NewClient() *Client {
 	return &Client{
 		URL:        RelaysURL,
@@ -64,7 +68,18 @@ func (c *Client) Fetch(ctx context.Context) ([]Relay, error) {
 			return nil, parseErr
 		}
 		if c.Cache != nil {
-			_ = c.Cache.Write(body)
+			if err := c.Cache.Write(body); err != nil {
+				// Cache writes are best-effort: a failed write should not
+				// fail the live request. Surface the failure through the
+				// optional logger so a misconfigured cache_path is visible
+				// before an outage exposes it.
+				if c.Logger != nil {
+					c.Logger.Warn("mullvad: relay-list cache write failed",
+						slog.String("path", c.Cache.Path),
+						slog.Any("err", err),
+					)
+				}
+			}
 		}
 		return relays, nil
 	}
