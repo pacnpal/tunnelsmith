@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Tunnelsmith</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+<header>
+  <h1>Tunnelsmith</h1>
+  <p class="sub">per-host scoreboard and upstream pool</p>
+  <p class="hint">No auth on this port. Bind to a private network. See docs/ui.md.</p>
+</header>
+
+<section id="summary">
+  <span id="generated">loading...</span>
+  <button id="refresh">Refresh</button>
+  <button id="reset" class="danger">Reset all state</button>
+</section>
+
+<section>
+  <h2>Upstream pool</h2>
+  <table id="pool">
+    <thead><tr><th>Upstream</th><th>Cooled hosts</th></tr></thead>
+    <tbody></tbody>
+  </table>
+  <p>Cascade-active hosts: <span id="cascade">0</span></p>
+</section>
+
+<section>
+  <h2>Scoreboard</h2>
+  <p>One row per (host, upstream). Highest score per host is the current winner.</p>
+  <table id="scoreboard">
+    <thead>
+      <tr>
+        <th>Host</th><th>Upstream</th><th>Score</th>
+        <th>Cooldown until</th><th>Last seen</th>
+        <th>OK</th><th>Fail</th><th></th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<section>
+  <h2>Active force pins</h2>
+  <table id="forces">
+    <thead><tr><th>Host</th><th>Upstream</th><th>Until</th><th></th></tr></thead>
+    <tbody></tbody>
+  </table>
+  <h3>Pin a host to an upstream</h3>
+  <form id="force-form">
+    <label>Host: <input name="host" required /></label>
+    <label>Upstream: <input name="upstream_id" required /></label>
+    <label>Duration (e.g. 30m, 2h): <input name="duration" value="30m" required /></label>
+    <button type="submit">Pin</button>
+  </form>
+  <p id="force-msg" class="msg"></p>
+</section>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
