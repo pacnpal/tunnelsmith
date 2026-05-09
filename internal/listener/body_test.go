@@ -372,6 +372,84 @@ func TestForwardBodyBufferZeroDisablesInspection(t *testing.T) {
 	}
 }
 
+// TestForwardReloadBodyBufferKBToggles exercises the hot-reload knob
+// that turns body inspection on and off without restart. The same
+// rule and patterns stay in place; only the buffer cap flips. With
+// the cap at 0 the listener must skip inspection and stream the
+// geo-block body straight through; flipping the cap back to a
+// non-zero value must restore retry behavior.
+func TestForwardReloadBodyBufferKBToggles(t *testing.T) {
+	t.Parallel()
+	var hit atomic.Int64
+	dest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		n := hit.Add(1)
+		// Always include the geo-block phrase so the listener can
+		// trigger a match when inspection is enabled. Even hits
+		// (when inspection routes to the second upstream) get a
+		// distinguishable suffix so the test can tell which path
+		// actually served.
+		if n%2 == 1 {
+			_, _ = io.WriteString(w, "Sorry, this content is not available in your region.")
+			return
+		}
+		_, _ = io.WriteString(w, "ok-from-fallback")
+	}))
+	t.Cleanup(dest.Close)
+
+	pool := directPoolWith(t, "a", "b")
+	sb := scoreboardFor(t, pool)
+	rules := mustRuleSet(t, config.RuleConfig{
+		HostGlob:  "*",
+		Prefer:    []string{"a", "b"},
+		BodyRegex: []string{"not available in your region"},
+	})
+
+	srv, proxyURL := startForwardListenerWithRules(t, sb, defaultDetector(), 5, rules, 32)
+	client := proxyClient(t, proxyURL)
+
+	// 1) Initial state: cap = 32 KiB, rule fires, listener retries.
+	resp, err := client.Get(dest.URL)
+	if err != nil {
+		t.Fatalf("first Get: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if string(body) != "ok-from-fallback" {
+		t.Fatalf("first body = %q; want fallback (rule should retry)", string(body))
+	}
+
+	// 2) Disable inspection via ReloadBodyBufferKB(0). The geo-block
+	// page must now reach the client without retry. Reset the
+	// scoreboard's cooldown for upstream a so the test sees a fresh
+	// pick from the priority order.
+	srv.ReloadBodyBufferKB(0)
+	resp, err = client.Get(dest.URL)
+	if err != nil {
+		t.Fatalf("second Get: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if !strings.Contains(string(body), "not available") {
+		t.Errorf("second body = %q; want geo-block content (inspection disabled)", string(body))
+	}
+	if got := resp.Header.Get("X-Tunnelsmith-Retries"); got != "0" {
+		t.Errorf("second X-Tunnelsmith-Retries = %q, want 0", got)
+	}
+
+	// 3) Re-enable inspection. The rule fires again; the next request
+	// retries past the geo-block (hit 4 = even = fallback content).
+	srv.ReloadBodyBufferKB(32)
+	resp, err = client.Get(dest.URL)
+	if err != nil {
+		t.Fatalf("third Get: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if string(body) != "ok-from-fallback" {
+		t.Errorf("third body = %q; want fallback (rule should retry after re-enable)", string(body))
+	}
+}
+
 // TestForwardReloadRulesSwapsBehavior covers hot-reload: starting with no
 // rules, then attaching a rule via ReloadRules. The first request streams
 // the geo-block body to the client; the second (after ReloadRules) cycles
