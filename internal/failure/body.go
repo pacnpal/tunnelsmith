@@ -97,52 +97,31 @@ func BufferAndDecide(body io.ReadCloser, encoding string, limit int, patterns []
 		}, nil
 	}
 
-	// Read and inspect incrementally up to limit bytes so a pattern
-	// can short-circuit as soon as it matches instead of waiting for
-	// the full inspection window (or EOF) to arrive.
-	var prefix bytes.Buffer
-	prefix.Grow(limit)
-	chunkSize := 4096
-	if limit < chunkSize {
-		chunkSize = limit
-	}
-	scratch := make([]byte, chunkSize)
-
-	for prefix.Len() < limit {
-		toRead := len(scratch)
-		remaining := limit - prefix.Len()
-		if remaining < toRead {
-			toRead = remaining
-		}
-
-		n, err := body.Read(scratch[:toRead])
-		if n > 0 {
-			_, _ = prefix.Write(scratch[:n])
-			buf := prefix.Bytes()
-			for _, p := range patterns {
-				if p == nil {
-					continue
-				}
-				if p.Match(buf) {
-					matched := append([]byte(nil), buf...)
-					return BodyInspectionDecision{
-						Matched: true,
-						Pattern: p.String(),
-						Replay:  replay(matched, body),
-					}, nil
-				}
-			}
-		}
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			_ = body.Close()
-			return BodyInspectionDecision{}, err
-		}
+	// Read up to limit bytes. We deliberately use limit (not limit+1)
+	// because the regex engine sees the same window the destination
+	// would have served to the client; the goal is to detect on the
+	// prefix the user can configure, not to peek beyond it. ReadAll
+	// already returns the slice the LimitReader produced, so we use
+	// it directly instead of allocating a separate buffer just to
+	// copy the same bytes into it.
+	buf, err := io.ReadAll(io.LimitReader(body, int64(limit)))
+	if err != nil {
+		_ = body.Close()
+		return BodyInspectionDecision{}, err
 	}
 
-	buf := append([]byte(nil), prefix.Bytes()...)
+	for _, p := range patterns {
+		if p == nil {
+			continue
+		}
+		if p.Match(buf) {
+			return BodyInspectionDecision{
+				Matched: true,
+				Pattern: p.String(),
+				Replay:  replay(buf, body),
+			}, nil
+		}
+	}
 	return BodyInspectionDecision{
 		Replay: replay(buf, body),
 	}, nil
