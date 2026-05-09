@@ -125,4 +125,4 @@ The RuleSet is hot-reloadable: `Scoreboard.ReplaceRules` and `HTTPServer.ReloadR
 
 ## What v1.0.0 deliberately does not have
 
-- Global degradation detection ("upstream X is failing for every host, mark it globally degraded"). The proposal lists this as a refinement; it is tracked for v2 in `docs/roadmap.md` (or the build plan's "Out of scope for v1" list, depending on which lands first).
+- Global degradation detection ("upstream X is failing for every host, mark it globally degraded"). The proposal lists this as a refinement; tracked in [docs/roadmap.md](roadmap.md#v2-candidates) for post-v1 consideration.

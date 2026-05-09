@@ -286,14 +286,16 @@ func TestForceEndpointDurationUsesBackendClock(t *testing.T) {
 
 func TestForceEndpointUntilCheckedAgainstBackendClock(t *testing.T) {
 	// "until in the past" must be evaluated against backend.Now(), not
-	// time.Now(). Send an until that is in the wall-clock future but
-	// before the pinned backend clock; the handler should reject it.
+	// time.Now(). Pin backend to a fixed instant and send an until that
+	// is one hour before that pinned instant; the handler should reject
+	// it. Both sides of the comparison are anchored on `pinned` so the
+	// test outcome does not depend on the wall clock at all.
 	pinned := time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC)
 	backend := &fakeBackend{now: pinned}
 	srv := newTestServer(backend)
 	defer srv.Close()
 
-	until := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	until := pinned.Add(-time.Hour).Format(time.RFC3339)
 	body, _ := json.Marshal(map[string]string{
 		"host": "a.example.com", "upstream_id": "u1", "until": until,
 	})
