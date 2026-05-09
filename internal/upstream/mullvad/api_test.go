@@ -1,6 +1,7 @@
 package mullvad
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log/slog"
@@ -111,6 +112,30 @@ func TestClientFetchFallsBackToCache(t *testing.T) {
 	}
 	if len(relays) != 6 {
 		t.Fatalf("want 6 relays from cache, got %d", len(relays))
+	}
+}
+
+func TestClientFetchRejectsOversizeResponse(t *testing.T) {
+	// A response just over the 8 MiB cap must surface as a clear
+	// "too large" error rather than as silently-truncated JSON. Without
+	// the explicit check, io.ReadAll(LimitReader) returns the truncated
+	// prefix and the next json.Unmarshal fails with a generic decode
+	// error that could be mistaken for a malformed payload.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Headers say the response is even larger; the body itself is
+		// big enough to trip the cap.
+		w.Header().Set("Content-Type", "application/json")
+		oversized := bytes.Repeat([]byte("x"), maxResponseBytes+1024)
+		_, _ = w.Write(oversized)
+	}))
+	defer srv.Close()
+	c := &Client{URL: srv.URL, HTTPClient: srv.Client()}
+	_, err := c.Fetch(context.Background())
+	if err == nil {
+		t.Fatal("expected oversize response to fail; got nil error")
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("expected error to mention size limit, got: %v", err)
 	}
 }
 

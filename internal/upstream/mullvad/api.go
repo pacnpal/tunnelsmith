@@ -129,9 +129,17 @@ func (c *Client) fetchOnline(ctx context.Context) ([]byte, error) {
 	// somehow bypasses TLS verification) cannot OOM the binary. Mullvad's
 	// real response is around 158 KB at the time of this code; 8 MiB is
 	// orders of magnitude more headroom than we expect to ever need.
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	//
+	// Read maxResponseBytes+1 so an oversize response surfaces as an
+	// explicit "too large" error rather than as silently-truncated JSON
+	// that fails parsing further down (which would mislead operators and
+	// might wrongly trigger the cache fallback path).
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("mullvad: read relays body: %w", err)
+	}
+	if int64(len(body)) > maxResponseBytes {
+		return nil, fmt.Errorf("mullvad: relay-list response exceeds %d bytes", maxResponseBytes)
 	}
 	return body, nil
 }
