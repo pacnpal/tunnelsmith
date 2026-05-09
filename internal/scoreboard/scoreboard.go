@@ -47,10 +47,18 @@ type Policy struct {
 // Config is the runtime tuning the scoreboard reads at construction. Build
 // it from a config.ScoringConfig via FromConfig, or hand-roll it in tests.
 type Config struct {
-	// ConnectionRefused, when false, disables scoring for KindRefused.
-	// Dial failures classified as KindRefused are still logged and counted
-	// in metrics, but RecordFailure is skipped so the upstream's score and
-	// cooldown are not affected. Defaults to true (scoring on).
+	// ConnectionRefused, when false, disables scoring for true ECONNREFUSED
+	// dial errors: the upstream's penalty and cooldown are unchanged. Dial
+	// failures classified as KindRefused for other reasons (DNS failure,
+	// network unreachable, or any other unclassified error that
+	// ClassifyDialError maps to KindRefused) are still scored regardless of
+	// this field. Logging and metrics are unaffected either way.
+	//
+	// The Go zero value is false (scoring off). Production callers build
+	// Config via FromConfig, which reads [failure].connection_refused; that
+	// key defaults to true via config.applyDefaults, so refused scoring is
+	// on by default in production. Test helpers that hand-roll Config must
+	// set this field explicitly when they need scoring-on behavior.
 	ConnectionRefused bool
 
 	// KindPolicy maps each failure.Kind the listener can report to its
@@ -949,9 +957,17 @@ func (s *Scoreboard) DialFor(ctx context.Context, network, addr string) (net.Con
 			return nil, "", errors.Join(attemptErrs...)
 		}
 		kind := failure.ClassifyDialError(dialErr)
-		cfg := s.configSnapshot()
-		if kind != "" && (kind != failure.KindRefused || cfg.ConnectionRefused) {
-			s.RecordFailure(host, up.ID(), kind, nil)
+		if kind != "" {
+			// Only skip scoring for a true ECONNREFUSED when the gate is off.
+			// Unclassified errors (DNS, network unreachable, etc.) that
+			// ClassifyDialError maps to KindRefused by default are always
+			// scored: the gate is specifically for "the remote actively
+			// refused our TCP connection", not "something went wrong dialing".
+			// configSnapshot is only called on the hot branch so lock traffic
+			// stays zero for non-refused and unclassified failures.
+			if kind != failure.KindRefused || !failure.IsConnectionRefused(dialErr) || s.configSnapshot().ConnectionRefused {
+				s.RecordFailure(host, up.ID(), kind, nil)
+			}
 		}
 		s.observeDialFailure(up.ID(), kind, latency)
 		s.logger.Warn("upstream dial",
