@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Mullvad integration verifier.
 #
-# Brings up deploy/docker-compose.mullvad.yml, then for each configured
-# country: writes a one-country tunnelsmith.mullvad.toml, restarts the
-# tunnelsmith container, and curls am.i.mullvad.net/json through the
-# proxy to confirm the returned `country` matches.
+# Assumes deploy/docker-compose.mullvad.yml is already running (the
+# Makefile test-integration target and the CI mullvad-integration job
+# both bring the stack up before invoking this script). Then for each
+# configured country: writes a one-country tunnelsmith.mullvad.toml,
+# restarts the tunnelsmith container, and curls am.i.mullvad.net/json
+# through the proxy to confirm the returned `country` matches.
 #
 # Per ADR-001 this script runs in CI, not on developer hosts. The
 # integration job in .github/workflows/ci.yml gates on both
