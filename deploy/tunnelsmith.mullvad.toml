@@ -1,0 +1,24 @@
+# Tunnelsmith config used by deploy/docker-compose.mullvad.yml.
+#
+# Sits inside gluetun's network namespace and routes traffic out through
+# Mullvad's per-server SOCKS5 mesh. The single [[upstream_pool]] block
+# expands at startup into one synthetic socks5 upstream per active
+# WireGuard relay in the listed countries (see ADR-004 for the hostname
+# derivation; the binary handles the transformation, the operator only
+# names countries).
+
+[listener]
+http  = ":8080"
+socks = ":1080"
+
+[failure]
+timeout_ms              = 8000
+max_retries_per_request = 5
+
+[[upstream_pool]]
+provider         = "mullvad"
+id_prefix        = "mvd"
+priority         = 100
+countries        = ["Sweden", "Netherlands", "Switzerland"]
+include_inactive = false
+refresh          = "12h"

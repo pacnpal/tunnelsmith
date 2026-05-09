@@ -1,0 +1,64 @@
+# Tunnelsmith fronting Mullvad's WireGuard SOCKS5 mesh.
+#
+# Two services:
+#   gluetun       connects to Mullvad over WireGuard. Provides the network
+#                 namespace tunnelsmith joins so SOCKS5 mesh hostnames
+#                 resolve and route inside the tunnel.
+#   tunnelsmith   per-destination egress router. Joins gluetun's netns,
+#                 publishes :8080 (HTTP CONNECT) and :1080 (SOCKS5) on the
+#                 host through gluetun.
+#
+# Per ADR-001 this stack is brought up only in CI; do not run it on a
+# developer host. Per ADR-003 Mullvad removed OpenVPN on 2026-01-15, so
+# this compose file uses WireGuard, which requires
+# MULLVAD_WIREGUARD_PRIVATE_KEY and MULLVAD_WIREGUARD_ADDRESSES. Both
+# values are generated once at https://mullvad.net/en/account/wireguard-config
+# and count against Mullvad's 5-device cap.
+#
+# Bring it up (CI):
+#   docker compose -f deploy/docker-compose.mullvad.yml up -d
+#
+# Verify (CI):
+#   scripts/verify-mullvad.sh
+
+services:
+  gluetun:
+    image: qmcgaw/gluetun:v3.41.1
+    container_name: tunnelsmith-gluetun
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      VPN_SERVICE_PROVIDER: mullvad
+      VPN_TYPE: wireguard
+      WIREGUARD_PRIVATE_KEY: ${MULLVAD_WIREGUARD_PRIVATE_KEY:?MULLVAD_WIREGUARD_PRIVATE_KEY is required}
+      WIREGUARD_ADDRESSES: ${MULLVAD_WIREGUARD_ADDRESSES:?MULLVAD_WIREGUARD_ADDRESSES is required}
+      SERVER_CITIES: ${MULLVAD_SERVER_CITIES:-Stockholm}
+      DOT: "off"
+      HEALTH_VPN_DURATION_INITIAL: "30s"
+    ports:
+      - "8080:8080"
+      - "1080:1080"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "--tries=1", "--timeout=5", "https://am.i.mullvad.net/connected"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  tunnelsmith:
+    image: ${TUNNELSMITH_IMAGE:-ghcr.io/pacnpal/tunnelsmith:latest}
+    container_name: tunnelsmith
+    network_mode: "service:gluetun"
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    volumes:
+      - ./tunnelsmith.mullvad.toml:/etc/tunnelsmith/config.toml:ro
+    command:
+      - --config=/etc/tunnelsmith/config.toml
+    restart: unless-stopped
+    environment:
+      TUNNELSMITH_LOG_LEVEL: ${TUNNELSMITH_LOG_LEVEL:-info}
