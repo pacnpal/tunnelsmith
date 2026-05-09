@@ -53,7 +53,7 @@ test-integration:
 		exit 0; \
 	fi; \
 	set -e; \
-	trap 'docker compose -f deploy/docker-compose.mullvad.yml down --volumes --remove-orphans' EXIT; \
+	trap 'rc=$$?; docker compose -f deploy/docker-compose.mullvad.yml down --volumes --remove-orphans || true; exit $$rc' EXIT; \
 	docker compose -f deploy/docker-compose.mullvad.yml up -d --quiet-pull; \
 	scripts/verify-mullvad.sh
 
