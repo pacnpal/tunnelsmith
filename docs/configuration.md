@@ -114,7 +114,7 @@ Failure-detection settings. The signals are wired to scoring in Phase 4 onward.
 | `connection_refused`         | bool             | `true`        | always on for Phase 1; opt-out lands in Phase 5 |
 | `timeout_ms`                 | int (ms)         | `8000`        | per-attempt timeout; must be > 0 |
 | `body_regex`                 | array of strings | `[]`          | deprecated in Phase 8; the parser still accepts the field but the runtime ignores it. Move patterns into `[[rule]].body_regex` instead. A non-empty value at startup triggers a one-line warning |
-| `body_buffer_kb`             | int              | `32`          | per-response cap (in KiB) on the body prefix the listener buffers for `[[rule]].body_regex` matching. Must be >= 1 and <= 1024. Set the listener flag to `0` only via SIGHUP if you want to disable inspection at runtime |
+| `body_buffer_kb`             | int              | `32`          | per-response cap (in KiB) on the body prefix the listener buffers for `[[rule]].body_regex` matching. Must be >= 0 and <= 1024. Set to `0` to disable body inspection regardless of any `[[rule]].body_regex` entries; SIGHUP applies the new value live |
 | `max_retries_per_request`    | int              | `5`           | retry cap per incoming request; must be >= 1 |
 | `status` (`[[failure.status]]`) | array of tables | see below | per-status-code rules |
 
@@ -234,7 +234,7 @@ What hot-reload changes in place:
 - `[[upstream]]` list (rebuilds the priority pool, swaps it into the scoreboard, drops cached transports for upstreams that disappeared)
 - `[failure]` retry cap, `[[failure.status]]` rules, and `body_buffer_kb`
 - `[failure.scoring]` penalty weights, cooldowns, probe chance, cascade TTL, debounce window, body-match knobs, prune-after
-- `[[rule]]` block list (compiled at reload time and swapped on both the scoreboard and the listener atomically; a malformed pattern or unknown prefer id leaves the previous rule set live)
+- `[[rule]]` block list (compiled at reload time and installed on both the scoreboard and the listener; a malformed pattern or unknown prefer id leaves the previous rule set live). The two installs run sequentially under each component's own write lock, so a request mid-reload may briefly see the new rules in one component and the old in the other; the request still completes against a coherent snapshot of whichever rule set each component holds
 
 What hot-reload does NOT change (restart required):
 

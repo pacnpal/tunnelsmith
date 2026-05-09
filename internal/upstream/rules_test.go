@@ -123,6 +123,11 @@ func TestRuleSetCompileErrors(t *testing.T) {
 			match: "[bad",
 		},
 		{
+			name:  "empty prefer",
+			cfgs:  []config.RuleConfig{{HostGlob: "*.x", Prefer: nil}},
+			match: "prefer must list at least one upstream id",
+		},
+		{
 			name:  "empty body regex entry",
 			cfgs:  []config.RuleConfig{{HostGlob: "*.x", Prefer: []string{"x"}, BodyRegex: []string{""}}},
 			match: "is empty",

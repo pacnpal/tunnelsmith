@@ -497,12 +497,14 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Errorf("failure.max_retries_per_request must be >= 1, got %d", c.Failure.MaxRetriesPerRequest))
 	}
 	// body_buffer_kb bounds the per-response read used for body-regex
-	// inspection. Must be > 0; capped at 1024 KiB so a misconfigured value
-	// cannot pin a multi-megabyte buffer per concurrent request. The cap
-	// stays well below the 8 MiB request-body cap so the two limits cannot
-	// be confused.
-	if c.Failure.BodyBufferKB < 1 {
-		errs = append(errs, fmt.Errorf("failure.body_buffer_kb must be >= 1, got %d", c.Failure.BodyBufferKB))
+	// inspection. 0 disables inspection regardless of [[rule]].body_regex
+	// entries (the listener's WithHTTPBodyBufferKB / ReloadBodyBufferKB
+	// already treat 0 as off, so the config value passes through). The
+	// upper bound caps a misconfigured value at 1024 KiB so it cannot
+	// pin a multi-megabyte buffer per concurrent request, well below
+	// the 8 MiB request-body cap so the two limits cannot be confused.
+	if c.Failure.BodyBufferKB < 0 {
+		errs = append(errs, fmt.Errorf("failure.body_buffer_kb must be >= 0, got %d", c.Failure.BodyBufferKB))
 	} else if c.Failure.BodyBufferKB > 1024 {
 		errs = append(errs, fmt.Errorf("failure.body_buffer_kb must be <= 1024, got %d", c.Failure.BodyBufferKB))
 	}

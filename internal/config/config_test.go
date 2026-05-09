@@ -520,16 +520,16 @@ prefer    = ["d"]
 			contains: "invalid glob",
 		},
 		{
-			name: "body_buffer_kb zero",
+			name: "body_buffer_kb negative",
 			toml: `
 [failure]
-body_buffer_kb = 0
+body_buffer_kb = -1
 
 [[upstream]]
 id   = "d"
 kind = "direct"
 `,
-			contains: "body_buffer_kb must be >= 1",
+			contains: "body_buffer_kb must be >= 0",
 		},
 		{
 			name: "body_buffer_kb above cap",

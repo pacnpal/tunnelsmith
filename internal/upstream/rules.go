@@ -101,6 +101,15 @@ func NewRuleSet(cfgs []config.RuleConfig) (*RuleSet, error) {
 		if _, err := path.Match(c.HostGlob, ""); err != nil {
 			return nil, fmt.Errorf("rules: rule[%d] (host_glob=%q): %w", i, c.HostGlob, err)
 		}
+		// Prefer must be non-empty. config.Validate already enforces
+		// this for the TOML path; the same check here defends against
+		// programmatic callers (and tests) that build a RuleConfig
+		// directly. A force=true rule with an empty prefer would force
+		// every request to ErrPoolExhausted, which is worse than
+		// rejecting the input at construction time.
+		if len(c.Prefer) == 0 {
+			return nil, fmt.Errorf("rules: rule[%d] (host_glob=%q): prefer must list at least one upstream id", i, c.HostGlob)
+		}
 		var compiled []*regexp.Regexp
 		for j, pat := range c.BodyRegex {
 			if pat == "" {

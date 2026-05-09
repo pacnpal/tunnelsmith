@@ -121,7 +121,7 @@ A `[[rule]]` block applies a host-glob filter on top of the score-based pick. Ru
 
 Body-regex inspection is separately gated by `failure.body_buffer_kb` and runs only on plain-HTTP responses (CONNECT and SOCKS5 traffic carries TLS the proxy cannot read). The listener feeds compiled patterns through `internal/failure.BufferAndDecide`, which reads up to the configured cap, runs each pattern, and returns either a match decision or a replay reader that streams the buffered prefix plus rest to the client. Encoded bodies (`Content-Encoding != identity`) skip inspection.
 
-The RuleSet is hot-reloadable: `Scoreboard.ReplaceRules` and `HTTPServer.ReloadRules` take the same compiled set under their respective write locks, so a SIGHUP-driven swap stays atomic from the request path's perspective.
+The RuleSet is hot-reloadable: `Scoreboard.ReplaceRules` and `HTTPServer.ReloadRules` install the same compiled set sequentially, each under its own component's write lock. Both calls take their write lock for the swap, so a request reading either component's pointer sees one self-consistent rule set, never a half-written state. Across components the swap is sequential, not atomic: a request mid-reload may briefly observe the new rules in one component and the old in the other (for example, the listener could route through the old prefer set while inspecting bodies with the new patterns). The window is short and bounded; routing decisions converge on the next request once both swaps complete.
 
 ## What is not here yet
 

@@ -99,7 +99,8 @@ body_regex = []
 
 # Per-response cap (in KiB) on the body prefix the listener buffers for
 # [[rule]].body_regex inspection. Bytes past the cap stream to the client
-# without ever being matched. Range: 1 to 1024.
+# without ever being matched. Range: 0 to 1024. Set to 0 to disable body
+# inspection regardless of any [[rule]].body_regex entries.
 body_buffer_kb = 32
 
 # Cap on per-request retries through the upstream pool. Protects the

@@ -294,15 +294,20 @@ func TestForwardBodyMatchHostNotInRule(t *testing.T) {
 	}
 }
 
-// TestForwardBodyMatchHonorsBufferLimit confirms that a pattern past the
-// configured buffer size never triggers, even when the body contains it
-// further on. Set the limit small enough that the pattern lies past it.
+// TestForwardBodyMatchHonorsBufferLimit confirms that a pattern lying
+// past the configured buffer cap never triggers a match. The body has
+// padding past the cap followed by the pattern; with the cap small
+// enough that the pattern lies past it, the listener must NOT detect
+// and the client must receive the full body.
 func TestForwardBodyMatchHonorsBufferLimit(t *testing.T) {
 	t.Parallel()
-	prefix := strings.Repeat("a", 200)
+	// 1 KiB cap. Build a body whose pattern starts well past the cap
+	// so the inspector never sees it. 4 KiB of padding plus the
+	// trigger comfortably exceeds 1 KiB.
+	padding := strings.Repeat("a", 4096)
 	tail := "geo-block-trigger"
 	dest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, prefix+tail)
+		_, _ = io.WriteString(w, padding+tail)
 	}))
 	t.Cleanup(dest.Close)
 
@@ -313,9 +318,43 @@ func TestForwardBodyMatchHonorsBufferLimit(t *testing.T) {
 		Prefer:    []string{"only"},
 		BodyRegex: []string{"geo-block-trigger"},
 	})
-	// 1 KB buffer is large enough that the prefix + tail (~217 bytes)
-	// fit; that's not what the test asserts. The test asserts that a
-	// body buffer of zero (disabled) skips inspection entirely.
+	_, proxyURL := startForwardListenerWithRules(t, sb, defaultDetector(), 5, rules, 1)
+	client := proxyClient(t, proxyURL)
+
+	resp, err := client.Get(dest.URL)
+	if err != nil {
+		t.Fatalf("client.Get: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if got := resp.Header.Get("X-Tunnelsmith-Retries"); got != "0" {
+		t.Errorf("X-Tunnelsmith-Retries = %q, want 0 (pattern lay past 1 KiB cap)", got)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != padding+tail {
+		t.Errorf("body length mismatch: got %d, want %d", len(body), len(padding)+len(tail))
+	}
+}
+
+// TestForwardBodyBufferZeroDisablesInspection covers the explicit
+// "disable inspection at runtime" path: even with patterns configured
+// on a matching rule, body_buffer_kb=0 should bypass inspection
+// entirely and stream the full body to the client. Mirrors the
+// behavior of WithHTTPBodyBufferKB(0) and ReloadBodyBufferKB(0).
+func TestForwardBodyBufferZeroDisablesInspection(t *testing.T) {
+	t.Parallel()
+	const payload = "Sorry, this content is not available in your region."
+	dest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, payload)
+	}))
+	t.Cleanup(dest.Close)
+
+	pool := directPoolWith(t, "only")
+	sb := scoreboardFor(t, pool)
+	rules := mustRuleSet(t, config.RuleConfig{
+		HostGlob:  "*",
+		Prefer:    []string{"only"},
+		BodyRegex: []string{"not available in your region"},
+	})
 	_, proxyURL := startForwardListenerWithRules(t, sb, defaultDetector(), 5, rules, 0)
 	client := proxyClient(t, proxyURL)
 
@@ -328,8 +367,8 @@ func TestForwardBodyMatchHonorsBufferLimit(t *testing.T) {
 		t.Errorf("X-Tunnelsmith-Retries = %q, want 0 (body_buffer_kb=0 disables inspection)", got)
 	}
 	body, _ := io.ReadAll(resp.Body)
-	if string(body) != prefix+tail {
-		t.Errorf("body length mismatch: got %d, want %d", len(body), len(prefix)+len(tail))
+	if string(body) != payload {
+		t.Errorf("body = %q, want full payload", string(body))
 	}
 }
 
