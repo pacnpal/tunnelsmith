@@ -14,7 +14,7 @@ This is the gap between HAProxy (no per-host memory), Squid (static rules, no le
 
 ## How it works
 
-Each request goes through the scoreboard's `DialFor`. The scoreboard picks the best non-cooled upstream for the host, dials, and either records success and returns the conn or records the failure (penalty + cooldown for that pair) and advances. Retries are capped per request; if every retry fails, the host enters cascade cooling and subsequent requests fail fast for a short TTL instead of stampeding the pool. A small probe chance occasionally picks a non-top candidate so previously penalized upstreams get a chance to recover. Time decay drifts old scores toward zero so the scoreboard responds to current conditions rather than yesterday's. See [`docs/architecture.md`](docs/architecture.md) for the full design.
+Each request goes through the scoreboard's `DialFor`. The scoreboard picks the best non-cooled upstream for the host, dials, and either records success and returns the conn or records the failure (penalty + cooldown for that pair) and advances. Retries are capped per request; if every retry fails, the host enters cascade cooling and subsequent requests fail fast for a short TTL instead of stampeding the pool. A small probe chance occasionally picks a non-top candidate so previously penalized upstreams get a chance to recover. Time decay drifts old scores toward zero so the scoreboard responds to current conditions rather than yesterday's. Optional `[[rule]]` blocks pin specific hosts to specific upstreams (`prefer` / `force`) and run response-body regex inspection for soft geo-blocks served as 200s. See [`docs/architecture.md`](docs/architecture.md) for the full design.
 
 ## Quick start
 

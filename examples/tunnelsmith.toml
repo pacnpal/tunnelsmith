@@ -92,9 +92,15 @@ connection_refused = true
 # Per-attempt connect/read timeout in milliseconds.
 timeout_ms = 8000
 
-# Body-regex matches indicate a "your region is blocked" page that
-# returns HTTP 200. Phase 8 enables this end to end.
-body_regex = ["content.?not.?available.?in.?your.?region"]
+# DEPRECATED: top-level body_regex is parsed for backward compatibility
+# but the runtime ignores it. Move patterns into [[rule]].body_regex (see
+# bottom of this file for an example).
+body_regex = []
+
+# Per-response cap (in KiB) on the body prefix the listener buffers for
+# [[rule]].body_regex inspection. Bytes past the cap stream to the client
+# without ever being matched. Range: 1 to 1024.
+body_buffer_kb = 32
 
 # Cap on per-request retries through the upstream pool. Protects the
 # pool from amplifying a real outage into a stampede.
@@ -162,6 +168,15 @@ cascade_ttl = "30s"
 # concurrent client requests from over-penalizing one rate-limit event.
 debounce_window = "100ms"
 
+# Body-match policy. Phase 8 fires KindBodyMatch when a [[rule]].body_regex
+# pattern matches the buffered prefix of a plain-HTTP response. The default
+# penalty (5) sits between timeout (2) and forbidden (6); the cooldown (60s)
+# is short enough to retry quickly when the match was a transient challenge
+# page and long enough to skip a host that consistently serves the pattern
+# from this exit.
+body_match_penalty  = 5
+body_match_cooldown = "60s"
+
 # The persistence-tick prune pass drops entries with score == 0 and
 # lastSeen older than prune_after. 0s disables entry pruning; expired
 # cascade entries and stale debounce keys are still evicted.
@@ -182,3 +197,16 @@ prefer    = ["direct", "mullvad-se-got"]
 host_glob = "*.bbc.co.uk"
 prefer    = ["mullvad-nl-ams"]
 force     = true   # do not fall back to other upstreams on failure
+
+# Body-regex example: pages that return HTTP 200 with a "not available in
+# your region" message. Each pattern is a Go regular expression compiled at
+# startup; an invalid pattern aborts the load. Inspection runs only on the
+# plain-HTTP forward path and only when Content-Encoding is empty or
+# "identity" (gzip / br / deflate bodies skip inspection by design).
+[[rule]]
+host_glob  = "*.example-streamer.com"
+prefer     = ["mullvad-nl-ams", "mullvad-se-got"]
+body_regex = [
+    "(?i)content is not available in your region",
+    "(?i)this video is not available in your country",
+]
