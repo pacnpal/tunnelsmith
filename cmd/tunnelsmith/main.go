@@ -25,6 +25,7 @@ import (
 	"github.com/pacnpal/tunnelsmith/internal/listener"
 	"github.com/pacnpal/tunnelsmith/internal/metrics"
 	"github.com/pacnpal/tunnelsmith/internal/scoreboard"
+	"github.com/pacnpal/tunnelsmith/internal/ui"
 	"github.com/pacnpal/tunnelsmith/internal/upstream"
 	"github.com/pacnpal/tunnelsmith/internal/upstream/mullvad"
 )
@@ -207,12 +208,19 @@ func run(args []string, stdout, stderr *os.File) error {
 	if cfg.Metrics.Bind != "" {
 		metricsSrv = metrics.NewServer(cfg.Metrics.Bind, metricsRegistry, logger)
 	}
+	var uiSrv *ui.Server
+	if cfg.UI.Bind != "" {
+		uiSrv = ui.NewServer(cfg.UI.Bind, sb, logger)
+	}
 
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error { return httpSrv.Serve(gctx) })
 	g.Go(func() error { return socksSrv.Serve(gctx) })
 	if metricsSrv != nil {
 		g.Go(func() error { return metricsSrv.Serve(gctx) })
+	}
+	if uiSrv != nil {
+		g.Go(func() error { return uiSrv.Serve(gctx) })
 	}
 	if cfg.Cache.PersistPath != "" {
 		persistLoop := scoreboard.NewPersistenceLoop(sb, scoreboard.PersistenceConfig{
@@ -276,6 +284,11 @@ func run(args []string, stdout, stderr *os.File) error {
 	if metricsSrv != nil {
 		if err := metricsSrv.Shutdown(shutdownCtx); err != nil {
 			logger.Warn("metrics shutdown error", "err", err)
+		}
+	}
+	if uiSrv != nil {
+		if err := uiSrv.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("ui shutdown error", "err", err)
 		}
 	}
 

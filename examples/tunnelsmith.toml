@@ -42,6 +42,14 @@ persist_interval = "30s"
 bind = ":9090"
 
 # --------------------------------------------------------------------
+# Web UI (Phase 9). Defaults to :9091; empty disables the listener.
+# The UI port is unauthenticated, bind it to a private interface only.
+# See docs/ui.md for the endpoint reference and the security stance.
+# --------------------------------------------------------------------
+[ui]
+bind = ":9091"
+
+# --------------------------------------------------------------------
 # Upstreams. At least one is required. Every upstream needs a unique id.
 #
 # Tunnelsmith builds a priority pool from these entries and tries them

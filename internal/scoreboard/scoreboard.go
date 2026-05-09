@@ -189,11 +189,12 @@ type Scoreboard struct {
 	// under mu, so a hot reload cannot tear concurrent reads.
 	rules *upstream.RuleSet
 
-	// mu guards entries and cascade. Pick takes RLock; Record* and the
-	// decay loop take Lock.
+	// mu guards entries, cascade, and forces. Pick takes RLock; Record*,
+	// the decay loop, and the Phase 9 admin actions take Lock.
 	mu      sync.RWMutex
 	entries map[string]map[string]*entry // host -> upstreamID -> entry
 	cascade map[string]time.Time         // host -> cascade-cooling expiry
+	forces  map[string]ForceEntry        // host -> active Force pin (Phase 9)
 
 	debounceMu sync.Mutex
 	debounce   map[debounceKey]time.Time
@@ -540,11 +541,24 @@ func (s *Scoreboard) decayTick() {
 //     order; everything else falls in by the existing (score desc,
 //     base priority asc) tiebreak.
 //
+// Phase 9: a live Force pin (set via Scoreboard.Force from the web UI)
+// short-circuits Pick the same way the static [[rule]] force=true path
+// does, but with one host pinned to one upstream until the pin's
+// expiry. The pin is checked before the rule-set scan: when active and
+// the pinned upstream is not in tried, Pick returns it ahead of any
+// scoring. If the pinned upstream is in tried (in-flight retry already
+// burned it), the pin is ignored for this attempt and Pick falls back
+// to normal scoring; the operator wanted a hint, not a guaranteed
+// failure loop.
+//
 // tried may be nil; nil and empty are equivalent.
 func (s *Scoreboard) Pick(host string, tried map[string]bool) (upstream.Upstream, error) {
 	now := s.clock()
 	if s.cascadeActive(host, now) {
 		return nil, &CascadeError{Host: host}
+	}
+	if up, ok := s.pickForced(host, tried, now); ok {
+		return up, nil
 	}
 	type ranked struct {
 		up         upstream.Upstream
