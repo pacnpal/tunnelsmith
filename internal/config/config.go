@@ -455,11 +455,18 @@ func (c *Config) Validate() error {
 				errs = append(errs, fmt.Errorf("%s (id_prefix=%q): countries[%d] is empty or whitespace", idx, p.IDPrefix, j))
 			}
 		}
-		// A 1-minute floor on refresh keeps a typo (e.g. "1s" or "0s")
-		// from hammering Mullvad's public relay API. The default of 12h is
-		// reasonable; anything below 1m is almost certainly unintentional.
-		if p.Refresh != nil && p.Refresh.Duration() < time.Minute {
-			errs = append(errs, fmt.Errorf("%s (id_prefix=%q): refresh must be >= 1m, got %v", idx, p.IDPrefix, p.Refresh.Duration()))
+		// refresh = "0s" is allowed and means "disable periodic refresh"
+		// (the expander's RunRefresh exits immediately when Refresh <= 0).
+		// Any positive value below the 1m floor is almost certainly a typo
+		// that would hammer Mullvad's public relay API, so reject those.
+		// Negative values are nonsensical for an interval.
+		if p.Refresh != nil {
+			d := p.Refresh.Duration()
+			if d < 0 {
+				errs = append(errs, fmt.Errorf("%s (id_prefix=%q): refresh must be >= 0, got %v", idx, p.IDPrefix, d))
+			} else if d > 0 && d < time.Minute {
+				errs = append(errs, fmt.Errorf("%s (id_prefix=%q): refresh must be 0 (to disable) or >= 1m, got %v", idx, p.IDPrefix, d))
+			}
 		}
 		if p.CachePath != "" && !filepath.IsAbs(p.CachePath) {
 			errs = append(errs, fmt.Errorf("%s (id_prefix=%q): cache_path %q must be an absolute path", idx, p.IDPrefix, p.CachePath))

@@ -19,8 +19,20 @@
 #   1  a country mismatched expectations
 #   2  tunnelsmith never became ready in time
 #   3  VERIFY_COUNTRIES is empty or invalid after trimming
+#   4  a required external tool (jq, curl, docker) is missing
 
 set -euo pipefail
+
+require_command() {
+  for cmd in "$@"; do
+    if ! command -v "${cmd}" >/dev/null 2>&1; then
+      echo "verify-mullvad: required command not found: ${cmd}" >&2
+      exit 4
+    fi
+  done
+}
+
+require_command jq curl docker
 
 COMPOSE_FILE="${COMPOSE_FILE:-deploy/docker-compose.mullvad.yml}"
 CONFIG_FILE="${CONFIG_FILE:-deploy/tunnelsmith.mullvad.toml}"

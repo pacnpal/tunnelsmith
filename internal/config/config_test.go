@@ -183,6 +183,24 @@ countries = ["Sweden"]
 	}
 }
 
+func TestUpstreamPoolRefreshZeroDisablesPolling(t *testing.T) {
+	t.Parallel()
+	const src = `
+[[upstream_pool]]
+provider  = "mullvad"
+id_prefix = "mvd"
+countries = ["Sweden"]
+refresh   = "0s"
+`
+	cfg, err := Parse([]byte(src), "pool-zero-refresh.toml")
+	if err != nil {
+		t.Fatalf("Parse: %v (refresh = 0s must validate; the expander treats 0 as 'disabled')", err)
+	}
+	if cfg.UpstreamPools[0].RefreshDuration() != 0 {
+		t.Fatalf("RefreshDuration = %v, want 0", cfg.UpstreamPools[0].RefreshDuration())
+	}
+}
+
 func TestRulePreferIDCheckDeferredWhenUpstreamPoolPresent(t *testing.T) {
 	t.Parallel()
 	// "mvd-se-sto-wg-001" cannot exist at parse time but will after the
@@ -527,17 +545,6 @@ countries = []
 			contains: "countries must list at least one country",
 		},
 		{
-			name: "upstream_pool zero refresh",
-			toml: `
-[[upstream_pool]]
-provider  = "mullvad"
-id_prefix = "mvd"
-countries = ["Sweden"]
-refresh   = "0s"
-`,
-			contains: "refresh must be >= 1m",
-		},
-		{
 			name: "upstream_pool refresh below 1m floor",
 			toml: `
 [[upstream_pool]]
@@ -546,7 +553,18 @@ id_prefix = "mvd"
 countries = ["Sweden"]
 refresh   = "30s"
 `,
-			contains: "refresh must be >= 1m",
+			contains: "refresh must be 0 (to disable) or >= 1m",
+		},
+		{
+			name: "upstream_pool negative refresh rejected",
+			toml: `
+[[upstream_pool]]
+provider  = "mullvad"
+id_prefix = "mvd"
+countries = ["Sweden"]
+refresh   = "-1s"
+`,
+			contains: "refresh must be >= 0",
 		},
 		{
 			name: "upstream_pool empty country entry",
