@@ -98,6 +98,12 @@ kind = "direct"
 	if cfg.Cache.NegativeTTL.Duration() != time.Minute {
 		t.Errorf("Cache.NegativeTTL default = %v, want 1m", cfg.Cache.NegativeTTL.Duration())
 	}
+	if cfg.Cache.PersistInterval.Duration() != 30*time.Second {
+		t.Errorf("Cache.PersistInterval default = %v, want 30s", cfg.Cache.PersistInterval.Duration())
+	}
+	if cfg.Metrics.Bind != ":9090" {
+		t.Errorf("Metrics.Bind default = %q, want :9090", cfg.Metrics.Bind)
+	}
 	if cfg.Failure.TimeoutMS != 8000 {
 		t.Errorf("Failure.TimeoutMS default = %d, want 8000", cfg.Failure.TimeoutMS)
 	}
@@ -507,6 +513,39 @@ kind = "direct"
 			contains: "must be an absolute path",
 		},
 		{
+			name: "cache persist_interval rejects negative",
+			toml: `
+[cache]
+persist_interval = "-1s"
+[[upstream]]
+id = "d"
+kind = "direct"
+`,
+			contains: "cache.persist_interval must be >= 0",
+		},
+		{
+			name: "metrics.bind rejects malformed addr",
+			toml: `
+[metrics]
+bind = "not-a-host-port"
+[[upstream]]
+id = "d"
+kind = "direct"
+`,
+			contains: "metrics.bind",
+		},
+		{
+			name: "metrics.bind rejects out-of-range port",
+			toml: `
+[metrics]
+bind = ":99999"
+[[upstream]]
+id = "d"
+kind = "direct"
+`,
+			contains: "outside the 1-65535 range",
+		},
+		{
 			name: "upstream_pool missing provider",
 			toml: `
 [[upstream_pool]]
@@ -726,6 +765,9 @@ kind = "direct"
 	if s.DebounceWindow.Duration() != ScoringDefaults.DebounceWindow.Duration() {
 		t.Errorf("DebounceWindow default = %v, want %v", s.DebounceWindow.Duration(), ScoringDefaults.DebounceWindow.Duration())
 	}
+	if s.PruneAfter.Duration() != ScoringDefaults.PruneAfter.Duration() {
+		t.Errorf("PruneAfter default = %v, want %v", s.PruneAfter.Duration(), ScoringDefaults.PruneAfter.Duration())
+	}
 }
 
 func TestScoringPartialOverridePreservesOtherDefaults(t *testing.T) {
@@ -856,6 +898,18 @@ id   = "d"
 kind = "direct"
 `,
 			contains: "debounce_window must be >= 0",
+		},
+		{
+			name: "negative prune_after",
+			toml: `
+[failure.scoring]
+prune_after = "-1m"
+
+[[upstream]]
+id   = "d"
+kind = "direct"
+`,
+			contains: "prune_after must be >= 0",
 		},
 	}
 	for _, tc := range cases {

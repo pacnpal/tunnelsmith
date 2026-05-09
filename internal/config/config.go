@@ -57,6 +57,7 @@ const (
 type Config struct {
 	Listener      ListenerConfig       `toml:"listener"`
 	Cache         CacheConfig          `toml:"cache"`
+	Metrics       MetricsConfig        `toml:"metrics"`
 	Upstreams     []UpstreamConfig     `toml:"upstream"`
 	UpstreamPools []UpstreamPoolConfig `toml:"upstream_pool"`
 	Failure       FailureConfig        `toml:"failure"`
@@ -77,10 +78,26 @@ type ListenerConfig struct {
 
 // CacheConfig controls the decision-cache behavior. Only the structural
 // settings live here; per-(host, upstream) scoring lands in Phase 4.
+//
+// PersistPath, when set, names the on-disk file the scoreboard snapshots
+// state into so it survives a restart. The directory must exist; the file
+// is created on the first successful write. PersistInterval drives the
+// background snapshot ticker added in Phase 7. Setting persist_interval
+// to "0s" disables periodic writes; a final write still runs at shutdown
+// when PersistPath is set.
 type CacheConfig struct {
-	TTL         Duration `toml:"ttl"`          // default: 15m
-	NegativeTTL Duration `toml:"negative_ttl"` // default: 1m
-	PersistPath string   `toml:"persist_path"` // default: "" (in-memory only)
+	TTL             Duration `toml:"ttl"`              // default: 15m
+	NegativeTTL     Duration `toml:"negative_ttl"`     // default: 1m
+	PersistPath     string   `toml:"persist_path"`     // default: "" (in-memory only)
+	PersistInterval Duration `toml:"persist_interval"` // default: 30s
+}
+
+// MetricsConfig controls the Prometheus exposition endpoint added in Phase 7.
+// Bind sets the host:port the metrics HTTP listener serves on; setting it to
+// the empty string disables the listener entirely. The endpoint always serves
+// at /metrics.
+type MetricsConfig struct {
+	Bind string `toml:"bind"` // default: ":9090"; "" disables
 }
 
 // UpstreamConfig declares one egress option that the router can pick.
@@ -203,6 +220,13 @@ type ScoringConfig struct {
 
 	CascadeTTL     Duration `toml:"cascade_ttl"`     // default: 30s
 	DebounceWindow Duration `toml:"debounce_window"` // default: 100ms
+
+	// PruneAfter governs when zero-score entries are dropped from the
+	// scoreboard during the persistence-tick prune pass. An entry whose
+	// score has decayed to zero and whose lastSeen is older than
+	// PruneAfter is removed; expired cascade entries and stale debounce
+	// keys are pruned alongside it. Set to "0s" to disable pruning.
+	PruneAfter Duration `toml:"prune_after"` // default: 24h
 }
 
 // ScoringDefaults captures the proposal's recommended scoreboard tuning.
@@ -221,6 +245,7 @@ var ScoringDefaults = ScoringConfig{
 	DecayStep:       0.5,
 	CascadeTTL:      Duration(30 * time.Second),
 	DebounceWindow:  Duration(100 * time.Millisecond),
+	PruneAfter:      Duration(24 * time.Hour),
 }
 
 // RuleConfig declares a per-host routing override.
@@ -279,6 +304,12 @@ func (c *Config) applyDefaults(md toml.MetaData) {
 	}
 	if !md.IsDefined("cache", "negative_ttl") {
 		c.Cache.NegativeTTL = Duration(time.Minute)
+	}
+	if !md.IsDefined("cache", "persist_interval") {
+		c.Cache.PersistInterval = Duration(30 * time.Second)
+	}
+	if !md.IsDefined("metrics", "bind") {
+		c.Metrics.Bind = ":9090"
 	}
 	if !md.IsDefined("failure", "timeout_ms") {
 		c.Failure.TimeoutMS = 8000
@@ -360,6 +391,9 @@ func (c *Config) applyScoringDefaults(md toml.MetaData) {
 	if !md.IsDefined("failure", "scoring", "debounce_window") {
 		s.DebounceWindow = d.DebounceWindow
 	}
+	if !md.IsDefined("failure", "scoring", "prune_after") {
+		s.PruneAfter = d.PruneAfter
+	}
 }
 
 // Validate runs every check the build plan calls for. Errors are joined so
@@ -377,6 +411,15 @@ func (c *Config) Validate() error {
 	if c.Cache.PersistPath != "" {
 		if !filepath.IsAbs(c.Cache.PersistPath) {
 			errs = append(errs, fmt.Errorf("cache.persist_path %q must be an absolute path", c.Cache.PersistPath))
+		}
+	}
+	if c.Cache.PersistInterval < 0 {
+		errs = append(errs, fmt.Errorf("cache.persist_interval must be >= 0, got %v", c.Cache.PersistInterval.Duration()))
+	}
+
+	if c.Metrics.Bind != "" {
+		if err := validateAddr(c.Metrics.Bind, "metrics.bind"); err != nil {
+			errs = append(errs, err)
 		}
 	}
 
@@ -536,6 +579,9 @@ func (s ScoringConfig) validate() error {
 	}
 	if s.DebounceWindow < 0 {
 		errs = append(errs, fmt.Errorf("failure.scoring.debounce_window must be >= 0, got %v", s.DebounceWindow.Duration()))
+	}
+	if s.PruneAfter < 0 {
+		errs = append(errs, fmt.Errorf("failure.scoring.prune_after must be >= 0, got %v", s.PruneAfter.Duration()))
 	}
 	return errors.Join(errs...)
 }
