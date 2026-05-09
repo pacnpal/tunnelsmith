@@ -35,12 +35,17 @@ type MetricsSink interface {
 
 // HTTPServer accepts HTTP CONNECT and plain-HTTP forward-proxy traffic.
 type HTTPServer struct {
-	addr     string
-	sb       *scoreboard.Scoreboard
-	detector *failure.StatusDetector
-	retryCap int
-	logger   *slog.Logger
-	metrics  MetricsSink
+	addr    string
+	sb      *scoreboard.Scoreboard
+	logger  *slog.Logger
+	metrics MetricsSink
+
+	// runtime is the slice of knobs SIGHUP hot-reload can swap in place.
+	// Guarded by runtimeMu so the request path's reads stay consistent
+	// with concurrent Reload calls.
+	runtimeMu sync.RWMutex
+	detector  *failure.StatusDetector
+	retryCap  int
 
 	server *http.Server
 
@@ -104,6 +109,9 @@ func NewHTTP(addr string, sb *scoreboard.Scoreboard, detector *failure.StatusDet
 		tunnels:    make(map[*tunnel]struct{}),
 		transports: make(map[string]*http.Transport),
 	}
+	// Reload knobs default to the constructor arguments above; the
+	// runtimeMu fields are populated implicitly via the struct literal.
+
 	for _, opt := range opts {
 		opt(h)
 	}
@@ -113,6 +121,61 @@ func NewHTTP(addr string, sb *scoreboard.Scoreboard, detector *failure.StatusDet
 		ReadHeaderTimeout: 30 * time.Second,
 	}
 	return h, nil
+}
+
+// currentDetector returns the live failure detector. Reads are guarded by
+// runtimeMu so a concurrent Reload cannot tear the pointer.
+func (h *HTTPServer) currentDetector() *failure.StatusDetector {
+	h.runtimeMu.RLock()
+	defer h.runtimeMu.RUnlock()
+	return h.detector
+}
+
+// currentRetryCap returns the live retry cap.
+func (h *HTTPServer) currentRetryCap() int {
+	h.runtimeMu.RLock()
+	defer h.runtimeMu.RUnlock()
+	return h.retryCap
+}
+
+// Reload swaps the live detector and retry cap. Called from the SIGHUP
+// hot-reload path. Invalid retryCap values (< 1) are ignored with a
+// log line so a misconfigured reload does not zero out the cap.
+//
+// Per-upstream HTTP transports are kept across reloads so connection
+// pools survive a config bump that does not change the upstream list;
+// when an upstream goes away in the new pool, CloseTransportsExcept
+// drops its transport explicitly.
+func (h *HTTPServer) Reload(detector *failure.StatusDetector, retryCap int) {
+	if retryCap < 1 {
+		h.logger.Warn("http listener reload ignored (retryCap < 1)", "retry_cap", retryCap)
+		return
+	}
+	h.runtimeMu.Lock()
+	h.detector = detector
+	h.retryCap = retryCap
+	h.runtimeMu.Unlock()
+	h.logger.Info("http listener reloaded", "retry_cap", retryCap)
+}
+
+// CloseTransportsExcept closes idle conns and drops cached transports for
+// every upstream whose id is not in keep. Called from the hot-reload path
+// after the upstream pool changes so per-upstream conn pools cannot leak.
+func (h *HTTPServer) CloseTransportsExcept(keep map[string]struct{}) {
+	h.transportsMu.Lock()
+	var removed []string
+	for id, t := range h.transports {
+		if _, ok := keep[id]; ok {
+			continue
+		}
+		t.CloseIdleConnections()
+		delete(h.transports, id)
+		removed = append(removed, id)
+	}
+	h.transportsMu.Unlock()
+	if len(removed) > 0 {
+		h.logger.Info("http listener dropped transports for removed upstreams", "ids", removed)
+	}
 }
 
 // transportFor returns the Transport pinned to up, building it on first use.
@@ -380,12 +443,14 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tried := make(map[string]bool, h.retryCap)
+	retryCap := h.currentRetryCap()
+	detector := h.currentDetector()
+	tried := make(map[string]bool, retryCap)
 	var (
 		retries        int
 		cascadeAlready bool
 	)
-	for attempt := 0; attempt < h.retryCap; attempt++ {
+	for attempt := 0; attempt < retryCap; attempt++ {
 		if err := r.Context().Err(); err != nil {
 			h.logger.Warn("forward client context done",
 				"host", host,
@@ -461,7 +526,7 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		det, isFail := h.detector.Detect(resp.StatusCode, resp.Header)
+		det, isFail := detector.Detect(resp.StatusCode, resp.Header)
 		if isFail {
 			h.sb.RecordFailure(host, up.ID(), det.Kind, det.CooldownOverride)
 			h.observeStatusFailure(up.ID(), resp.StatusCode)

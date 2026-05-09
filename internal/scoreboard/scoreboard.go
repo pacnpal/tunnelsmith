@@ -298,6 +298,58 @@ func New(pool *upstream.Pool, cfg Config, opts ...Option) (*Scoreboard, error) {
 	return s, nil
 }
 
+// ReplacePool swaps the wrapped pool for a new one. Used by the SIGHUP
+// hot-reload path: the per-(host, upstream) entry table survives the
+// swap, so a host whose previous winner is still in the new pool keeps
+// the cached winner. Entries keyed off ids that no longer exist in the
+// new pool stay in the map but are unreachable through Pick (their id
+// is not a candidate). The next Prune pass evicts them once their score
+// decays below the threshold.
+//
+// Returns an error if newPool is nil; callers pass the old pool back if
+// they want to keep things unchanged.
+func (s *Scoreboard) ReplacePool(newPool *upstream.Pool) error {
+	if newPool == nil {
+		return errors.New("scoreboard: ReplacePool called with nil pool")
+	}
+	entries := newPool.Entries()
+	retryCap := newPool.RetryCap()
+	poolLen := newPool.Len()
+	s.mu.Lock()
+	s.pool = newPool
+	s.poolEntries = entries
+	s.poolRetryCap = retryCap
+	s.poolLen = poolLen
+	s.mu.Unlock()
+	return nil
+}
+
+// Reload updates the runtime tuning knobs in place. The new Config can
+// change penalty weights, cooldowns, probe chance, debounce window,
+// cascade TTL, and prune-after; DecayInterval is intentionally left
+// alone because the decay goroutine reads its ticker once at start.
+// Listener bindings, the upstream pool, and the random source are all
+// changed through their own paths.
+//
+// Reload holds the write lock for the duration of the swap to avoid
+// torn reads from concurrent Pick / Record* callers.
+func (s *Scoreboard) Reload(newCfg Config) {
+	s.mu.Lock()
+	// Preserve DecayInterval so a SIGHUP cannot accidentally tear down
+	// the running decay goroutine. Operators who want a different
+	// interval restart the binary; the build plan documents this.
+	preservedDecay := s.cfg.DecayInterval
+	s.cfg = newCfg
+	s.cfg.DecayInterval = preservedDecay
+	s.mu.Unlock()
+	s.logger.Info("scoreboard reloaded",
+		"probe_chance", newCfg.ProbeChance,
+		"cascade_ttl_ms", newCfg.CascadeTTL.Milliseconds(),
+		"debounce_window_ms", newCfg.DebounceWindow.Milliseconds(),
+		"prune_after_ms", newCfg.PruneAfter.Milliseconds(),
+	)
+}
+
 // Start launches the time-decay goroutine. Stop or a cancelled ctx ends it.
 // Calling Start twice without an intervening Stop is a no-op past the first
 // call; the existing loop keeps running.

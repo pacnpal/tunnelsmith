@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -100,6 +101,10 @@ func run(args []string, stdout, stderr *os.File) error {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+
+	hupCh := make(chan os.Signal, 1)
+	signal.Notify(hupCh, syscall.SIGHUP)
+	defer signal.Stop(hupCh)
 
 	dialTimeout := time.Duration(cfg.Failure.TimeoutMS) * time.Millisecond
 	expandedPools, expanders, err := expandUpstreamPools(ctx, cfg.UpstreamPools, logger)
@@ -200,15 +205,40 @@ func run(args []string, stdout, stderr *os.File) error {
 		}, logger, metricsRegistry)
 		g.Go(func() error { return persistLoop.Run(gctx) })
 	}
+	var gaugeRefresh *scoreboardGaugeRefresher
 	if metricsSrv != nil {
 		// Refresh the scoreboard-shape gauges on every metrics scrape
 		// would be more accurate, but Prometheus client_golang does not
 		// expose a "before-collect" hook for arbitrary gauges. A light
 		// background ticker mirrors the scoreboard state into the gauge
 		// vectors at a reasonable cadence.
-		gaugeRefresh := newScoreboardGaugeRefresher(sb, metricsRegistry, pool.IDs())
+		gaugeRefresh = newScoreboardGaugeRefresher(sb, metricsRegistry, pool.IDs())
 		g.Go(func() error { return gaugeRefresh.run(gctx) })
 	}
+
+	// SIGHUP hot-reload: re-read the config file, validate, then apply
+	// the subset that does not require a restart. Listener bindings,
+	// the decay interval, [[upstream_pool]] refresh interval, and the
+	// persistence path stay frozen at startup.
+	reloader := &reloader{
+		path:     *configPath,
+		logger:   logger,
+		sb:       sb,
+		httpSrv:  httpSrv,
+		registry: metricsRegistry,
+		gauges:   gaugeRefresh,
+		poolIDs:  pool.IDs(),
+	}
+	g.Go(func() error {
+		for {
+			select {
+			case <-gctx.Done():
+				return nil
+			case <-hupCh:
+				reloader.reload(gctx)
+			}
+		}
+	})
 	for _, run := range expanders {
 		run := run
 		g.Go(func() error { return run(gctx) })
@@ -422,6 +452,100 @@ func diffUpstreams(prev, next []config.UpstreamConfig) (added, removed []string)
 	return added, removed
 }
 
+// reloader drives the SIGHUP hot-reload path. It re-reads the config file,
+// validates it, and applies the subset of fields the running binary can
+// change in place. Listener bindings, decay interval, persist path, and
+// the [[upstream_pool]] refresh schedule are frozen at startup.
+type reloader struct {
+	path     string
+	logger   *slog.Logger
+	sb       *scoreboard.Scoreboard
+	httpSrv  *listener.HTTPServer
+	registry *metrics.Registry
+	gauges   *scoreboardGaugeRefresher
+
+	mu      sync.Mutex
+	poolIDs []string
+}
+
+func (r *reloader) reload(ctx context.Context) {
+	r.logger.Info("config reload requested", "path", r.path)
+	newCfg, err := config.Load(r.path)
+	if err != nil {
+		r.logger.Warn("config reload failed (keeping current config)", "err", err)
+		r.registry.ObserveConfigReload(metrics.ResultError)
+		return
+	}
+	if len(newCfg.UnknownKeys) > 0 {
+		r.logger.Warn("reloaded config has unknown keys; check for typos",
+			"path", r.path,
+			"keys", newCfg.UnknownKeys,
+		)
+	}
+	if len(newCfg.UpstreamPools) > 0 {
+		r.logger.Warn("[[upstream_pool]] hot-reload not supported in v1; restart to apply",
+			"pool_count", len(newCfg.UpstreamPools),
+		)
+	}
+
+	dialTimeout := time.Duration(newCfg.Failure.TimeoutMS) * time.Millisecond
+	entries := make([]upstream.PoolEntry, 0, len(newCfg.Upstreams))
+	for _, uc := range newCfg.Upstreams {
+		up, buildErr := upstream.New(uc, dialTimeout)
+		if buildErr != nil {
+			r.logger.Warn("config reload failed (build upstream)", "id", uc.ID, "err", buildErr)
+			r.registry.ObserveConfigReload(metrics.ResultError)
+			return
+		}
+		entries = append(entries, upstream.PoolEntry{Up: up, Priority: uc.PriorityValue()})
+	}
+	if len(entries) == 0 {
+		// A reload with zero static upstreams while pools are restart-frozen
+		// would empty the pool entirely. Refuse the reload.
+		r.logger.Warn("config reload failed (no static upstreams; pools are restart-frozen)")
+		r.registry.ObserveConfigReload(metrics.ResultError)
+		return
+	}
+	newPool, err := upstream.NewPool(entries, newCfg.Failure.MaxRetriesPerRequest, r.logger)
+	if err != nil {
+		r.logger.Warn("config reload failed (build pool)", "err", err)
+		r.registry.ObserveConfigReload(metrics.ResultError)
+		return
+	}
+
+	if err := r.sb.ReplacePool(newPool); err != nil {
+		r.logger.Warn("config reload failed (scoreboard ReplacePool)", "err", err)
+		r.registry.ObserveConfigReload(metrics.ResultError)
+		return
+	}
+	r.sb.Reload(scoreboard.FromConfig(newCfg.Failure.Scoring, newCfg.Failure.Status))
+	r.httpSrv.Reload(failure.NewStatusDetector(newCfg.Failure.Status), newCfg.Failure.MaxRetriesPerRequest)
+
+	keep := make(map[string]struct{}, len(entries))
+	newIDs := make([]string, 0, len(entries))
+	for _, e := range entries {
+		keep[e.Up.ID()] = struct{}{}
+		newIDs = append(newIDs, e.Up.ID())
+	}
+	r.httpSrv.CloseTransportsExcept(keep)
+
+	r.mu.Lock()
+	r.poolIDs = newIDs
+	if r.gauges != nil {
+		r.gauges.setPoolIDs(newIDs)
+	}
+	r.mu.Unlock()
+
+	r.registry.SetUpstreamPoolSize(newPool.Len())
+	r.registry.ObserveConfigReload(metrics.ResultSuccess)
+	r.logger.Info("config reloaded",
+		"path", r.path,
+		"upstreams", len(entries),
+		"retry_cap", newCfg.Failure.MaxRetriesPerRequest,
+	)
+	_ = ctx // reserved for future cancel-aware reloads
+}
+
 // scoreboardGaugeRefresher periodically copies the scoreboard's
 // shape-only state (total entries, per-upstream cooled hosts, cascade
 // active count) into the metrics registry. The refresh interval is
@@ -430,12 +554,23 @@ func diffUpstreams(prev, next []config.UpstreamConfig) (added, removed []string)
 type scoreboardGaugeRefresher struct {
 	sb       *scoreboard.Scoreboard
 	registry *metrics.Registry
+
+	mu       sync.RWMutex
 	poolIDs  []string
 	interval time.Duration
 }
 
 func newScoreboardGaugeRefresher(sb *scoreboard.Scoreboard, reg *metrics.Registry, poolIDs []string) *scoreboardGaugeRefresher {
 	return &scoreboardGaugeRefresher{sb: sb, registry: reg, poolIDs: poolIDs, interval: 5 * time.Second}
+}
+
+// setPoolIDs swaps the upstream id list the gauges reset against. Called
+// from the SIGHUP hot-reload path after the upstream pool changes so a
+// scrape after the reload reports the right set of upstream_id labels.
+func (r *scoreboardGaugeRefresher) setPoolIDs(ids []string) {
+	r.mu.Lock()
+	r.poolIDs = ids
+	r.mu.Unlock()
 }
 
 func (r *scoreboardGaugeRefresher) run(ctx context.Context) error {
@@ -453,11 +588,14 @@ func (r *scoreboardGaugeRefresher) run(ctx context.Context) error {
 }
 
 func (r *scoreboardGaugeRefresher) tick() {
+	r.mu.RLock()
+	ids := r.poolIDs
+	r.mu.RUnlock()
 	r.registry.SetScoreboardSnapshot(
 		r.sb.EntriesCount(),
 		r.sb.CooledHostsByUpstream(),
 		r.sb.CascadeActiveCount(),
-		r.poolIDs,
+		ids,
 	)
 }
 
