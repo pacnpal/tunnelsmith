@@ -17,13 +17,14 @@ package scoreboard
 // the helpers below own the per-Pick draw and serialize access to the
 // underlying *rand.Rand so concurrent Picks do not race it.
 
-// probeRoll returns true when a uniform [0,1) draw falls below ProbeChance.
-// Concurrent Picks may both call this; the mutex serializes access to the
-// scoreboard's *rand.Rand, which is not goroutine-safe on its own.
-func (s *Scoreboard) probeRoll() bool {
+// probeRoll returns true when a uniform [0,1) draw falls below chance. The
+// caller passes the snapshotted ProbeChance so a concurrent Reload cannot
+// race the read; only the random source is serialized here, since
+// math/rand.Rand is not goroutine-safe on its own.
+func (s *Scoreboard) probeRoll(chance float64) bool {
 	s.randMu.Lock()
 	defer s.randMu.Unlock()
-	return s.rand.Float64() < s.cfg.ProbeChance
+	return s.rand.Float64() < chance
 }
 
 // probePick returns a uniform random integer in [0, n). Caller guarantees

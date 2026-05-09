@@ -244,14 +244,20 @@ func (r *Registry) SetUpstreamPoolSize(n int) {
 // from the same Snapshot the persistence writer uses, so /metrics and the
 // snapshot file stay in lockstep.
 //
-// poolIDs is the full list of upstream ids known to the binary; cooled
-// gauges are reset for every id so an upstream that no longer has any
-// cooled hosts reports 0 instead of carrying its previous value.
+// poolIDs is the full list of upstream ids known to the binary. The
+// upstream_cooled_hosts gauge vec is reset before repopulating so an
+// upstream that disappeared from the pool after a hot-reload no longer
+// shows its stale label series.
 func (r *Registry) SetScoreboardSnapshot(totalEntries int, cooledByUpstream map[string]int, cascadeHosts int, poolIDs []string) {
 	if r == nil {
 		return
 	}
 	r.ScoreboardEntries.Set(float64(totalEntries))
+	// Reset drops every label series the gauge vec is currently tracking,
+	// so the loop below repopulates only ids that exist in the live pool.
+	// A scrape between Reset and the loop sees zero series; the refresh
+	// cadence (5 seconds) makes that gap acceptable.
+	r.UpstreamCooledHosts.Reset()
 	for _, id := range poolIDs {
 		count := cooledByUpstream[id]
 		r.UpstreamCooledHosts.WithLabelValues(id).Set(float64(count))

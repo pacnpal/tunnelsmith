@@ -194,7 +194,10 @@ func TestPruneDropsZeroScoreStaleEntries(t *testing.T) {
 }
 
 // TestPruneEvictsExpiredCascade confirms cascade entries past their expiry
-// are dropped, and active ones survive.
+// are dropped, and active ones survive. The two TripCascade calls are
+// staggered on the fixed clock so a single 31s advance only crosses the
+// first trip's TTL; without the stagger both entries would expire and
+// the test would not exercise the "active ones survive" path.
 func TestPruneEvictsExpiredCascade(t *testing.T) {
 	t.Parallel()
 
@@ -203,14 +206,20 @@ func TestPruneEvictsExpiredCascade(t *testing.T) {
 	sb := newPersistTestScoreboard(t, clock)
 
 	sb.TripCascade("expiring.example.com")
+	// Stagger the second trip so its TTL lands later on the fake clock.
+	clock.advance(2 * time.Second)
 	sb.TripCascade("active.example.com")
 
 	// CascadeTTL in the test scoreboard is 30s. Advance past the first
-	// trip but not so far that the second has also expired.
-	clock.advance(31 * time.Second)
+	// trip's expiry but not the second's: 31s after the first trip is
+	// 29s after the second.
+	clock.advance(29 * time.Second)
 	stats := sb.Prune()
-	if stats.CascadeDropped < 1 {
-		t.Errorf("CascadeDropped = %d, want at least 1", stats.CascadeDropped)
+	if stats.CascadeDropped != 1 {
+		t.Errorf("CascadeDropped = %d, want 1 (only expiring.example.com is past TTL)", stats.CascadeDropped)
+	}
+	if got := sb.CascadeActiveCount(); got != 1 {
+		t.Errorf("CascadeActiveCount after prune = %d, want 1 (active.example.com still in cooldown)", got)
 	}
 }
 

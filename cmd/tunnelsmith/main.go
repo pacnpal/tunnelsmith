@@ -221,13 +221,14 @@ func run(args []string, stdout, stderr *os.File) error {
 	// the decay interval, [[upstream_pool]] refresh interval, and the
 	// persistence path stay frozen at startup.
 	reloader := &reloader{
-		path:     *configPath,
-		logger:   logger,
-		sb:       sb,
-		httpSrv:  httpSrv,
-		registry: metricsRegistry,
-		gauges:   gaugeRefresh,
-		poolIDs:  pool.IDs(),
+		path:           *configPath,
+		logger:         logger,
+		sb:             sb,
+		httpSrv:        httpSrv,
+		registry:       metricsRegistry,
+		gauges:         gaugeRefresh,
+		poolIDs:        pool.IDs(),
+		runningHasPool: len(cfg.UpstreamPools) > 0,
 	}
 	g.Go(func() error {
 		for {
@@ -456,13 +457,21 @@ func diffUpstreams(prev, next []config.UpstreamConfig) (added, removed []string)
 // validates it, and applies the subset of fields the running binary can
 // change in place. Listener bindings, decay interval, persist path, and
 // the [[upstream_pool]] refresh schedule are frozen at startup.
+//
+// runningHasPool says whether the running instance was built with at
+// least one [[upstream_pool]] block. When true the reloader leaves the
+// upstream pool alone (pool expansion is restart-frozen for v1) and
+// only swaps scoring tunings, the status detector, and the retry cap;
+// the alternative would silently drop pool-expanded upstreams from the
+// live pool on every SIGHUP, which is worse than not reloading them.
 type reloader struct {
-	path     string
-	logger   *slog.Logger
-	sb       *scoreboard.Scoreboard
-	httpSrv  *listener.HTTPServer
-	registry *metrics.Registry
-	gauges   *scoreboardGaugeRefresher
+	path           string
+	logger         *slog.Logger
+	sb             *scoreboard.Scoreboard
+	httpSrv        *listener.HTTPServer
+	registry       *metrics.Registry
+	gauges         *scoreboardGaugeRefresher
+	runningHasPool bool
 
 	mu      sync.Mutex
 	poolIDs []string
@@ -482,52 +491,76 @@ func (r *reloader) reload(ctx context.Context) {
 			"keys", newCfg.UnknownKeys,
 		)
 	}
-	if len(newCfg.UpstreamPools) > 0 {
-		r.logger.Warn("[[upstream_pool]] hot-reload not supported in v1; restart to apply",
-			"pool_count", len(newCfg.UpstreamPools),
+
+	// Always hot-reload scoring tunings and the status detector. They
+	// are independent of the pool shape.
+	r.sb.Reload(scoreboard.FromConfig(newCfg.Failure.Scoring, newCfg.Failure.Status))
+	r.httpSrv.Reload(failure.NewStatusDetector(newCfg.Failure.Status), newCfg.Failure.MaxRetriesPerRequest)
+
+	switch {
+	case r.runningHasPool || len(newCfg.UpstreamPools) > 0:
+		// The running config or the new config carries an
+		// [[upstream_pool]] block. Pool expansion runs on its own
+		// refresh ticker per ADR-006-equivalent reasoning: rebuilding
+		// the priority pool here would either drop the pool-expanded
+		// upstreams (if we used only newCfg.Upstreams) or duplicate
+		// them (if we mixed snapshots). Skip the swap entirely and let
+		// the user restart for pool-shape changes.
+		r.logger.Warn("upstream pool not hot-reloaded; [[upstream_pool]] in play, restart to apply pool shape changes",
+			"running_has_pool", r.runningHasPool,
+			"new_has_pool", len(newCfg.UpstreamPools) > 0,
 		)
+	default:
+		if err := r.swapStaticPool(newCfg); err != nil {
+			r.logger.Warn("config reload failed (pool swap)", "err", err)
+			r.registry.ObserveConfigReload(metrics.ResultError)
+			return
+		}
 	}
 
+	r.registry.ObserveConfigReload(metrics.ResultSuccess)
+	r.logger.Info("config reloaded",
+		"path", r.path,
+		"static_upstreams", len(newCfg.Upstreams),
+		"pools", len(newCfg.UpstreamPools),
+		"retry_cap", newCfg.Failure.MaxRetriesPerRequest,
+	)
+	_ = ctx // reserved for future cancel-aware reloads
+}
+
+// swapStaticPool builds a fresh priority pool from newCfg.Upstreams and
+// installs it on the scoreboard plus drops every cached HTTP transport.
+// Cached transports pin the previous Upstream object via their
+// DialContext closure, so a same-id reload that changes addr/kind would
+// otherwise route through the stale destination; dropping the whole
+// cache is simpler than tracking per-upstream identity.
+func (r *reloader) swapStaticPool(newCfg *config.Config) error {
 	dialTimeout := time.Duration(newCfg.Failure.TimeoutMS) * time.Millisecond
 	entries := make([]upstream.PoolEntry, 0, len(newCfg.Upstreams))
 	for _, uc := range newCfg.Upstreams {
 		up, buildErr := upstream.New(uc, dialTimeout)
 		if buildErr != nil {
-			r.logger.Warn("config reload failed (build upstream)", "id", uc.ID, "err", buildErr)
-			r.registry.ObserveConfigReload(metrics.ResultError)
-			return
+			return fmt.Errorf("build upstream %q: %w", uc.ID, buildErr)
 		}
 		entries = append(entries, upstream.PoolEntry{Up: up, Priority: uc.PriorityValue()})
 	}
 	if len(entries) == 0 {
-		// A reload with zero static upstreams while pools are restart-frozen
-		// would empty the pool entirely. Refuse the reload.
-		r.logger.Warn("config reload failed (no static upstreams; pools are restart-frozen)")
-		r.registry.ObserveConfigReload(metrics.ResultError)
-		return
+		return errors.New("no static upstreams in reloaded config")
 	}
 	newPool, err := upstream.NewPool(entries, newCfg.Failure.MaxRetriesPerRequest, r.logger)
 	if err != nil {
-		r.logger.Warn("config reload failed (build pool)", "err", err)
-		r.registry.ObserveConfigReload(metrics.ResultError)
-		return
+		return fmt.Errorf("build pool: %w", err)
 	}
-
 	if err := r.sb.ReplacePool(newPool); err != nil {
-		r.logger.Warn("config reload failed (scoreboard ReplacePool)", "err", err)
-		r.registry.ObserveConfigReload(metrics.ResultError)
-		return
+		return fmt.Errorf("scoreboard ReplacePool: %w", err)
 	}
-	r.sb.Reload(scoreboard.FromConfig(newCfg.Failure.Scoring, newCfg.Failure.Status))
-	r.httpSrv.Reload(failure.NewStatusDetector(newCfg.Failure.Status), newCfg.Failure.MaxRetriesPerRequest)
 
-	keep := make(map[string]struct{}, len(entries))
-	newIDs := make([]string, 0, len(entries))
-	for _, e := range entries {
-		keep[e.Up.ID()] = struct{}{}
-		newIDs = append(newIDs, e.Up.ID())
-	}
-	r.httpSrv.CloseTransportsExcept(keep)
+	newIDs := newPool.IDs()
+	// Pass an empty keep set so every cached transport is dropped. The
+	// new pool's Upstream objects need their own freshly-pinned
+	// transports; a same-id transport from the old pool would still
+	// dial through the previous Upstream's closure.
+	r.httpSrv.CloseTransportsExcept(map[string]struct{}{})
 
 	r.mu.Lock()
 	r.poolIDs = newIDs
@@ -537,13 +570,7 @@ func (r *reloader) reload(ctx context.Context) {
 	r.mu.Unlock()
 
 	r.registry.SetUpstreamPoolSize(newPool.Len())
-	r.registry.ObserveConfigReload(metrics.ResultSuccess)
-	r.logger.Info("config reloaded",
-		"path", r.path,
-		"upstreams", len(entries),
-		"retry_cap", newCfg.Failure.MaxRetriesPerRequest,
-	)
-	_ = ctx // reserved for future cancel-aware reloads
+	return nil
 }
 
 // scoreboardGaugeRefresher periodically copies the scoreboard's

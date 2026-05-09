@@ -17,12 +17,13 @@ import (
 )
 
 // BenchmarkScoreboardWriterContention is the profile run for issue #12.
-// It seeds a scoreboard with 10k hosts spread across 50 upstreams, then
+// It seeds a scoreboard with 1k hosts spread across 20 upstreams, then
 // has every available CPU writer hammer Pick + RecordSuccess in a tight
-// loop while a background goroutine runs decayTick (via the Decay clock
-// path) and Snapshot every 5ms. The benchmark reports allocs/op and
-// ns/op so a bot reviewer (or this commit's profiling notes) can show
-// whether the prune / decay write-lock holds back the hot path.
+// loop while a background goroutine calls Snapshot, CooledHostsByUpstream,
+// and CascadeActiveCount every 5ms and a second goroutine runs
+// SaveSnapshot every 50ms. The benchmark reports ns/op alongside the
+// total snapshot reads and writes so reviewers can see whether the
+// prune / decay write-lock holds back the hot path.
 //
 // The benchmark uses public APIs only; no internal hooks. Snapshot and
 // CooledHostsByUpstream both take the read lock, so they exercise the
@@ -117,8 +118,11 @@ func BenchmarkScoreboardWriterContention(b *testing.B) {
 	b.StopTimer()
 	close(stop)
 
-	b.ReportMetric(float64(snapshotsTaken.Load()), "snapshots/sec")
-	b.ReportMetric(float64(snapshotsWritten.Load()), "writes/sec")
+	// ReportMetric values are absolute counts over the benchmark's run,
+	// not rates. Earlier labels said "/sec" which made identical numbers
+	// from a 1s and a 10s run look the same.
+	b.ReportMetric(float64(snapshotsTaken.Load()), "snapshots")
+	b.ReportMetric(float64(snapshotsWritten.Load()), "writes")
 }
 
 // buildPersistTestPoolN is a sibling of buildPersistTestPool that takes a

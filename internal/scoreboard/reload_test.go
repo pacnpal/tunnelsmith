@@ -3,6 +3,7 @@ package scoreboard_test
 import (
 	"io"
 	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
@@ -124,4 +125,98 @@ func TestReloadKeepsDecayInterval(t *testing.T) {
 		t.Errorf("post-reload score = %v, want 1", got)
 	}
 	_ = upstream.PoolEntry{} // keep the upstream import alive
+}
+
+// TestReloadAndReplacePoolUnderLoad hammers the scoreboard with concurrent
+// Pick / RecordSuccess / RecordFailure / DialFor calls while a writer
+// goroutine swaps the pool and the config back and forth via ReplacePool
+// and Reload. Run under -race; without the snapshot helpers added in the
+// review fix, the race detector fires on s.cfg and s.poolEntries reads.
+func TestReloadAndReplacePoolUnderLoad(t *testing.T) {
+	t.Parallel()
+
+	clock := &fixedClock{now: time.Date(2026, 5, 9, 0, 0, 0, 0, time.UTC)}
+	sb := newPersistTestScoreboard(t, clock)
+
+	cfgA := scoreboard.Config{
+		KindPolicy: map[failure.Kind]scoreboard.Policy{
+			failure.KindRefused: {Penalty: 1, Cooldown: 30 * time.Second},
+			failure.KindTimeout: {Penalty: 1, Cooldown: 15 * time.Second},
+		},
+		SuccessWeight:  1,
+		ScoreCap:       10,
+		ProbeChance:    0.1,
+		DecayInterval:  time.Minute,
+		DecayStep:      0.5,
+		CascadeTTL:     30 * time.Second,
+		DebounceWindow: 50 * time.Millisecond,
+		PruneAfter:     time.Hour,
+	}
+	cfgB := cfgA
+	cfgB.SuccessWeight = 5
+	cfgB.ProbeChance = 0
+	cfgB.DebounceWindow = 0
+	cfgB.CascadeTTL = 0
+
+	poolAlpha := buildPersistTestPool(t, "alpha", "beta", "gamma")
+	poolDelta := buildPersistTestPool(t, "alpha", "delta")
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// Writers: swap pool + config back and forth.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if i%2 == 0 {
+				_ = sb.ReplacePool(poolDelta)
+				sb.Reload(cfgB)
+			} else {
+				_ = sb.ReplacePool(poolAlpha)
+				sb.Reload(cfgA)
+			}
+		}
+	}()
+
+	// Readers: hot-path callers.
+	const readers = 4
+	for i := 0; i < readers; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			host := "api.example.com"
+			for j := 0; ; j++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				_, _ = sb.Pick(host, nil)
+				sb.RecordSuccess(host, "alpha", time.Millisecond)
+				if j%3 == 0 {
+					sb.RecordFailure(host, "alpha", failure.KindRefused, nil)
+				}
+				if j%5 == 0 {
+					sb.TripCascade(host)
+				}
+				_ = sb.Snapshot()
+				_ = sb.CooledHostsByUpstream()
+				_ = sb.CascadeActiveCount()
+				_ = sb.EntriesCount()
+				_ = sb.Prune()
+			}
+		}(i)
+	}
+
+	// Run for a short interval; -race instrumentation is what makes this
+	// useful, not throughput.
+	time.Sleep(200 * time.Millisecond)
+	close(stop)
+	wg.Wait()
 }

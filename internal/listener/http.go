@@ -526,7 +526,17 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		det, isFail := detector.Detect(resp.StatusCode, resp.Header)
+		// detector may be nil per NewHTTP / Reload's contract: that
+		// mode means "status detection disabled, treat every response
+		// as success". Skip the call entirely so the nil-detector path
+		// cannot panic.
+		var (
+			det    failure.Detection
+			isFail bool
+		)
+		if detector != nil {
+			det, isFail = detector.Detect(resp.StatusCode, resp.Header)
+		}
 		if isFail {
 			h.sb.RecordFailure(host, up.ID(), det.Kind, det.CooldownOverride)
 			h.observeStatusFailure(up.ID(), resp.StatusCode)

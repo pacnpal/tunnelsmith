@@ -122,7 +122,30 @@ func (s *Scoreboard) SaveSnapshot(path string) error {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("rename snapshot %s -> %s: %w", tmpPath, path, err)
 	}
+	// fsync the containing directory so the new directory entry hits the
+	// disk as well as the file contents. Without this a power loss
+	// between the rename and the next dir flush can leave the
+	// just-written snapshot missing or reverted.
+	if err := syncDir(dir); err != nil {
+		return fmt.Errorf("sync snapshot dir %s: %w", dir, err)
+	}
 	return nil
+}
+
+// syncDir opens the directory at path, calls Sync on it, and closes. On
+// platforms where directory fsync is a no-op (e.g. Windows) this still
+// returns nil; on Unix it makes the rename above durable.
+func syncDir(path string) error {
+	d, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	syncErr := d.Sync()
+	closeErr := d.Close()
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
 }
 
 // buildSnapshot copies the scoreboard's entry and cascade state into a
@@ -254,10 +277,14 @@ type PruneStats struct {
 // Debounce uses its own mutex.
 func (s *Scoreboard) Prune() PruneStats {
 	now := s.clock()
-	pruneAfter := s.cfg.PruneAfter
 	stats := PruneStats{}
 
+	// Hold mu for the cfg read plus the entries / cascade pass. Reload
+	// takes the same Lock for its swap, so the field reads here cannot
+	// race with a concurrent reload.
 	s.mu.Lock()
+	pruneAfter := s.cfg.PruneAfter
+	debounceWindow := s.cfg.DebounceWindow
 	for host, perUp := range s.entries {
 		if pruneAfter > 0 {
 			for id, e := range perUp {
@@ -280,8 +307,8 @@ func (s *Scoreboard) Prune() PruneStats {
 	}
 	s.mu.Unlock()
 
-	if s.cfg.DebounceWindow > 0 {
-		stale := 10 * s.cfg.DebounceWindow
+	if debounceWindow > 0 {
+		stale := 10 * debounceWindow
 		s.debounceMu.Lock()
 		for k, last := range s.debounce {
 			if now.Sub(last) > stale {

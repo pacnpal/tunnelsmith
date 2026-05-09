@@ -266,7 +266,7 @@ func WithRand(r *rand.Rand) Option {
 }
 
 // WithMetrics attaches a metrics sink. Pass nil to disable metric emission;
-// the scoreboard never deferences a nil sink.
+// the scoreboard never dereferences a nil sink.
 func WithMetrics(m MetricsSink) Option {
 	return func(s *Scoreboard) {
 		s.metrics = m
@@ -296,6 +296,28 @@ func New(pool *upstream.Pool, cfg Config, opts ...Option) (*Scoreboard, error) {
 		opt(s)
 	}
 	return s, nil
+}
+
+// configSnapshot returns a value copy of s.cfg taken under the read lock.
+// Reload swaps the whole struct, never mutates a field in place, so a
+// readers' value copy stays consistent with whatever cfg the writer
+// installed at snapshot time. Hot paths that read more than one field
+// take one snapshot at the start so multiple reads cannot tear
+// mid-write.
+func (s *Scoreboard) configSnapshot() Config {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.cfg
+}
+
+// poolSnapshot returns the cached pool view (entries slice header, retry
+// cap, pool length) taken under the read lock. ReplacePool installs
+// fresh slices, so a reader's pointer to the old backing array stays
+// stable for the lifetime of its dial.
+func (s *Scoreboard) poolSnapshot() (entries []upstream.PoolEntry, retryCap, poolLen int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.poolEntries, s.poolRetryCap, s.poolLen
 }
 
 // ReplacePool swaps the wrapped pool for a new one. Used by the SIGHUP
@@ -418,14 +440,15 @@ func (s *Scoreboard) decayLoop(ctx context.Context, done chan struct{}) {
 // decayTick drifts every entry's score toward zero by DecayStep, clamped at
 // zero. Holds mu for the duration; decay is cheap (one float subtraction
 // per entry) and runs every DecayInterval, not per-request, so the lock
-// pressure is fine for v1.
+// pressure is fine for v1. DecayStep is read under the same lock so a
+// concurrent Reload cannot race with the field read.
 func (s *Scoreboard) decayTick() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	step := s.cfg.DecayStep
 	if step <= 0 {
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	for _, perUpstream := range s.entries {
 		for _, e := range perUpstream {
 			switch {
@@ -458,10 +481,6 @@ func (s *Scoreboard) Pick(host string, tried map[string]bool) (upstream.Upstream
 	if s.cascadeActive(host, now) {
 		return nil, &CascadeError{Host: host}
 	}
-	candidates := s.poolEntries
-	if len(candidates) == 0 {
-		return nil, ErrPoolExhausted
-	}
 	type ranked struct {
 		up       upstream.Upstream
 		basePri  int
@@ -470,8 +489,18 @@ func (s *Scoreboard) Pick(host string, tried map[string]bool) (upstream.Upstream
 		untilT   time.Time
 		untilSet bool
 	}
-	pool := make([]ranked, 0, len(candidates))
+	// Take one read lock around every field that hot-reload can swap
+	// (poolEntries, cfg.ProbeChance) plus the entries map iteration. A
+	// concurrent ReplacePool / Reload waits behind this RLock; a
+	// concurrent reader runs without contention.
 	s.mu.RLock()
+	candidates := s.poolEntries
+	probeChance := s.cfg.ProbeChance
+	if len(candidates) == 0 {
+		s.mu.RUnlock()
+		return nil, ErrPoolExhausted
+	}
+	pool := make([]ranked, 0, len(candidates))
 	for _, c := range candidates {
 		id := c.Up.ID()
 		if tried[id] {
@@ -538,8 +567,10 @@ func (s *Scoreboard) Pick(host string, tried map[string]bool) (upstream.Upstream
 
 	// Probe roll: with prob ProbeChance, pick a non-top eligible candidate
 	// uniformly at random so a previously-penalized upstream gets a chance
-	// to recover. Skip when there is only one eligible.
-	if len(eligible) > 1 && s.cfg.ProbeChance > 0 && s.probeRoll() {
+	// to recover. Skip when there is only one eligible. probeChance was
+	// captured under the RLock above so it cannot tear with a concurrent
+	// Reload.
+	if len(eligible) > 1 && probeChance > 0 && s.probeRoll(probeChance) {
 		idx := s.probePick(len(eligible) - 1)
 		if s.metrics != nil {
 			s.metrics.ObserveProbePick()
@@ -594,10 +625,14 @@ func (s *Scoreboard) RecordFailure(host, upstreamID string, kind failure.Kind, c
 		return
 	}
 	now := s.clock()
-	if !s.acceptForDebounce(host, upstreamID, kind, now) {
+	// Snapshot the cfg fields the rest of this method reads so a
+	// concurrent Reload cannot tear KindPolicy / DebounceWindow / ScoreCap
+	// across the call.
+	cfg := s.configSnapshot()
+	if !s.acceptForDebounce(host, upstreamID, kind, now, cfg.DebounceWindow) {
 		return
 	}
-	policy := s.cfg.KindPolicy[kind]
+	policy := cfg.KindPolicy[kind]
 	overridden := cooldownOverride != nil
 	cooldown := policy.Cooldown
 	if overridden {
@@ -606,8 +641,8 @@ func (s *Scoreboard) RecordFailure(host, upstreamID string, kind failure.Kind, c
 	s.mu.Lock()
 	e := s.getOrCreateLocked(host, upstreamID)
 	e.score -= policy.Penalty
-	if e.score < -s.cfg.ScoreCap {
-		e.score = -s.cfg.ScoreCap
+	if e.score < -cfg.ScoreCap {
+		e.score = -cfg.ScoreCap
 	}
 	switch {
 	case overridden && cooldown > 0:
@@ -642,16 +677,17 @@ func (s *Scoreboard) RecordFailure(host, upstreamID string, kind failure.Kind, c
 }
 
 // acceptForDebounce returns true if a (host, upstream, kind) penalty should
-// be applied now. False means the previous penalty was within DebounceWindow
-// and this call should be a no-op.
-func (s *Scoreboard) acceptForDebounce(host, upstreamID string, kind failure.Kind, now time.Time) bool {
-	if s.cfg.DebounceWindow <= 0 {
+// be applied now. False means the previous penalty was within window
+// and this call should be a no-op. window is passed by the caller so a
+// concurrent Reload cannot tear the s.cfg.DebounceWindow read.
+func (s *Scoreboard) acceptForDebounce(host, upstreamID string, kind failure.Kind, now time.Time, window time.Duration) bool {
+	if window <= 0 {
 		return true
 	}
 	key := debounceKey{host: host, upstreamID: upstreamID, kind: kind}
 	s.debounceMu.Lock()
 	defer s.debounceMu.Unlock()
-	if last, ok := s.debounce[key]; ok && now.Sub(last) < s.cfg.DebounceWindow {
+	if last, ok := s.debounce[key]; ok && now.Sub(last) < window {
 		return false
 	}
 	s.debounce[key] = now
@@ -688,8 +724,9 @@ func (s *Scoreboard) DialFor(ctx context.Context, network, addr string) (net.Con
 	if s.cascadeActive(host, s.clock()) {
 		return nil, "", &CascadeError{Host: host}
 	}
-	retryCap := s.poolRetryCap
-	candidateCount := s.poolLen
+	// Snapshot pool metadata under the read lock so a concurrent
+	// ReplacePool cannot tear retryCap or candidateCount.
+	_, retryCap, candidateCount := s.poolSnapshot()
 	limit := retryCap
 	if limit > candidateCount {
 		limit = candidateCount
