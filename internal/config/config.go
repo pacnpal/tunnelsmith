@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -184,10 +186,16 @@ type StatusRule struct {
 // numeric fields are defaulted via toml.MetaData.IsDefined rather than
 // "value == zero", so a user-provided 0 reaches Validate (and rightly fails)
 // instead of being silently replaced by the default.
+//
+// BodyRegex is parsed for forward compatibility but no longer applied;
+// Phase 8 moved body-regex detection to the per-rule BodyRegex field so
+// buffering only fires for hosts whose [[rule]] opts in. A non-empty
+// top-level body_regex produces a startup warning so operators move it.
 type FailureConfig struct {
 	ConnectionRefused    bool          `toml:"connection_refused"`      // default: true; user can opt out by setting connection_refused = false
 	TimeoutMS            int           `toml:"timeout_ms"`              // default: 8000
-	BodyRegex            []string      `toml:"body_regex"`              // default: []
+	BodyRegex            []string      `toml:"body_regex"`              // deprecated: use [[rule]].body_regex instead
+	BodyBufferKB         int           `toml:"body_buffer_kb"`          // default: 32; per-response cap on bytes buffered for regex inspection
 	MaxRetriesPerRequest int           `toml:"max_retries_per_request"` // default: 5
 	Status               []StatusRule  `toml:"status"`                  // default: see DefaultStatusRules
 	Scoring              ScoringConfig `toml:"scoring"`                 // default: see ScoringDefaults
@@ -221,6 +229,16 @@ type ScoringConfig struct {
 	CascadeTTL     Duration `toml:"cascade_ttl"`     // default: 30s
 	DebounceWindow Duration `toml:"debounce_window"` // default: 100ms
 
+	// BodyMatchPenalty and BodyMatchCooldown drive the scoreboard's
+	// response to a Phase 8 body-regex match. The default penalty (5)
+	// sits between timeout (2) and forbidden (6), mirroring the
+	// proposal's "soft block" framing; the default cooldown (60s) is
+	// short enough to retry quickly when the match was a transient
+	// challenge page and long enough to skip a host that consistently
+	// returns the configured pattern from this exit.
+	BodyMatchPenalty  float64  `toml:"body_match_penalty"`  // default: 5
+	BodyMatchCooldown Duration `toml:"body_match_cooldown"` // default: 60s
+
 	// PruneAfter governs when zero-score entries are dropped from the
 	// scoreboard during the persistence-tick prune pass. An entry whose
 	// score has decayed to zero and whose lastSeen is older than
@@ -234,25 +252,34 @@ type ScoringConfig struct {
 // in for partial sections so a user can override one field without having
 // to restate the rest.
 var ScoringDefaults = ScoringConfig{
-	RefusedPenalty:  3,
-	RefusedCooldown: Duration(30 * time.Second),
-	TimeoutPenalty:  2,
-	TimeoutCooldown: Duration(15 * time.Second),
-	SuccessWeight:   1,
-	ScoreCap:        10,
-	ProbeChance:     0.05,
-	DecayInterval:   Duration(5 * time.Minute),
-	DecayStep:       0.5,
-	CascadeTTL:      Duration(30 * time.Second),
-	DebounceWindow:  Duration(100 * time.Millisecond),
-	PruneAfter:      Duration(24 * time.Hour),
+	RefusedPenalty:    3,
+	RefusedCooldown:   Duration(30 * time.Second),
+	TimeoutPenalty:    2,
+	TimeoutCooldown:   Duration(15 * time.Second),
+	SuccessWeight:     1,
+	ScoreCap:          10,
+	ProbeChance:       0.05,
+	DecayInterval:     Duration(5 * time.Minute),
+	DecayStep:         0.5,
+	CascadeTTL:        Duration(30 * time.Second),
+	DebounceWindow:    Duration(100 * time.Millisecond),
+	BodyMatchPenalty:  5,
+	BodyMatchCooldown: Duration(60 * time.Second),
+	PruneAfter:        Duration(24 * time.Hour),
 }
 
-// RuleConfig declares a per-host routing override.
+// RuleConfig declares a per-host routing override. Phase 8 adds BodyRegex
+// for response-body inspection: when non-empty, plain-HTTP responses for
+// matching hosts buffer up to FailureConfig.BodyBufferKB and run each
+// pattern against the buffered prefix. A match is treated as a soft
+// upstream failure (KindBodyMatch) and the request retries through the
+// next-best upstream. CONNECT and SOCKS5 traffic bypasses body inspection
+// because the proxy cannot see TLS payloads.
 type RuleConfig struct {
-	HostGlob string   `toml:"host_glob"`
-	Prefer   []string `toml:"prefer"`
-	Force    bool     `toml:"force"` // default: false
+	HostGlob  string   `toml:"host_glob"`
+	Prefer    []string `toml:"prefer"`
+	Force     bool     `toml:"force"`      // default: false
+	BodyRegex []string `toml:"body_regex"` // default: []; opt-in per rule, plain-HTTP only
 }
 
 // DefaultStatusRules captures the proposal's recommended status-code
@@ -323,6 +350,9 @@ func (c *Config) applyDefaults(md toml.MetaData) {
 	if !md.IsDefined("failure", "body_regex") {
 		c.Failure.BodyRegex = []string{}
 	}
+	if !md.IsDefined("failure", "body_buffer_kb") {
+		c.Failure.BodyBufferKB = 32
+	}
 	if !md.IsDefined("failure", "status") {
 		c.Failure.Status = append([]StatusRule(nil), DefaultStatusRules...)
 	}
@@ -390,6 +420,12 @@ func (c *Config) applyScoringDefaults(md toml.MetaData) {
 	}
 	if !md.IsDefined("failure", "scoring", "debounce_window") {
 		s.DebounceWindow = d.DebounceWindow
+	}
+	if !md.IsDefined("failure", "scoring", "body_match_penalty") {
+		s.BodyMatchPenalty = d.BodyMatchPenalty
+	}
+	if !md.IsDefined("failure", "scoring", "body_match_cooldown") {
+		s.BodyMatchCooldown = d.BodyMatchCooldown
 	}
 	if !md.IsDefined("failure", "scoring", "prune_after") {
 		s.PruneAfter = d.PruneAfter
@@ -460,6 +496,18 @@ func (c *Config) Validate() error {
 	if c.Failure.MaxRetriesPerRequest < 1 {
 		errs = append(errs, fmt.Errorf("failure.max_retries_per_request must be >= 1, got %d", c.Failure.MaxRetriesPerRequest))
 	}
+	// body_buffer_kb bounds the per-response read used for body-regex
+	// inspection. 0 disables inspection regardless of [[rule]].body_regex
+	// entries (the listener's WithHTTPBodyBufferKB / ReloadBodyBufferKB
+	// already treat 0 as off, so the config value passes through). The
+	// upper bound caps a misconfigured value at 1024 KiB so it cannot
+	// pin a multi-megabyte buffer per concurrent request, well below
+	// the 8 MiB request-body cap so the two limits cannot be confused.
+	if c.Failure.BodyBufferKB < 0 {
+		errs = append(errs, fmt.Errorf("failure.body_buffer_kb must be >= 0, got %d", c.Failure.BodyBufferKB))
+	} else if c.Failure.BodyBufferKB > 1024 {
+		errs = append(errs, fmt.Errorf("failure.body_buffer_kb must be <= 1024, got %d", c.Failure.BodyBufferKB))
+	}
 	for i, s := range c.Failure.Status {
 		if s.Code < 100 || s.Code > 599 {
 			errs = append(errs, fmt.Errorf("failure.status[%d]: code %d is outside the 100-599 range", i, s.Code))
@@ -519,6 +567,12 @@ func (c *Config) Validate() error {
 	for i, r := range c.Rules {
 		if r.HostGlob == "" {
 			errs = append(errs, fmt.Errorf("rule[%d]: host_glob is required", i))
+		} else if _, err := path.Match(r.HostGlob, ""); err != nil {
+			// path.Match validates the pattern lazily on the first match.
+			// Probe with an empty subject so a malformed pattern surfaces
+			// at config-load time instead of silently never matching at
+			// request time.
+			errs = append(errs, fmt.Errorf("rule[%d] (host_glob=%q): invalid glob: %w", i, r.HostGlob, err))
 		}
 		if len(r.Prefer) == 0 {
 			errs = append(errs, fmt.Errorf("rule[%d] (host_glob=%q): prefer must list at least one upstream id", i, r.HostGlob))
@@ -533,6 +587,15 @@ func (c *Config) Validate() error {
 				if _, ok := seenIDs[id]; !ok {
 					errs = append(errs, fmt.Errorf("rule[%d] (host_glob=%q): prefer references unknown upstream id %q", i, r.HostGlob, id))
 				}
+			}
+		}
+		for j, pat := range r.BodyRegex {
+			if pat == "" {
+				errs = append(errs, fmt.Errorf("rule[%d] (host_glob=%q): body_regex[%d] is empty", i, r.HostGlob, j))
+				continue
+			}
+			if _, err := regexp.Compile(pat); err != nil {
+				errs = append(errs, fmt.Errorf("rule[%d] (host_glob=%q): body_regex[%d] does not compile: %w", i, r.HostGlob, j, err))
 			}
 		}
 	}
@@ -579,6 +642,12 @@ func (s ScoringConfig) validate() error {
 	}
 	if s.DebounceWindow < 0 {
 		errs = append(errs, fmt.Errorf("failure.scoring.debounce_window must be >= 0, got %v", s.DebounceWindow.Duration()))
+	}
+	if s.BodyMatchPenalty < 0 {
+		errs = append(errs, fmt.Errorf("failure.scoring.body_match_penalty must be >= 0, got %v", s.BodyMatchPenalty))
+	}
+	if s.BodyMatchCooldown < 0 {
+		errs = append(errs, fmt.Errorf("failure.scoring.body_match_cooldown must be >= 0, got %v", s.BodyMatchCooldown.Duration()))
 	}
 	if s.PruneAfter < 0 {
 		errs = append(errs, fmt.Errorf("failure.scoring.prune_after must be >= 0, got %v", s.PruneAfter.Duration()))

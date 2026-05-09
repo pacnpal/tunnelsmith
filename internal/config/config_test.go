@@ -110,6 +110,9 @@ kind = "direct"
 	if cfg.Failure.MaxRetriesPerRequest != 5 {
 		t.Errorf("Failure.MaxRetriesPerRequest default = %d, want 5", cfg.Failure.MaxRetriesPerRequest)
 	}
+	if cfg.Failure.BodyBufferKB != 32 {
+		t.Errorf("Failure.BodyBufferKB default = %d, want 32", cfg.Failure.BodyBufferKB)
+	}
 	if !cfg.Failure.ConnectionRefused {
 		t.Error("Failure.ConnectionRefused default should be true")
 	}
@@ -479,6 +482,68 @@ prefer    = ["mystery"]
 			contains: `unknown upstream id "mystery"`,
 		},
 		{
+			name: "rule body_regex does not compile",
+			toml: `
+[[upstream]]
+id = "d"
+kind = "direct"
+[[rule]]
+host_glob = "*.example"
+prefer    = ["d"]
+body_regex = ["[unterminated"]
+`,
+			contains: "body_regex[0] does not compile",
+		},
+		{
+			name: "rule body_regex empty entry",
+			toml: `
+[[upstream]]
+id = "d"
+kind = "direct"
+[[rule]]
+host_glob = "*.example"
+prefer    = ["d"]
+body_regex = [""]
+`,
+			contains: "body_regex[0] is empty",
+		},
+		{
+			name: "rule host_glob malformed",
+			toml: `
+[[upstream]]
+id = "d"
+kind = "direct"
+[[rule]]
+host_glob = "[bad"
+prefer    = ["d"]
+`,
+			contains: "invalid glob",
+		},
+		{
+			name: "body_buffer_kb negative",
+			toml: `
+[failure]
+body_buffer_kb = -1
+
+[[upstream]]
+id   = "d"
+kind = "direct"
+`,
+			contains: "body_buffer_kb must be >= 0",
+		},
+		{
+			name: "body_buffer_kb above cap",
+			toml: `
+[failure]
+body_buffer_kb = 4096
+
+[[upstream]]
+id   = "d"
+kind = "direct"
+`,
+			contains: "body_buffer_kb must be <= 1024",
+		},
+		{
 			name: "rule missing host_glob",
 			toml: `
 [[upstream]]
@@ -768,6 +833,55 @@ kind = "direct"
 	if s.PruneAfter.Duration() != ScoringDefaults.PruneAfter.Duration() {
 		t.Errorf("PruneAfter default = %v, want %v", s.PruneAfter.Duration(), ScoringDefaults.PruneAfter.Duration())
 	}
+	if s.BodyMatchPenalty != ScoringDefaults.BodyMatchPenalty {
+		t.Errorf("BodyMatchPenalty default = %v, want %v", s.BodyMatchPenalty, ScoringDefaults.BodyMatchPenalty)
+	}
+	if s.BodyMatchCooldown.Duration() != ScoringDefaults.BodyMatchCooldown.Duration() {
+		t.Errorf("BodyMatchCooldown default = %v, want %v", s.BodyMatchCooldown.Duration(), ScoringDefaults.BodyMatchCooldown.Duration())
+	}
+}
+
+func TestRuleBodyRegexAndForceParse(t *testing.T) {
+	t.Parallel()
+	const src = `
+[[upstream]]
+id   = "direct"
+kind = "direct"
+
+[[upstream]]
+id   = "fallback"
+kind = "socks5"
+addr = "127.0.0.1:1080"
+
+[[rule]]
+host_glob  = "*.bbc.co.uk"
+prefer     = ["fallback"]
+force      = true
+
+[[rule]]
+host_glob  = "*.itch.io"
+prefer     = ["direct"]
+body_regex = ["content.?not.?available", "region.?lock"]
+`
+	cfg, err := Parse([]byte(src), "rule-body.toml")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := len(cfg.Rules); got != 2 {
+		t.Fatalf("len(Rules) = %d, want 2", got)
+	}
+	if !cfg.Rules[0].Force {
+		t.Error("Rules[0].Force = false, want true")
+	}
+	if got := len(cfg.Rules[0].BodyRegex); got != 0 {
+		t.Errorf("Rules[0].BodyRegex len = %d, want 0", got)
+	}
+	if got := len(cfg.Rules[1].BodyRegex); got != 2 {
+		t.Fatalf("Rules[1].BodyRegex len = %d, want 2", got)
+	}
+	if cfg.Rules[1].Force {
+		t.Error("Rules[1].Force = true, want false (default)")
+	}
 }
 
 func TestScoringPartialOverridePreservesOtherDefaults(t *testing.T) {
@@ -910,6 +1024,30 @@ id   = "d"
 kind = "direct"
 `,
 			contains: "prune_after must be >= 0",
+		},
+		{
+			name: "negative body_match_penalty",
+			toml: `
+[failure.scoring]
+body_match_penalty = -2
+
+[[upstream]]
+id   = "d"
+kind = "direct"
+`,
+			contains: "body_match_penalty must be >= 0",
+		},
+		{
+			name: "negative body_match_cooldown",
+			toml: `
+[failure.scoring]
+body_match_cooldown = "-30s"
+
+[[upstream]]
+id   = "d"
+kind = "direct"
+`,
+			contains: "body_match_cooldown must be >= 0",
 		},
 	}
 	for _, tc := range cases {

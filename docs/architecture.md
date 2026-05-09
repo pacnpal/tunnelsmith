@@ -61,7 +61,7 @@ Three things to notice:
 
 `RecordFailure(host, upstream_id, kind, cooldown_override)` looks up the kind's policy (penalty + cooldown), subtracts penalty from score (clamped at `-score_cap`), bumps `cooldown_until` to `now + cooldown`, sets `last_seen`, and increments `global_failure_count`. `cooldown_override` is `*time.Duration`: `nil` means use the kind's default cooldown, non-nil overrides it verbatim including a literal zero. The pointer shape exists so the listener can honor `Retry-After: 0` (a legal RFC 7231 §7.1.3 value meaning "retry immediately") without it being indistinguishable from "header absent".
 
-Phase 4 fires only `KindRefused` and `KindTimeout` from the dial path with a nil override. Phase 5 fires `KindRateLimit`, `KindForbidden`, and `KindLegalBlock` from the plain-HTTP listener: when the response status matches a configured `[[failure.status]]` rule, the listener calls `RecordFailure` with the matching kind plus the detector's `CooldownOverride` (non-nil when the rule honors `Retry-After` and the header parsed) and rotates to the next upstream within the same retry budget. `KindBodyMatch` stays unwired until Phase 8.
+Phase 4 fires only `KindRefused` and `KindTimeout` from the dial path with a nil override. Phase 5 fires `KindRateLimit`, `KindForbidden`, and `KindLegalBlock` from the plain-HTTP listener: when the response status matches a configured `[[failure.status]]` rule, the listener calls `RecordFailure` with the matching kind plus the detector's `CooldownOverride` (non-nil when the rule honors `Retry-After` and the header parsed) and rotates to the next upstream within the same retry budget. Phase 8 fires `KindBodyMatch` from the same listener: when a `[[rule]]` matches the host and one of its compiled `body_regex` patterns matches the buffered response prefix, the listener records `KindBodyMatch` and rotates the request to the next upstream.
 
 ## Failure debounce
 
@@ -112,10 +112,19 @@ Status detection is on the listener side, not the scoreboard side. `internal/fai
 
 CONNECT and SOCKS5 paths skip steps 4 and 5 entirely - the listener cannot inspect a TLS tunnel or a SOCKS byte stream. They use `Scoreboard.DialFor` directly, which runs the dial-only loop.
 
+## Per-host rules
+
+A `[[rule]]` block applies a host-glob filter on top of the score-based pick. Rules compile into a `RuleSet` at startup; the scoreboard looks the rule up on every Pick. Two flags shape the routing:
+
+- `force = true` narrows the candidate set to ids in `prefer` before scoring runs. Cooldown-fallback also stays inside the prefer set, so a forced rule whose preferred upstreams are all in tried produces `ErrPoolExhausted` (and a forced cascade) rather than touching unrelated upstreams.
+- `force = false` (default) keeps the full candidate set but adds a `preferRank` tiebreak that wins over score and base priority. Preferred upstreams sort to the top in declaration order; non-preferred candidates fall in behind by the existing `(score desc, base_priority asc)` rule.
+
+Body-regex inspection is separately gated by `failure.body_buffer_kb` and runs only on plain-HTTP responses (CONNECT and SOCKS5 traffic carries TLS the proxy cannot read). The listener feeds compiled patterns through `internal/failure.BufferAndDecide`, which reads up to the configured cap, runs each pattern, and returns either a match decision or a replay reader that streams the buffered prefix plus rest to the client. Encoded bodies (`Content-Encoding != identity`) skip inspection.
+
+The RuleSet is hot-reloadable: `Scoreboard.ReplaceRules` and `HTTPServer.ReloadRules` install the same compiled set sequentially, each under its own component's write lock. Both calls take their write lock for the swap, so a request reading either component's pointer sees one self-consistent rule set, never a half-written state. Across components the swap is sequential, not atomic: a request mid-reload may briefly observe the new rules in one component and the old in the other (for example, the listener could route through the old prefer set while inspecting bodies with the new patterns). The window is short and bounded; routing decisions converge on the next request once both swaps complete.
+
 ## What is not here yet
 
-- Body-regex detection (Phase 8).
-- Per-host rules (`[[rule]]`) for `force` and `prefer` overrides (Phase 8).
 - Scoreboard persistence to disk (Phase 7).
 - Prometheus metrics (Phase 7; `Snapshot` is the data source).
 - Web UI (Phase 9).

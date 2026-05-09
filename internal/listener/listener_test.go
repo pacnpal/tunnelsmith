@@ -38,6 +38,7 @@ func scoreboardFor(t *testing.T, pool *upstream.Pool) *scoreboard.Scoreboard {
 			failure.KindRateLimit:  {Penalty: 4, Cooldown: 120 * time.Second},
 			failure.KindForbidden:  {Penalty: 6, Cooldown: 30 * time.Minute},
 			failure.KindLegalBlock: {Penalty: 8, Cooldown: 6 * time.Hour},
+			failure.KindBodyMatch:  {Penalty: 5, Cooldown: 60 * time.Second},
 		},
 		SuccessWeight:  1,
 		ScoreCap:       10,

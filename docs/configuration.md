@@ -113,7 +113,8 @@ Failure-detection settings. The signals are wired to scoring in Phase 4 onward.
 |------------------------------|------------------|---------------|-------|
 | `connection_refused`         | bool             | `true`        | always on for Phase 1; opt-out lands in Phase 5 |
 | `timeout_ms`                 | int (ms)         | `8000`        | per-attempt timeout; must be > 0 |
-| `body_regex`                 | array of strings | `[]`          | response-body patterns that count as failure (Phase 8 wires this) |
+| `body_regex`                 | array of strings | `[]`          | deprecated in Phase 8; the parser still accepts the field but the runtime ignores it. Move patterns into `[[rule]].body_regex` instead. A non-empty value at startup triggers a one-line warning |
+| `body_buffer_kb`             | int              | `32`          | per-response cap (in KiB) on the body prefix the listener buffers for `[[rule]].body_regex` matching. Must be >= 0 and <= 1024. Set to `0` to disable body inspection regardless of any `[[rule]].body_regex` entries; SIGHUP applies the new value live |
 | `max_retries_per_request`    | int              | `5`           | retry cap per incoming request; must be >= 1 |
 | `status` (`[[failure.status]]`) | array of tables | see below | per-status-code rules |
 
@@ -155,21 +156,61 @@ Knobs for the per-(host, upstream) scoreboard introduced in Phase 4. Sensible de
 | `decay_step`       | float    | `0.5`   | absolute amount each entry's score moves toward zero per tick |
 | `cascade_ttl`      | duration | `30s`   | negative TTL for a host where every upstream just failed; subsequent requests within the TTL get an immediate cascade error without burning through the pool |
 | `debounce_window`  | duration | `100ms` | identical `(host, upstream, kind)` failures arriving within this window collapse into one penalty event |
+| `body_match_penalty`  | float   | `5`     | score subtracted on `KindBodyMatch`. Phase 8 fires this when a `[[rule]].body_regex` matches the buffered response prefix |
+| `body_match_cooldown` | duration | `60s`  | cooldown applied to the `(host, upstream)` after a body-regex match |
 | `prune_after`      | duration | `24h`   | the persistence-tick prune pass drops entries with `score == 0` and `lastSeen` older than this; `0s` disables entry pruning (cascade and debounce eviction still run) |
 
 The rate-limit, forbidden, and legal-block kinds get their penalty and cooldown from `[[failure.status]]` entries. Phase 5 wires them through the plain-HTTP listener: when a 429, 403, or 451 lands, the listener records a failure of the matching kind and rotates to the next upstream within the same request, up to `failure.max_retries_per_request`. Body-match policy lands in Phase 8.
 
 ## `[[rule]]`
 
-Optional per-host overrides. Phase 8 enables them in the router; Phase 1 just validates them.
+Optional per-host overrides. Phase 8 wires the routing semantics and the
+body-regex inspector through the live request path.
 
 | key         | type             | default | notes |
 |-------------|------------------|---------|-------|
-| `host_glob` | string           | none    | required; `path.Match` semantics, so `*.bbc.co.uk` matches `news.bbc.co.uk` |
-| `prefer`    | array of strings | none    | required; references upstream IDs in priority order |
-| `force`     | bool             | `false` | when true, never fall back to upstreams not in `prefer` |
+| `host_glob` | string           | none    | required; `path.Match` semantics over the lowercased host. `*.bbc.co.uk` matches `news.bbc.co.uk` and `a.b.bbc.co.uk` (`*` is multi-segment because path.Match's separator is `/`, which never appears in a host). Match is case-insensitive |
+| `prefer`    | array of strings | none    | required; references upstream IDs in declaration order |
+| `force`     | bool             | `false` | when true, the router never falls back to upstreams outside `prefer`. Forced cascade fires when every preferred upstream has been tried |
+| `body_regex` | array of strings | `[]`   | response-body patterns that flag the response as a soft block when matched. Each pattern is compiled as a Go regexp at startup; an invalid pattern fails the load |
 
-Every id in `prefer` must match an `id` from a defined `[[upstream]]`.
+Every id in `prefer` must match an `id` from a defined `[[upstream]]`. When
+the running config also has an `[[upstream_pool]]` block, prefer ids are
+checked at startup against the merged set (after pool expansion). The
+SIGHUP reloader re-runs the same check before swapping rule state in.
+
+Rules are evaluated in declaration order. The first rule whose
+`host_glob` matches the request host wins; subsequent rules are ignored
+for that host. Place specific globs (`*.news.bbc.co.uk`) above broader
+ones (`*.bbc.co.uk`) when you want a tighter override.
+
+### Body-regex semantics
+
+Body inspection runs only on the plain-HTTP forward-proxy path. CONNECT
+and SOCKS5 traffic carries TLS payloads the proxy cannot decrypt; both
+paths skip inspection regardless of any matching rule. The listener's
+behavior on a plain-HTTP response when the matched rule has compiled
+patterns:
+
+1. Read the response body up to `failure.body_buffer_kb` KiB. Bodies
+   larger than the cap are inspected on the prefix only; bytes past the
+   cap are streamed to the client without ever being matched.
+2. If `Content-Encoding` is set to anything other than empty or
+   `identity` (gzip, br, deflate, ...), inspection is skipped: the
+   regex would run against compressed bytes that mean nothing in their
+   raw form. The body still reaches the client unchanged.
+3. If any pattern matches, the listener treats the response as a
+   `KindBodyMatch` failure: the upstream is penalized per
+   `failure.scoring.body_match_*`, the response body is drained, the
+   upstream id is added to `tried`, and the request retries through
+   the next-best upstream.
+4. If no pattern matches (or inspection was skipped), the listener
+   stitches the buffered prefix back in front of the rest of the body
+   so the client sees a byte-for-byte copy of the upstream response.
+
+A failed body read mid-inspection (TCP reset, etc.) is logged but does
+not record a per-kind failure: the upstream may still be healthy and
+the request rotates to the next upstream without an explicit penalty.
 
 ## CONNECT and SOCKS5: what status detection cannot see
 
@@ -182,9 +223,7 @@ The same caveat applies to header injection, with the precise rule:
 - Listener-generated errors that do not even reach the dial loop (e.g. the 400 for a non-absolute or non-http(s) URL) carry no Tunnelsmith headers at all.
 - CONNECT and SOCKS5 paths inject nothing, because Tunnelsmith does not own the response framing on those paths.
 
-Practical consequence: a client that issues an HTTPS request through Tunnelsmith via CONNECT goes through the dial-loop part of the scoreboard (refused, timeout) but not the status part. If you want a host's HTTP and HTTPS traffic to share rate-limit cycling, send the HTTP traffic as a forward-proxy request (no CONNECT) and the HTTPS traffic via CONNECT to a destination that returns 429 over TLS - the HTTP side will rotate exits, the HTTPS side will not, until Phase 8 ships the body-regex hook for response-side inspection.
-
-Body-regex detection in Phase 8 will share this constraint: it can read response bodies on the plain-HTTP path only.
+Practical consequence: a client that issues an HTTPS request through Tunnelsmith via CONNECT goes through the dial-loop part of the scoreboard (refused, timeout) but not the status or body parts. Phase 8's `[[rule]].body_regex` shares the same constraint: body inspection only runs on plain-HTTP forward-proxy responses, and only when `Content-Encoding` is empty or `identity` (the inspector skips gzip/br/deflate bodies because matching against compressed bytes would never produce a useful signal).
 
 ## Hot-reload
 
@@ -193,9 +232,9 @@ Sending `SIGHUP` to the running Tunnelsmith process re-reads the config file fro
 What hot-reload changes in place:
 
 - `[[upstream]]` list (rebuilds the priority pool, swaps it into the scoreboard, drops cached transports for upstreams that disappeared)
-- `[failure]` retry cap and `[[failure.status]]` rules
-- `[failure.scoring]` penalty weights, cooldowns, probe chance, cascade TTL, debounce window, prune-after
-- `[[rule]]` block list (parsed and stored; Phase 8 will apply them)
+- `[failure]` retry cap, `[[failure.status]]` rules, and `body_buffer_kb`
+- `[failure.scoring]` penalty weights, cooldowns, probe chance, cascade TTL, debounce window, body-match knobs, prune-after
+- `[[rule]]` block list (compiled at reload time and installed on both the scoreboard and the listener; a malformed pattern or unknown prefer id leaves the previous rule set live). The two installs run sequentially under each component's own write lock, so a request mid-reload may briefly see the new rules in one component and the old in the other; the request still completes against a coherent snapshot of whichever rule set each component holds
 
 What hot-reload does NOT change (restart required):
 

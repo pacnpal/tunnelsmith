@@ -43,9 +43,11 @@ type HTTPServer struct {
 	// runtime is the slice of knobs SIGHUP hot-reload can swap in place.
 	// Guarded by runtimeMu so the request path's reads stay consistent
 	// with concurrent Reload calls.
-	runtimeMu sync.RWMutex
-	detector  *failure.StatusDetector
-	retryCap  int
+	runtimeMu       sync.RWMutex
+	detector        *failure.StatusDetector
+	retryCap        int
+	rules           *upstream.RuleSet
+	bodyBufferBytes int
 
 	server *http.Server
 
@@ -78,6 +80,33 @@ type HTTPOption func(*HTTPServer)
 func WithHTTPMetrics(m MetricsSink) HTTPOption {
 	return func(h *HTTPServer) {
 		h.metrics = m
+	}
+}
+
+// WithHTTPRules attaches the per-host RuleSet the listener consults
+// for body-regex inspection. The same set lives behind the scoreboard
+// for routing; the listener reference lets handleForward decide
+// whether to buffer a response body without reaching across packages.
+// Pass nil to disable body inspection.
+func WithHTTPRules(rs *upstream.RuleSet) HTTPOption {
+	return func(h *HTTPServer) {
+		h.rules = rs
+	}
+}
+
+// WithHTTPBodyBufferKB sets the per-response cap on bytes the
+// inspector buffers for regex matching. Values <= 0 are treated as
+// "disabled"; the listener will skip body inspection and stream every
+// response straight through. The bare HTTPServer constructor leaves
+// bodyBufferBytes at zero (inspection disabled); cmd/tunnelsmith
+// always passes FailureConfig.BodyBufferKB through this option, and
+// FailureConfig.BodyBufferKB defaults to 32.
+func WithHTTPBodyBufferKB(kb int) HTTPOption {
+	return func(h *HTTPServer) {
+		if kb < 0 {
+			kb = 0
+		}
+		h.bodyBufferBytes = kb * 1024
 	}
 }
 
@@ -138,6 +167,18 @@ func (h *HTTPServer) currentRetryCap() int {
 	return h.retryCap
 }
 
+// currentInspectionConfig returns the live rule set and the body
+// buffer cap together under a single RLock so a request reads a
+// coherent snapshot. Without the combined read, two separate Lock
+// acquisitions could interleave with a SIGHUP-driven ReloadRules /
+// ReloadBodyBufferKB pair and produce a mixed view (new rules with
+// the old cap, or vice versa) within a single request.
+func (h *HTTPServer) currentInspectionConfig() (*upstream.RuleSet, int) {
+	h.runtimeMu.RLock()
+	defer h.runtimeMu.RUnlock()
+	return h.rules, h.bodyBufferBytes
+}
+
 // Reload swaps the live detector and retry cap. Called from the SIGHUP
 // hot-reload path. Invalid retryCap values (< 1) are ignored with a
 // log line so a misconfigured reload does not zero out the cap.
@@ -156,6 +197,28 @@ func (h *HTTPServer) Reload(detector *failure.StatusDetector, retryCap int) {
 	h.retryCap = retryCap
 	h.runtimeMu.Unlock()
 	h.logger.Info("http listener reloaded", "retry_cap", retryCap)
+}
+
+// ReloadRules swaps the per-host rule set in place. Pass nil to
+// clear all rules. The runtimeMu guard mirrors Reload's, so a request
+// path mid-Pick sees one coherent rule set or the other.
+func (h *HTTPServer) ReloadRules(rs *upstream.RuleSet) {
+	h.runtimeMu.Lock()
+	h.rules = rs
+	h.runtimeMu.Unlock()
+	h.logger.Info("http listener rules reloaded", "rule_count", rs.Len())
+}
+
+// ReloadBodyBufferKB swaps the per-response body buffer cap. Zero or
+// negative values turn body inspection off entirely.
+func (h *HTTPServer) ReloadBodyBufferKB(kb int) {
+	if kb < 0 {
+		kb = 0
+	}
+	h.runtimeMu.Lock()
+	h.bodyBufferBytes = kb * 1024
+	h.runtimeMu.Unlock()
+	h.logger.Info("http listener body buffer reloaded", "body_buffer_kb", kb)
 }
 
 // CloseTransportsExcept closes idle conns and drops cached transports for
@@ -446,6 +509,29 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 	retryCap := h.currentRetryCap()
 	detector := h.currentDetector()
 	tried := make(map[string]bool, retryCap)
+	// Resolve the rule and the body-inspect knobs once per request:
+	// the destination host is constant across retry attempts, the
+	// rule pointer is stable for the duration of the request (Reload
+	// installs a new pointer atomically), and re-resolving on every
+	// retry would just hand back the same rule pointer.
+	//
+	// Read both knobs under a single RLock via
+	// currentInspectionConfig so a concurrent ReloadRules /
+	// ReloadBodyBufferKB pair cannot interleave between the two
+	// reads and hand this request a mixed snapshot (new rules with
+	// the old buffer cap, or vice versa).
+	//
+	// rule.Patterns() returns the precomputed []failure.Pattern slice
+	// the rule built once at compile time, so the request path does
+	// no per-request allocation or interface boxing for body
+	// inspection. nil here (no matching rule, no body_regex on the
+	// matching rule, or buffer cap == 0) skips the inspector entirely.
+	liveRules, bodyBufferBytes := h.currentInspectionConfig()
+	rule := liveRules.Match(host)
+	var bodyPatterns []failure.Pattern
+	if bodyBufferBytes > 0 {
+		bodyPatterns = rule.Patterns()
+	}
 	var (
 		retries        int
 		cascadeAlready bool
@@ -563,6 +649,70 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 				"attempt", attempt+1,
 			)
 			continue
+		}
+
+		// Phase 8: response-body inspection. Skip the call entirely
+		// when bodyPatterns is nil (no rule matched the host, no
+		// patterns on the matching rule, or the buffer cap is 0).
+		// Status-code detection ran above and any flagged failure
+		// already continued past this block, so the responses that
+		// reach here are anything the detector did NOT flag: 2xx and
+		// 3xx, plus any 4xx/5xx the operator did not configure as a
+		// status failure. The headline use case is the 200 soft-block
+		// page (geo-block / "not available in your region"), but the
+		// inspector itself is status-agnostic by design - users who
+		// want a tighter scope can constrain via host_glob.
+		// failure.BufferAndDecide handles the encoded-body skip, the
+		// limit, and the replay reader so the listener stays simple.
+		if len(bodyPatterns) > 0 {
+			dec, bdErr := failure.BufferAndDecide(resp.Body, resp.Header.Get("Content-Encoding"), bodyBufferBytes, bodyPatterns)
+			if bdErr != nil {
+				// Read failed mid-body. The dial succeeded (we
+				// already have a non-nil resp), so dial_attempts
+				// stays "success" to match the status-failure and
+				// body-match paths below; the body-read failure
+				// rides on the structured log line so observability
+				// keeps a record without misattributing the failure
+				// to the dial outcome. The upstream's TCP path is
+				// suspect but not necessarily broken; rotating to
+				// the next upstream is the right move, but pinning a
+				// penalty on this kind of transient is not, so we
+				// skip RecordFailure and just rotate.
+				h.logger.Warn("forward body inspect failed",
+					"host", host,
+					"upstream_id", up.ID(),
+					"attempt", attempt+1,
+					"err", bdErr,
+				)
+				h.observeForwardDial(up.ID(), "success", latency)
+				tried[up.ID()] = true
+				retries++
+				continue
+			}
+			if dec.Matched {
+				h.sb.RecordFailure(host, up.ID(), failure.KindBodyMatch, nil)
+				// dial_attempts_total: the dial succeeded and the
+				// response started, so this still counts as a
+				// successful dial outcome. The body-match dimension
+				// rides on the structured log line below.
+				h.observeForwardDial(up.ID(), "success", latency)
+				drainAndClose(dec.Replay)
+				tried[up.ID()] = true
+				retries++
+				h.logger.Warn("forward body match",
+					"host", host,
+					"upstream_id", up.ID(),
+					"pattern", dec.Pattern,
+					"latency_ms", latency.Milliseconds(),
+					"attempt", attempt+1,
+				)
+				continue
+			}
+			// No match (or skipped due to encoding). Replace resp.Body
+			// with the replay reader so writeForwardSuccess streams the
+			// already-buffered prefix plus rest to the client without
+			// dropping a byte.
+			resp.Body = dec.Replay
 		}
 
 		h.sb.RecordSuccess(host, up.ID(), latency)
