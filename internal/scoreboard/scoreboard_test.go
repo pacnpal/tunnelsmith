@@ -142,6 +142,11 @@ func buildScoreboard(t *testing.T, ups []*fakeUpstream, cfg scoreboard.Config, c
 	if cfg.DebounceWindow == 0 {
 		cfg.DebounceWindow = 100 * time.Millisecond
 	}
+	// Default ConnectionRefused to true to match the production default
+	// ([failure].connection_refused defaults to true). Tests that want to
+	// exercise the gate-off path must build the scoreboard directly; they
+	// cannot reclaim false via Config{} because false is the zero value.
+	cfg.ConnectionRefused = true
 	r := rand.New(rand.NewSource(seed))
 	sb, err := scoreboard.New(pool, cfg,
 		scoreboard.WithLogger(quietLogger()),
@@ -704,4 +709,66 @@ func TestSnapshotIsStable(t *testing.T) {
 	if snaps[0].Host != "hostA" || snaps[1].Host != "hostB" {
 		t.Errorf("hosts = %s, %s; want hostA, hostB", snaps[0].Host, snaps[1].Host)
 	}
+}
+
+// TestConnectionRefusedGate pins the connection_refused = false behaviour:
+// when the gate is disabled, a dial that returns ECONNREFUSED must leave the
+// upstream's score and cooldown unchanged. The dial still fails (the
+// connection was refused), but the scoreboard must not penalise the upstream.
+func TestConnectionRefusedGate(t *testing.T) {
+	t.Parallel()
+
+	refused := alwaysRefused("refused")
+	clock := newManualClock(time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC))
+
+	// Build the scoreboard directly (not via buildScoreboard) so we can set
+	// ConnectionRefused = false. buildScoreboard always defaults the field to
+	// true to match the production default; false is the zero value of bool so
+	// it cannot be round-tripped through the helper's zero-check defaulting.
+	entries := []upstream.PoolEntry{{Up: refused, Priority: 10}}
+	pool, err := upstream.NewPool(entries, 1, quietLogger())
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	cfg := scoreboard.Config{
+		ConnectionRefused: false,
+		KindPolicy: map[failure.Kind]scoreboard.Policy{
+			failure.KindRefused: {Penalty: 3, Cooldown: 30 * time.Second},
+			failure.KindTimeout: {Penalty: 2, Cooldown: 15 * time.Second},
+		},
+		SuccessWeight:  1,
+		ScoreCap:       10,
+		DecayInterval:  5 * time.Minute,
+		CascadeTTL:     30 * time.Second,
+		DebounceWindow: 100 * time.Millisecond,
+	}
+	r := rand.New(rand.NewSource(1))
+	sb, err := scoreboard.New(pool, cfg,
+		scoreboard.WithLogger(quietLogger()),
+		scoreboard.WithClock(clock.Now),
+		scoreboard.WithRand(r),
+	)
+	if err != nil {
+		t.Fatalf("scoreboard.New: %v", err)
+	}
+	defer sb.Stop()
+
+	_, err = dialOnce(t, sb, "example.com:443")
+	if err == nil {
+		t.Fatal("DialFor returned nil error; expected refused connection to fail")
+	}
+
+	snap := snapshotByID(sb, "example.com")
+	if e, ok := snap["refused"]; ok {
+		// Score must not have been penalised: should be >= 0.
+		if e.Score < 0 {
+			t.Errorf("upstream score = %v, want >= 0 (connection_refused = false must skip penalty)", e.Score)
+		}
+		// Cooldown must not have been set.
+		if !e.CooldownUntil.IsZero() {
+			t.Errorf("upstream cooldownUntil = %v, want zero (connection_refused = false must skip cooldown)", e.CooldownUntil)
+		}
+	}
+	// No entry at all is also acceptable: it means RecordFailure was skipped
+	// entirely and the upstream was never touched by the scoring path.
 }

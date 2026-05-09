@@ -47,6 +47,12 @@ type Policy struct {
 // Config is the runtime tuning the scoreboard reads at construction. Build
 // it from a config.ScoringConfig via FromConfig, or hand-roll it in tests.
 type Config struct {
+	// ConnectionRefused, when false, disables scoring for KindRefused.
+	// Dial failures classified as KindRefused are still logged and counted
+	// in metrics, but RecordFailure is skipped so the upstream's score and
+	// cooldown are not affected. Defaults to true (scoring on).
+	ConnectionRefused bool
+
 	// KindPolicy maps each failure.Kind the listener can report to its
 	// penalty and cooldown. Missing kinds are treated as zero policy
 	// (no penalty, no cooldown), which is the right thing for kinds that
@@ -89,12 +95,13 @@ type Config struct {
 }
 
 // FromConfig builds a scoreboard Config from the parsed [failure.scoring]
-// section plus the [[failure.status]] entries. Phase 4 fires refused and
-// timeout from the dial path; Phase 5 wires the status-rule kinds; Phase 8
-// fires KindBodyMatch from the listener's response-body inspector. The
-// kind→policy table is complete at construction so a missing kind never
-// records a penalty silently.
-func FromConfig(s config.ScoringConfig, status []config.StatusRule) Config {
+// section plus the [[failure.status]] entries. connectionRefused mirrors the
+// [failure].connection_refused key: false disables KindRefused scoring.
+// Phase 4 fires refused and timeout from the dial path; Phase 5 wires the
+// status-rule kinds; Phase 8 fires KindBodyMatch from the listener's
+// response-body inspector. The kind→policy table is complete at construction
+// so a missing kind never records a penalty silently.
+func FromConfig(s config.ScoringConfig, status []config.StatusRule, connectionRefused bool) Config {
 	policy := map[failure.Kind]Policy{
 		failure.KindRefused: {
 			Penalty:  s.RefusedPenalty,
@@ -129,7 +136,8 @@ func FromConfig(s config.ScoringConfig, status []config.StatusRule) Config {
 		}
 	}
 	return Config{
-		KindPolicy:     policy,
+		ConnectionRefused: connectionRefused,
+		KindPolicy:        policy,
 		SuccessWeight:  s.SuccessWeight,
 		ScoreCap:       s.ScoreCap,
 		ProbeChance:    s.ProbeChance,
@@ -941,7 +949,8 @@ func (s *Scoreboard) DialFor(ctx context.Context, network, addr string) (net.Con
 			return nil, "", errors.Join(attemptErrs...)
 		}
 		kind := failure.ClassifyDialError(dialErr)
-		if kind != "" {
+		cfg := s.configSnapshot()
+		if kind != "" && (kind != failure.KindRefused || cfg.ConnectionRefused) {
 			s.RecordFailure(host, up.ID(), kind, nil)
 		}
 		s.observeDialFailure(up.ID(), kind, latency)
