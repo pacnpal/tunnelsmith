@@ -60,44 +60,54 @@ jobs:
             DATE=${{ github.event.head_commit.timestamp }}
 
       # Per ADR-005, release-image verification runs in CI rather than on
-      # the host. Pull the freshly pushed tag, run --version inside it, and
-      # confirm the manifest index carries both architectures the build
-      # step asked for. If `:latest` was also pushed (default-branch tag),
-      # confirm its index digest matches the version tag's. Any failure
-      # here aborts the release before the GitHub release is created, so
-      # a broken image cannot reach v* tags.
+      # the host. Pull the freshly pushed image, run --version inside it,
+      # and confirm the manifest index carries both architectures the
+      # build step asked for. If `:latest` was also pushed
+      # (default-branch tag), confirm its index digest matches the
+      # version tag's. Any failure here aborts the release before the
+      # GitHub release is created, so a broken image cannot reach v*
+      # tags.
+      #
+      # PULL_TAG vs GIT_REF: metadata-action's `type=semver,pattern={{version}}`
+      # strips the leading `v`, so a push of git tag `v1.0.0` produces
+      # image tag `1.0.0`. The pull and digest checks therefore use
+      # `steps.meta.outputs.version` (the canonical resolved version,
+      # e.g. `1.0.0`). The binary's --version output, on the other hand,
+      # is built with `VERSION=${{ github.ref_name }}` and so contains
+      # the v-prefixed git ref. The substring check anchors on that.
       - name: verify pushed image runs and is multi-arch
         env:
-          VERSION_TAG: ${{ github.ref_name }}
+          PULL_TAG: ${{ steps.meta.outputs.version }}
+          GIT_REF: ${{ github.ref_name }}
           IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
         run: |
           set -euo pipefail
-          echo "verifying ${IMAGE}:${VERSION_TAG}"
-          docker pull "${IMAGE}:${VERSION_TAG}"
-          out="$(docker run --rm "${IMAGE}:${VERSION_TAG}" --version)"
+          echo "verifying ${IMAGE}:${PULL_TAG} (git ref: ${GIT_REF})"
+          docker pull "${IMAGE}:${PULL_TAG}"
+          out="$(docker run --rm "${IMAGE}:${PULL_TAG}" --version)"
           echo "image --version: ${out}"
           case "${out}" in
-            *"${VERSION_TAG}"*) ;;
+            *"${GIT_REF}"*) ;;
             *)
-              echo "image --version output does not contain tag ${VERSION_TAG}" >&2
+              echo "image --version output does not contain git ref ${GIT_REF}" >&2
               exit 1
               ;;
           esac
-          docker manifest inspect "${IMAGE}:${VERSION_TAG}" | jq -e '
+          docker manifest inspect "${IMAGE}:${PULL_TAG}" | jq -e '
             (.manifests | map(.platform.architecture) | sort) == ["amd64","arm64"]
             and (.manifests | map(.platform.os)         | unique) == ["linux"]
           ' > /dev/null
           echo "multi-arch manifest verified: linux/amd64 + linux/arm64"
-          version_digest="$(docker buildx imagetools inspect --format '{{json .Manifest}}' "${IMAGE}:${VERSION_TAG}" | jq -r '.digest')"
-          echo "${VERSION_TAG} index digest: ${version_digest}"
+          version_digest="$(docker buildx imagetools inspect --format '{{json .Manifest}}' "${IMAGE}:${PULL_TAG}" | jq -r '.digest')"
+          echo "${PULL_TAG} index digest: ${version_digest}"
           if docker buildx imagetools inspect "${IMAGE}:latest" > /dev/null 2>&1; then
             latest_digest="$(docker buildx imagetools inspect --format '{{json .Manifest}}' "${IMAGE}:latest" | jq -r '.digest')"
             echo ":latest index digest:    ${latest_digest}"
             if [ "${version_digest}" != "${latest_digest}" ]; then
-              echo ":latest index digest does not match ${VERSION_TAG}" >&2
+              echo ":latest index digest does not match ${PULL_TAG}" >&2
               exit 1
             fi
-            echo ":latest matches ${VERSION_TAG}"
+            echo ":latest matches ${PULL_TAG}"
           else
             echo "::notice::no :latest tag in registry; metadata-action did not emit latest for this push"
           fi
