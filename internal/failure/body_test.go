@@ -199,6 +199,30 @@ func (c *chunkedReader) Read(p []byte) (int, error) {
 }
 func (c *chunkedReader) Close() error { return nil }
 
+func TestReplayReadAfterCloseReturnsErrClosedPipe(t *testing.T) {
+	t.Parallel()
+	body := io.NopCloser(strings.NewReader("ordinary content with no patterns to match"))
+	pats := mustPatterns(t, "no.match.here")
+	dec, err := BufferAndDecide(body, "", 256, pats)
+	if err != nil {
+		t.Fatalf("BufferAndDecide: %v", err)
+	}
+	if dec.Matched {
+		t.Fatal("Matched = true on benign body")
+	}
+	if err := dec.Replay.Close(); err != nil {
+		t.Fatalf("Replay close: %v", err)
+	}
+	buf := make([]byte, 8)
+	n, err := dec.Replay.Read(buf)
+	if !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("Read after Close err = %v, want io.ErrClosedPipe", err)
+	}
+	if n != 0 {
+		t.Errorf("Read after Close returned %d bytes, want 0", n)
+	}
+}
+
 func TestBufferAndDecideHandlesChunkedReads(t *testing.T) {
 	t.Parallel()
 	body := &chunkedReader{data: []byte("region locked content here")}

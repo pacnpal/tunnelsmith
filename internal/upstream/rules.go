@@ -38,15 +38,19 @@ import (
 )
 
 // Rule is one compiled [[rule]] block. Glob is the lowercased host
-// pattern in path.Match form; Prefer is the user's ordered upstream id
-// list; Force toggles the strict-membership behavior described in the
-// package doc; BodyRegex is the compiled set of patterns that fire
-// KindBodyMatch on a positive match.
+// pattern in path.Match form; Prefer is the user's ordered upstream
+// id list; PreferRank is a derived map[id]position lookup (1-based
+// so 0 cleanly means "not in this rule's prefer list") so the
+// scoreboard's Pick can read O(1) ranks without rebuilding the map
+// per request; Force toggles the strict-membership behavior described
+// in the package doc; BodyRegex is the compiled set of patterns that
+// fire KindBodyMatch on a positive match.
 type Rule struct {
-	Glob      string
-	Prefer    []string
-	Force     bool
-	BodyRegex []*regexp.Regexp
+	Glob       string
+	Prefer     []string
+	PreferRank map[string]int
+	Force      bool
+	BodyRegex  []*regexp.Regexp
 }
 
 // HasBodyRegex reports whether this rule asked the listener to buffer
@@ -122,13 +126,24 @@ func NewRuleSet(cfgs []config.RuleConfig) (*RuleSet, error) {
 			compiled = append(compiled, re)
 		}
 		// Copy Prefer so caller mutations to the source slice cannot
-		// race with request-path readers later.
+		// race with request-path readers later. Pre-build the
+		// PreferRank lookup at compile time: positions are 1-based so
+		// the zero value of an int (returned by a missing-key lookup)
+		// cleanly means "not in this rule's prefer list".
 		prefer := append([]string(nil), c.Prefer...)
+		preferRank := make(map[string]int, len(prefer))
+		for j, id := range prefer {
+			if _, dup := preferRank[id]; dup {
+				continue
+			}
+			preferRank[id] = j + 1
+		}
 		out.rules = append(out.rules, &Rule{
-			Glob:      strings.ToLower(c.HostGlob),
-			Prefer:    prefer,
-			Force:     c.Force,
-			BodyRegex: compiled,
+			Glob:       strings.ToLower(c.HostGlob),
+			Prefer:     prefer,
+			PreferRank: preferRank,
+			Force:      c.Force,
+			BodyRegex:  compiled,
 		})
 	}
 	return out, nil

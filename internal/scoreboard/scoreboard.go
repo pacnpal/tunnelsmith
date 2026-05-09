@@ -568,17 +568,13 @@ func (s *Scoreboard) Pick(host string, tried map[string]bool) (upstream.Upstream
 		return nil, ErrPoolExhausted
 	}
 
-	// Build the prefer-rank lookup once per Pick. Position is 1-based
-	// so 0 stays "not preferred" and the smallest non-zero value wins.
+	// Read the prefer-rank lookup directly from the compiled rule.
+	// NewRuleSet pre-builds it once at compile time; Pick stays
+	// allocation-free for the rule path. Position is 1-based so 0
+	// stays "not preferred" and the smallest non-zero value wins.
 	var preferRank map[string]int
-	if rule != nil && len(rule.Prefer) > 0 {
-		preferRank = make(map[string]int, len(rule.Prefer))
-		for i, id := range rule.Prefer {
-			if _, dup := preferRank[id]; dup {
-				continue
-			}
-			preferRank[id] = i + 1
-		}
+	if rule != nil {
+		preferRank = rule.PreferRank
 	}
 
 	pool := make([]ranked, 0, len(candidates))

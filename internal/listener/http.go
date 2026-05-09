@@ -97,8 +97,10 @@ func WithHTTPRules(rs *upstream.RuleSet) HTTPOption {
 // WithHTTPBodyBufferKB sets the per-response cap on bytes the
 // inspector buffers for regex matching. Values <= 0 are treated as
 // "disabled"; the listener will skip body inspection and stream every
-// response straight through. The default of 32 KiB matches
-// FailureConfig.BodyBufferKB's default.
+// response straight through. The bare HTTPServer constructor leaves
+// bodyBufferBytes at zero (inspection disabled); cmd/tunnelsmith
+// always passes FailureConfig.BodyBufferKB through this option, and
+// FailureConfig.BodyBufferKB defaults to 32.
 func WithHTTPBodyBufferKB(kb int) HTTPOption {
 	return func(h *HTTPServer) {
 		if kb < 0 {
@@ -658,18 +660,24 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 		if len(bodyPatterns) > 0 {
 			dec, bdErr := failure.BufferAndDecide(resp.Body, resp.Header.Get("Content-Encoding"), bodyBufferBytes, bodyPatterns)
 			if bdErr != nil {
-				// Read failed mid-body. The upstream's TCP path is
-				// suspect but not necessarily broken; rotating to the
-				// next upstream is the right move, but pinning a
-				// penalty on this kind of transient is not. Skip
-				// RecordFailure and just rotate.
+				// Read failed mid-body. The dial succeeded (we
+				// already have a non-nil resp), so dial_attempts
+				// stays "success" to match the status-failure and
+				// body-match paths below; the body-read failure
+				// rides on the structured log line so observability
+				// keeps a record without misattributing the failure
+				// to the dial outcome. The upstream's TCP path is
+				// suspect but not necessarily broken; rotating to
+				// the next upstream is the right move, but pinning a
+				// penalty on this kind of transient is not, so we
+				// skip RecordFailure and just rotate.
 				h.logger.Warn("forward body inspect failed",
 					"host", host,
 					"upstream_id", up.ID(),
 					"attempt", attempt+1,
 					"err", bdErr,
 				)
-				h.observeForwardDial(up.ID(), "other", latency)
+				h.observeForwardDial(up.ID(), "success", latency)
 				tried[up.ID()] = true
 				retries++
 				continue

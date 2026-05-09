@@ -52,20 +52,26 @@ type BodyInspectionDecision struct {
 // with a Replay reader the caller can use to forward the body to the
 // client when nothing matched.
 //
-// Behavior:
-//   - body == nil or limit <= 0: no inspection, Replay is http.NoBody,
+// Behavior (Replay is always non-nil so the caller can drain or
+// forward without a nil check):
+//   - body == nil: no inspection, Replay is http.NoBody, Skipped=true.
+//   - body != nil and limit <= 0: no inspection, Replay is body
+//     itself so the caller can still stream the response untouched,
 //     Skipped=true.
 //   - encoding != "" and encoding != "identity": no inspection,
-//     Replay reconstructs the original body, Skipped=true. The proxy
-//     does not decompress before regex matching in v1.
-//   - len(patterns) == 0: same as above, Skipped=true.
+//     Replay is body itself, Skipped=true. The proxy does not
+//     decompress before regex matching in v1.
+//   - len(patterns) == 0: no inspection, Replay is body itself,
+//     Skipped=true.
 //   - otherwise: the first len(buffered) <= limit bytes are matched
-//     against each pattern in order. On hit, Matched=true; on miss,
-//     Matched=false. Replay is always set.
+//     against each pattern in order. On hit, Matched=true and Replay
+//     yields the buffered prefix plus rest of body. On miss,
+//     Matched=false with the same Replay shape.
 //
-// Replay is built so a caller that copies it to the client sees the
-// exact bytes the upstream wrote, in order, including any prefix the
-// inspector consumed. Closing Replay also closes body.
+// In every "matched or no-match" path, Replay is built so a caller
+// that copies it to the client sees the exact bytes the upstream
+// wrote, in order, including any prefix the inspector consumed.
+// Closing Replay also closes body.
 func BufferAndDecide(body io.ReadCloser, encoding string, limit int, patterns []Pattern) (BodyInspectionDecision, error) {
 	if body == nil || limit <= 0 || len(patterns) == 0 {
 		// Nothing to inspect. Hand back a Replay that mirrors body
@@ -149,6 +155,13 @@ type replayReader struct {
 }
 
 func (r *replayReader) Read(p []byte) (int, error) {
+	// Reject reads after Close so the caller can never accidentally
+	// drain bytes from a closed underlying body. io.ErrClosedPipe is
+	// the stdlib's standard sentinel for this; callers that wrap the
+	// read can errors.Is(err, io.ErrClosedPipe) to branch on it.
+	if r.closed {
+		return 0, io.ErrClosedPipe
+	}
 	if r.prefix != nil && r.prefix.Len() > 0 {
 		n, err := r.prefix.Read(p)
 		if err == io.EOF {
