@@ -743,6 +743,50 @@ countries = ["USA"]
 `,
 			contains: "duplicate id_prefix",
 		},
+		{
+			name: "control auth_tokens rejects empty token",
+			toml: `
+[control]
+auth_tokens = ["good", ""]
+[[upstream]]
+id = "d"
+kind = "direct"
+`,
+			contains: "empty token",
+		},
+		{
+			name: "control auth_tokens rejects leading whitespace",
+			toml: `
+[control]
+auth_tokens = [" alpha"]
+[[upstream]]
+id = "d"
+kind = "direct"
+`,
+			contains: "leading or trailing whitespace",
+		},
+		{
+			name: "control auth_tokens rejects trailing whitespace",
+			toml: `
+[control]
+auth_tokens = ["alpha\t"]
+[[upstream]]
+id = "d"
+kind = "direct"
+`,
+			contains: "leading or trailing whitespace",
+		},
+		{
+			name: "control auth_tokens_file rejects relative path",
+			toml: `
+[control]
+auth_tokens_file = "tokens.txt"
+[[upstream]]
+id = "d"
+kind = "direct"
+`,
+			contains: "must be an absolute path",
+		},
 	}
 
 	for _, tc := range cases {

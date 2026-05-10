@@ -63,9 +63,10 @@ func fakeProxy(t *testing.T, upstreamID string) (proxyURL *url.URL, srv *httptes
 
 // recordingControl captures /v1/report POSTs for assertions.
 type recordingControl struct {
-	mu       sync.Mutex
-	received []recordedReport
-	status   int // status to return (default 204)
+	mu          sync.Mutex
+	received    []recordedReport
+	authHeaders []string // Phase 12: per-request Authorization header values, empty string when absent
+	status      int      // status to return (default 204)
 }
 
 type recordedReport struct {
@@ -88,8 +89,10 @@ func (rc *recordingControl) handler(t *testing.T) http.Handler {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		auth := r.Header.Get("Authorization")
 		rc.mu.Lock()
 		rc.received = append(rc.received, rep)
+		rc.authHeaders = append(rc.authHeaders, auth)
 		s := rc.status
 		rc.mu.Unlock()
 		if s == 0 {
@@ -97,6 +100,17 @@ func (rc *recordingControl) handler(t *testing.T) http.Handler {
 		}
 		w.WriteHeader(s)
 	})
+}
+
+// authSnapshot returns the Authorization header value the server saw on
+// each accepted POST, indexed by arrival order. Empty string means the
+// SDK did not set the header on that request.
+func (rc *recordingControl) authSnapshot() []string {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	out := make([]string, len(rc.authHeaders))
+	copy(out, rc.authHeaders)
+	return out
 }
 
 func (rc *recordingControl) snapshot() []recordedReport {
@@ -212,6 +226,86 @@ func TestPlainHTTPCapturesUpstreamFromResponse(t *testing.T) {
 	}
 	if got[0].Host == "" {
 		t.Errorf("host should be populated, got empty")
+	}
+}
+
+// TestReportAttachesBearerTokenWhenSet pins the Phase 12 SDK side:
+// when Options.Token is non-empty, every report POST carries
+// `Authorization: Bearer <token>`. The synchronous Report path is the
+// surface most likely to regress because it threads token through
+// upstreamBox; this test exercises it end-to-end against a recording
+// control server.
+func TestReportAttachesBearerTokenWhenSet(t *testing.T) {
+	t.Parallel()
+	dest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	}))
+	t.Cleanup(dest.Close)
+
+	proxyURL, _ := fakeProxy(t, "mullvad-se-got")
+	rc, controlSrv := newControl(t)
+
+	c := mustNewClient(t, client.Options{
+		ProxyURL:   proxyURL.String(),
+		ControlURL: controlSrv.URL,
+		Token:      "secret-tok-1",
+	})
+
+	resp, err := c.Get(dest.URL)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if err := client.Report(resp, "ok"); err != nil {
+		t.Fatalf("Report: %v", err)
+	}
+	got := waitForReports(t, rc, 1)
+	if len(got) != 1 {
+		t.Fatalf("control received %d reports, want 1", len(got))
+	}
+	auths := rc.authSnapshot()
+	if len(auths) != 1 {
+		t.Fatalf("authSnapshot len = %d, want 1", len(auths))
+	}
+	if auths[0] != "Bearer secret-tok-1" {
+		t.Errorf("Authorization = %q, want %q", auths[0], "Bearer secret-tok-1")
+	}
+}
+
+// TestReportOmitsAuthorizationHeaderWhenTokenEmpty pins the no-auth
+// default: when Options.Token is "" the SDK does not set the header at
+// all, so existing Phase 11 deployments stay wire-compatible.
+func TestReportOmitsAuthorizationHeaderWhenTokenEmpty(t *testing.T) {
+	t.Parallel()
+	dest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	}))
+	t.Cleanup(dest.Close)
+
+	proxyURL, _ := fakeProxy(t, "mullvad-se-got")
+	rc, controlSrv := newControl(t)
+
+	c := mustNewClient(t, client.Options{
+		ProxyURL:   proxyURL.String(),
+		ControlURL: controlSrv.URL,
+		// Token deliberately left empty
+	})
+
+	resp, err := c.Get(dest.URL)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if err := client.Report(resp, "ok"); err != nil {
+		t.Fatalf("Report: %v", err)
+	}
+	got := waitForReports(t, rc, 1)
+	if len(got) != 1 {
+		t.Fatalf("control received %d reports, want 1", len(got))
+	}
+	auths := rc.authSnapshot()
+	if len(auths) != 1 || auths[0] != "" {
+		t.Errorf("Authorization = %q, want empty string (header absent)", auths)
 	}
 }
 
