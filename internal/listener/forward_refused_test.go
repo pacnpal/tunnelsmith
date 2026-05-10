@@ -72,6 +72,17 @@ func startForwardListenerOpts(t *testing.T, sb *scoreboard.Scoreboard, detector 
 	case <-time.After(2 * time.Second):
 		t.Fatal("http listener did not bind in time")
 	}
+	if srv.Addr() == nil {
+		// Ready closed due to a bind failure; retrieve the error from
+		// the goroutine so we report it clearly instead of panicking on
+		// srv.Addr().String() below.
+		select {
+		case bindErr := <-serveErr:
+			t.Fatalf("http listener failed to bind: %v", bindErr)
+		case <-time.After(time.Second):
+			t.Fatal("http listener failed to bind (error not received in time)")
+		}
+	}
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
