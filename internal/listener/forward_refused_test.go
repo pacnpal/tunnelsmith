@@ -122,11 +122,12 @@ func TestForwardConnectionRefusedGate(t *testing.T) {
 
 		destURL := &url.URL{Scheme: "http", Host: addr}
 		resp, err := client.Get(destURL.String())
-		if err == nil {
-			_ = resp.Body.Close()
-			if resp.StatusCode != http.StatusBadGateway {
-				t.Fatalf("status = %d, want 502 (ECONNREFUSED destination)", resp.StatusCode)
-			}
+		if err != nil {
+			t.Fatalf("GET: %v", err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusBadGateway {
+			t.Fatalf("status = %d, want 502 (ECONNREFUSED destination)", resp.StatusCode)
 		}
 
 		host, _, _ := net.SplitHostPort(addr)
@@ -148,11 +149,12 @@ func TestForwardConnectionRefusedGate(t *testing.T) {
 
 		destURL := &url.URL{Scheme: "http", Host: addr}
 		resp, err := client.Get(destURL.String())
-		if err == nil {
-			_ = resp.Body.Close()
-			if resp.StatusCode != http.StatusBadGateway {
-				t.Fatalf("status = %d, want 502 (ECONNREFUSED destination)", resp.StatusCode)
-			}
+		if err != nil {
+			t.Fatalf("GET: %v", err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusBadGateway {
+			t.Fatalf("status = %d, want 502 (ECONNREFUSED destination)", resp.StatusCode)
 		}
 
 		host, _, _ := net.SplitHostPort(addr)
@@ -176,8 +178,12 @@ func TestForwardConnectionRefusedGate(t *testing.T) {
 
 		// First request: gate off — no penalty.
 		resp, err := client.Get(destURL.String())
-		if err == nil {
-			_ = resp.Body.Close()
+		if err != nil {
+			t.Fatalf("first GET: %v", err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusBadGateway {
+			t.Fatalf("first GET status = %d, want 502 (ECONNREFUSED destination)", resp.StatusCode)
 		}
 
 		host, _, _ := net.SplitHostPort(addr)
@@ -190,8 +196,12 @@ func TestForwardConnectionRefusedGate(t *testing.T) {
 
 		// Second request: gate on — penalty must be recorded.
 		resp2, err := client.Get(destURL.String())
-		if err == nil {
-			_ = resp2.Body.Close()
+		if err != nil {
+			t.Fatalf("second GET: %v", err)
+		}
+		_ = resp2.Body.Close()
+		if resp2.StatusCode != http.StatusBadGateway {
+			t.Fatalf("second GET status = %d, want 502 (ECONNREFUSED destination)", resp2.StatusCode)
 		}
 
 		if got := forwardRefusedFailureCount(sb, host, "a"); got == 0 {
