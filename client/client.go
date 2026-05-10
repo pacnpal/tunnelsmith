@@ -16,10 +16,10 @@
 //   - The chosen upstream id is captured automatically (from the
 //     X-Tunnelsmith-Upstream header on plain-HTTP responses, and from
 //     the same header on the CONNECT 200 response for HTTPS).
-//   - Status codes 429, 403, and 451 auto-report to the control
-//     endpoint as rate_limited / forbidden / legal_block. Apps that
-//     want richer signal call Report(resp, outcome) with one of the
-//     outcomes documented in docs/cooperative-reporting.md.
+//   - For HTTPS requests, status codes 429, 403, and 451 auto-report
+//     to the control endpoint as rate_limited / forbidden / legal_block.
+//     Apps that want richer signal call Report(resp, outcome) with one
+//     of the outcomes documented in docs/cooperative-reporting.md.
 //
 // What this gives up:
 //
@@ -86,8 +86,8 @@ type Options struct {
 var ErrNoUpstream = errors.New("client: response has no recorded upstream id")
 
 // reportingTransport wraps an *http.Transport, captures the chosen
-// upstream id for each request, and emits auto-reports for status codes
-// in {429, 403, 451}. It is the SDK's RoundTripper.
+// upstream id for each request, and emits auto-reports for HTTPS status
+// codes in {429, 403, 451}. It is the SDK's RoundTripper.
 type reportingTransport struct {
 	base            *http.Transport
 	controlURL      string
@@ -200,7 +200,7 @@ func New(opts Options) (*http.Client, error) {
 //     can write the captured upstream id through it.
 //  2. Delegates to the base transport.
 //  3. Reads X-Tunnelsmith-Upstream from the response (covers the plain-HTTP path).
-//  4. Auto-reports 429 / 403 / 451 to the control endpoint.
+//  4. Auto-reports HTTPS 429 / 403 / 451 to the control endpoint.
 func (r *reportingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	box := &upstreamBox{
 		controlURL:      r.controlURL,
@@ -221,7 +221,7 @@ func (r *reportingTransport) RoundTrip(req *http.Request) (*http.Response, error
 		box.upstream.Store(up)
 	}
 
-	if outcome := autoOutcomeForStatus(resp.StatusCode); outcome != "" {
+	if outcome := autoOutcomeFor(req2, resp.StatusCode); outcome != "" {
 		host := hostForReport(req2)
 		upID := box.get()
 		if upID != "" {
@@ -276,50 +276,58 @@ func autoOutcomeForStatus(status int) string {
 	return ""
 }
 
-// hostForReport returns the host:port the report should reference. We
-// prefer req.URL.Host (canonical for outbound requests). req.Host is
-// used only as a fallback for synthetic requests that did not populate
-// the URL.
-func hostForReport(req *http.Request) string {
-	scheme := ""
-	if req.URL != nil {
-		scheme = req.URL.Scheme
+func autoOutcomeFor(req *http.Request, status int) string {
+	if req == nil || req.URL == nil || !strings.EqualFold(req.URL.Scheme, "https") {
+		return ""
 	}
-	if req.URL != nil && req.URL.Host != "" {
-		if normalized := normalizeHostPort(req.URL.Host, scheme); normalized != "" {
-			return normalized
-		}
-		return req.URL.Host
-	}
-	if req.Host != "" {
-		if normalized := normalizeHostPort(req.Host, scheme); normalized != "" {
-			return normalized
-		}
-	}
-	return req.Host
+	return autoOutcomeForStatus(status)
 }
 
-// normalizeHostPort returns host:port for reporting by adding a default
-// port when one is absent (443 for https, 80 for http). Returns empty
-// string for unsupported schemes so callers can fall back to raw host.
-func normalizeHostPort(hostport, scheme string) string {
-	host := hostport
-	port := ""
-	if splitHost, splitPort, err := net.SplitHostPort(hostport); err == nil {
-		host = splitHost
-		port = splitPort
+// hostForReport returns the host key the report should reference. For
+// HTTPS it returns host:port (defaulting to :443 when absent) to match
+// the CONNECT key used by the proxy path. For plain HTTP it returns just
+// the hostname to match the proxy's forward-path keying.
+func hostForReport(req *http.Request) string {
+	if req == nil {
+		return ""
 	}
-	if port == "" {
-		switch strings.ToLower(scheme) {
-		case "https":
-			port = "443"
-		case "http":
-			port = "80"
-		default:
-			return ""
+	if req.URL != nil && req.URL.Host != "" {
+		return normalizeHostForScheme(req.URL.Hostname(), req.URL.Port(), req.URL.Scheme)
+	}
+	if req.Host != "" {
+		host, port := splitHostAndPort(req.Host)
+		scheme := ""
+		if req.URL != nil {
+			scheme = req.URL.Scheme
 		}
+		return normalizeHostForScheme(host, port, scheme)
 	}
-	return net.JoinHostPort(host, port)
+	return ""
+}
+
+func normalizeHostForScheme(host, port, scheme string) string {
+	switch strings.ToLower(scheme) {
+	case "https":
+		if port == "" {
+			port = "443"
+		}
+		return net.JoinHostPort(host, port)
+	case "http":
+		return host
+	default:
+		if port == "" {
+			return host
+		}
+		return net.JoinHostPort(host, port)
+	}
+}
+
+func splitHostAndPort(raw string) (string, string) {
+	if splitHost, splitPort, err := net.SplitHostPort(raw); err == nil {
+		return splitHost, splitPort
+	}
+	u := &url.URL{Host: raw}
+	return u.Hostname(), u.Port()
 }
 
 // reportPayload mirrors internal/control/handlers.go's reportRequest.

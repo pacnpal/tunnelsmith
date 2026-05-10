@@ -130,6 +130,27 @@ func TestReportOKRecordsSuccess(t *testing.T) {
 	}
 }
 
+func TestReportNormalizesHostBeforeRecording(t *testing.T) {
+	t.Parallel()
+	backend := &fakeBackend{poolIDs: []string{"u1"}}
+	srv := newTestServer(t, backend, nil)
+	resp := postJSON(t, srv, "/v1/report", `{
+		"host": "EXAMPLE.COM:443",
+		"upstream": "u1",
+		"outcome": "ok"
+	}`)
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", resp.StatusCode)
+	}
+	if got := len(backend.successes); got != 1 {
+		t.Fatalf("RecordSuccess calls = %d, want 1", got)
+	}
+	if backend.successes[0].host != "example.com:443" {
+		t.Fatalf("normalized host = %q, want %q", backend.successes[0].host, "example.com:443")
+	}
+}
+
 func TestReportEachOutcomeMapsToExpectedKind(t *testing.T) {
 	t.Parallel()
 	cases := map[string]failure.Kind{
@@ -239,6 +260,33 @@ func TestReportMissingFieldsReturns400(t *testing.T) {
 	for _, r := range m.rejected {
 		if r != metrics.ReportRejectMissingField {
 			t.Errorf("reject reason = %q, want %q", r, metrics.ReportRejectMissingField)
+		}
+	}
+}
+
+func TestReportInvalidHostReturns400(t *testing.T) {
+	t.Parallel()
+	m := &fakeMetrics{}
+	srv := newTestServer(t, &fakeBackend{poolIDs: []string{"u1"}}, m)
+	cases := []string{
+		`{"host":"bad host","upstream":"u1","outcome":"ok"}`,
+		`{"host":"example.com:99999","upstream":"u1","outcome":"ok"}`,
+		`{"host":"example.com:abc","upstream":"u1","outcome":"ok"}`,
+		`{"host":"http://example.com","upstream":"u1","outcome":"ok"}`,
+	}
+	for _, body := range cases {
+		resp := postJSON(t, srv, "/v1/report", body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("body=%q status = %d, want 400", body, resp.StatusCode)
+		}
+	}
+	if got := len(m.rejected); got != len(cases) {
+		t.Fatalf("rejected count = %d, want %d", got, len(cases))
+	}
+	for _, reason := range m.rejected {
+		if reason != metrics.ReportRejectBadJSON {
+			t.Errorf("rejection reason = %q, want %q", reason, metrics.ReportRejectBadJSON)
 		}
 	}
 }

@@ -209,7 +209,7 @@ func TestPlainHTTPCapturesUpstreamFromResponse(t *testing.T) {
 	}
 }
 
-func TestAutoReportFiresOn429(t *testing.T) {
+func TestAutoReportDoesNotFireOnHTTP429(t *testing.T) {
 	t.Parallel()
 	dest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusTooManyRequests)
@@ -232,19 +232,16 @@ func TestAutoReportFiresOn429(t *testing.T) {
 	}
 	_ = resp.Body.Close()
 
-	got := waitForReports(t, rc, 1)
-	if len(got) != 1 {
-		t.Fatalf("auto-report missing; received %d", len(got))
-	}
-	if got[0].Outcome != "rate_limited" || got[0].Upstream != "u1" {
-		t.Errorf("auto-report = %+v", got[0])
-	}
-	if got[0].HTTPStatus == nil || *got[0].HTTPStatus != 429 {
-		t.Errorf("http_status = %v, want 429", got[0].HTTPStatus)
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if got := rc.snapshot(); len(got) != 0 {
+			t.Fatalf("unexpected auto-report on HTTP 429: %+v", got)
+		}
+		time.Sleep(15 * time.Millisecond)
 	}
 }
 
-func TestAutoReportFiresOn403And451(t *testing.T) {
+func TestAutoReportDoesNotFireOnHTTP403And451(t *testing.T) {
 	t.Parallel()
 	cases := map[int]string{
 		http.StatusForbidden:                  "forbidden",
@@ -271,9 +268,12 @@ func TestAutoReportFiresOn403And451(t *testing.T) {
 			}
 			_ = resp.Body.Close()
 
-			got := waitForReports(t, rc, 1)
-			if len(got) != 1 || got[0].Outcome != wantOutcome {
-				t.Errorf("got %+v, want one report with outcome=%s", got, wantOutcome)
+			deadline := time.Now().Add(300 * time.Millisecond)
+			for time.Now().Before(deadline) {
+				if got := rc.snapshot(); len(got) != 0 {
+					t.Fatalf("unexpected auto-report on HTTP %d (%s): %+v", status, wantOutcome, got)
+				}
+				time.Sleep(15 * time.Millisecond)
 			}
 		})
 	}

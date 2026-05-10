@@ -7,8 +7,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -136,6 +139,11 @@ func handleReport(w http.ResponseWriter, r *http.Request, backend Backend, m Met
 		rejectReport(w, m, metrics.ReportRejectMissingField, http.StatusBadRequest, "missing required field: "+missing)
 		return
 	}
+	normalizedHost, err := normalizeReportHost(req.Host)
+	if err != nil {
+		rejectReport(w, m, metrics.ReportRejectBadJSON, http.StatusBadRequest, "invalid host: "+err.Error())
+		return
+	}
 
 	kind, ok := resolveOutcome(req.Outcome)
 	if !ok {
@@ -152,9 +160,9 @@ func handleReport(w http.ResponseWriter, r *http.Request, backend Backend, m Met
 
 	// Apply.
 	if req.Outcome == outcomeOK {
-		backend.RecordSuccess(req.Host, req.Upstream, 0)
+		backend.RecordSuccess(normalizedHost, req.Upstream, 0)
 	} else {
-		backend.RecordFailure(req.Host, req.Upstream, kind, nil)
+		backend.RecordFailure(normalizedHost, req.Upstream, kind, nil)
 	}
 
 	if m != nil {
@@ -172,6 +180,67 @@ func handleReport(w http.ResponseWriter, r *http.Request, backend Backend, m Met
 	logger.Debug("report accepted", logArgs...)
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+var hostLabelRe = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+
+func normalizeReportHost(host string) (string, error) {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return "", errors.New("host is empty")
+	}
+	if strings.ContainsAny(host, "/?#") {
+		return "", fmt.Errorf("host %q contains URL delimiters", host)
+	}
+
+	if splitHost, splitPort, err := net.SplitHostPort(host); err == nil {
+		normalizedHost, err := normalizeReportHostPart(splitHost)
+		if err != nil {
+			return "", err
+		}
+		if err := validateReportPort(splitPort); err != nil {
+			return "", err
+		}
+		return net.JoinHostPort(normalizedHost, splitPort), nil
+	}
+
+	if strings.Contains(host, ":") {
+		return "", fmt.Errorf("host %q must be hostname or host:port", host)
+	}
+	return normalizeReportHostPart(host)
+}
+
+func normalizeReportHostPart(host string) (string, error) {
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
+	}
+	if host == "" {
+		return "", errors.New("host is empty")
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.String(), nil
+	}
+	host = strings.ToLower(host)
+	if strings.HasPrefix(host, ".") || strings.HasSuffix(host, ".") || strings.Contains(host, "..") {
+		return "", fmt.Errorf("invalid hostname %q", host)
+	}
+	for _, label := range strings.Split(host, ".") {
+		if !hostLabelRe.MatchString(label) {
+			return "", fmt.Errorf("invalid hostname label %q", label)
+		}
+	}
+	return host, nil
+}
+
+func validateReportPort(port string) error {
+	p, err := strconv.Atoi(port)
+	if err != nil {
+		return fmt.Errorf("port %q is not numeric: %w", port, err)
+	}
+	if p < 1 || p > 65535 {
+		return fmt.Errorf("port %d is outside the 1-65535 range", p)
+	}
+	return nil
 }
 
 // resolveOutcome maps an outcome string to its failure.Kind. The boolean

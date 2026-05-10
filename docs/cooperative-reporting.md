@@ -104,7 +104,7 @@ This is a **closed set**. Unknown values are rejected so a typo on your side sur
 | `timeout` | App-detected stall (slow body, partial download). | Maps to `KindTimeout`. |
 | `refused` | App-detected connection-level failure surfaced after CONNECT succeeded. | Maps to `KindRefused`. |
 
-The Go SDK auto-reports `429` → `rate_limited`, `403` → `forbidden`, and `451` → `legal_block` with no app code. Other outcomes — including `ok` — require an explicit `client.Report(resp, outcome)` call.
+The Go SDK auto-reports `429` → `rate_limited`, `403` → `forbidden`, and `451` → `legal_block` for **HTTPS** requests with no app code. Other outcomes — including `ok` — require an explicit `client.Report(resp, outcome)` call.
 
 ### Response codes
 

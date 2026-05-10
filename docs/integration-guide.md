@@ -154,7 +154,7 @@ Users who want VPN routing get a known-good baseline they can adapt.
 
 Tunnelsmith cannot inspect HTTPS responses; the proxy carries TLS bytes blindly. Your app *can* see those responses — it terminates the TLS, so the cleartext is right there. The cooperative reporting protocol lets your app submit per-request outcomes back to Tunnelsmith so the scoreboard learns from HTTPS the same way it does from plain HTTP. This is the difference between "Tunnelsmith only sees dial failures on HTTPS" and "Tunnelsmith fully understands which exits are working for which destinations".
 
-**Go: three lines.** Use the SDK at [`github.com/pacnpal/tunnelsmith/client`](../client). The wrapped `*http.Client` captures the chosen upstream id automatically, auto-reports `429` / `403` / `451`, and lets you submit semantic outcomes (soft geo-block, app-detected timeout, custom signals) via `client.Report`.
+**Go: three lines.** Use the SDK at [`github.com/pacnpal/tunnelsmith/client`](../client). The wrapped `*http.Client` captures the chosen upstream id automatically, auto-reports HTTPS `429` / `403` / `451`, and lets you submit semantic outcomes (soft geo-block, app-detected timeout, custom signals) via `client.Report`.
 
 ```go
 import "github.com/pacnpal/tunnelsmith/client"
@@ -164,7 +164,7 @@ c, err := client.New(client.Options{
     ControlURL: "http://tunnelsmith:9092",
 })
 resp, err := c.Get("https://example.com/api/things")
-// 429/403/451 auto-report. For semantic outcomes:
+// HTTPS 429/403/451 auto-report. For semantic outcomes:
 _ = client.Report(resp, "geo_block")
 ```
 
