@@ -158,11 +158,19 @@ func handleReport(w http.ResponseWriter, r *http.Request, backend Backend, m Met
 		return
 	}
 
-	// Apply.
+	// Apply. The scoreboard keys every (host, upstream) pair on the
+	// hostname only — internal/scoreboard/scoreboard.go.DialFor strips
+	// the port via hostOnly() before recording, and the plain-HTTP
+	// forward path passes r.URL.Hostname() directly. To make a Phase 11
+	// report land on the same scoreboard entry the proxy itself would
+	// touch, we strip any port from the (already-normalized) host
+	// before calling Record*. The full normalizedHost stays in the log
+	// line so the audit trail still shows what the app reported.
+	scoreboardHost := scoreboardHostKey(normalizedHost)
 	if req.Outcome == outcomeOK {
-		backend.RecordSuccess(normalizedHost, req.Upstream, 0)
+		backend.RecordSuccess(scoreboardHost, req.Upstream, 0)
 	} else {
-		backend.RecordFailure(normalizedHost, req.Upstream, kind, nil)
+		backend.RecordFailure(scoreboardHost, req.Upstream, kind, nil)
 	}
 
 	if m != nil {
@@ -255,6 +263,20 @@ func validateReportPort(port string) error {
 		return fmt.Errorf("port %d is outside the 1-65535 range", p)
 	}
 	return nil
+}
+
+// scoreboardHostKey reduces a normalizeReportHost result to the form
+// the scoreboard actually keys on: hostname only, no port. The proxy's
+// own dial path strips ports via internal/scoreboard.hostOnly before
+// calling Record*, so reports must do the same to land on the same
+// entry. host is the already-normalized return value of
+// normalizeReportHost (lowercase, RFC 1123 labels, IP literals
+// canonicalized), so we only need to strip an optional :port suffix.
+func scoreboardHostKey(host string) string {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		return h
+	}
+	return host
 }
 
 // resolveOutcome maps an outcome string to its failure.Kind. The boolean

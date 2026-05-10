@@ -80,7 +80,7 @@ Content-Type: application/json
 
 | field | type | notes |
 |---|---|---|
-| `host` | string | Destination key the report applies to. The format must match how the proxy keys this destination on its side: **`host:port`** for HTTPS / CONNECT traffic (e.g. `example.com:443`), **hostname only** for plain-HTTP forward-proxy traffic (e.g. `example.com`). The Go SDK derives this automatically from the request URL; non-Go integrations should mirror that rule so reports land on the right scoreboard entry. Reports get normalized server-side (lowercased, RFC 1123 label check, IP literals canonicalized). |
+| `host` | string | Destination the report applies to. The hostname is what matters — the **scoreboard keys every (host, upstream) pair on hostname only**, mirroring the proxy's own dial-path convention (`internal/scoreboard/hostOnly`). You may submit a `host:port` pair for forensic clarity (e.g. `example.com:443` for HTTPS traffic, `example.com` for plain HTTP); the server normalizes (lowercase, RFC 1123 labels, IP-literal canonicalization) and then strips any port before recording, so `example.com:443` and `example.com` reach the same scoreboard entry. The Go SDK emits `host:port` for HTTPS and hostname-only for plain HTTP; either form works. |
 | `upstream` | string | Upstream id from `X-Tunnelsmith-Upstream`. Tunnelsmith rejects ids it does not know with `404`. |
 | `outcome` | string | One of the values in the table below. Unknown outcomes return `400`. |
 
@@ -111,7 +111,7 @@ The Go SDK auto-reports `429` → `rate_limited`, `403` → `forbidden`, and `45
 | status | meaning | what to do |
 |---|---|---|
 | `204 No Content` | Recorded. | Continue. |
-| `400 Bad Request` | Malformed JSON, missing field, unknown outcome, oversized body, unknown JSON field, or trailing content after the object. | Fix the payload. The body explains the specific problem. |
+| `400 Bad Request` | Malformed JSON, missing field, unknown outcome, unknown JSON field, or trailing content after the object. | Fix the payload. The body explains the specific problem. |
 | `404 Not Found` | `upstream` is not in the pool. Common causes: the upstream id was renamed in tunnelsmith's config, or the report points at an old id from before a hot-reload. | Refresh the upstream id from the next response and retry. |
 | `405 Method Not Allowed` | You sent something other than `POST`. | Use `POST`. |
 | `413 Payload Too Large` | Body exceeded 4 KiB. | Trim the payload. Required fields are tiny. |

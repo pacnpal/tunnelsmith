@@ -120,8 +120,10 @@ func TestReportOKRecordsSuccess(t *testing.T) {
 	if got := len(backend.successes); got != 1 {
 		t.Fatalf("RecordSuccess calls = %d, want 1", got)
 	}
-	if backend.successes[0].host != "example.com:443" || backend.successes[0].upstreamID != "mullvad-se-got" {
-		t.Errorf("RecordSuccess called with %+v", backend.successes[0])
+	// Scoreboard keys on hostname only — see scoreboardHostKey — so a
+	// host:port report lands under the same key the proxy itself records.
+	if backend.successes[0].host != "example.com" || backend.successes[0].upstreamID != "mullvad-se-got" {
+		t.Errorf("RecordSuccess called with %+v, want host=example.com upstream=mullvad-se-got", backend.successes[0])
 	}
 	if len(backend.failures) != 0 {
 		t.Errorf("unexpected RecordFailure calls: %+v", backend.failures)
@@ -147,23 +149,65 @@ func TestReportNormalizesHostBeforeRecording(t *testing.T) {
 	if got := len(backend.successes); got != 1 {
 		t.Fatalf("RecordSuccess calls = %d, want 1", got)
 	}
-	if backend.successes[0].host != "example.com:443" {
-		t.Fatalf("normalized host = %q, want %q", backend.successes[0].host, "example.com:443")
+	// Normalization lowercases the host; the scoreboard call also
+	// strips the port so the report key matches the proxy's own
+	// (hostname-only) keying convention.
+	if backend.successes[0].host != "example.com" {
+		t.Fatalf("scoreboard key = %q, want %q", backend.successes[0].host, "example.com")
 	}
 }
 
-// TestReportAcceptsIPLiteralHosts pins normalization for IPv4 and IPv6
-// reports without an explicit port. Plain-HTTP traffic to an IP literal
-// arrives here as a bare address; SplitHostPort cannot parse it, but the
-// host is still valid and must reach the scoreboard.
+// TestReportStripsPortBeforeScoreboardCall pins the contract that an
+// HTTPS-style host:port report lands on the SAME scoreboard entry the
+// proxy itself records under (hostname only, no port). Phase 11 was
+// silently broken for HTTPS without this: scoreboard.DialFor strips
+// the port via hostOnly() before calling Record*, and the SDK was
+// emitting "host:port" — so reports created a parallel scoreboard
+// entry that never affected routing decisions for the real host key.
+func TestReportStripsPortBeforeScoreboardCall(t *testing.T) {
+	t.Parallel()
+	cases := map[string]string{
+		"example.com:443":    "example.com",
+		"example.com":        "example.com",
+		"[2001:db8::1]:8443": "2001:db8::1",
+		"2001:db8::1":        "2001:db8::1",
+		"192.0.2.1:443":      "192.0.2.1",
+	}
+	for inHost, wantKey := range cases {
+		inHost, wantKey := inHost, wantKey
+		t.Run(inHost, func(t *testing.T) {
+			t.Parallel()
+			backend := &fakeBackend{poolIDs: []string{"u1"}}
+			srv := newTestServer(t, backend, nil)
+			payload := fmt.Sprintf(`{"host":%q,"upstream":"u1","outcome":"ok"}`, inHost)
+			resp := postJSON(t, srv, "/v1/report", payload)
+			defer func() { _ = resp.Body.Close() }()
+			if resp.StatusCode != http.StatusNoContent {
+				t.Fatalf("status = %d, want 204", resp.StatusCode)
+			}
+			if got := len(backend.successes); got != 1 {
+				t.Fatalf("RecordSuccess calls = %d, want 1", got)
+			}
+			if backend.successes[0].host != wantKey {
+				t.Fatalf("scoreboard key = %q, want %q (must match scoreboard.hostOnly)", backend.successes[0].host, wantKey)
+			}
+		})
+	}
+}
+
+// TestReportAcceptsIPLiteralHosts pins acceptance and scoreboard-key
+// shape for IPv4 and IPv6 reports. The wire format may include an
+// explicit port, but the scoreboard key strips it (matching the
+// proxy's own hostOnly convention) so all forms reduce to a single
+// canonical hostname.
 func TestReportAcceptsIPLiteralHosts(t *testing.T) {
 	t.Parallel()
 	cases := map[string]string{
 		"192.0.2.1":     "192.0.2.1",
 		"[::1]":         "::1",
 		"::1":           "::1",
-		"[::1]:443":     "[::1]:443",
-		"192.0.2.1:443": "192.0.2.1:443",
+		"[::1]:443":     "::1",
+		"192.0.2.1:443": "192.0.2.1",
 	}
 	for inHost, wantHost := range cases {
 		inHost, wantHost := inHost, wantHost

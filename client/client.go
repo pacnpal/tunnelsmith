@@ -166,7 +166,7 @@ func New(opts Options) (*http.Client, error) {
 	// stdlib's tested DialContext / TLS handshake / idle conn timeouts
 	// rather than zeroing them out (which would let a partial network
 	// failure stall a user-facing request indefinitely).
-	base := http.DefaultTransport.(*http.Transport).Clone()
+	base := newSDKTransport()
 	base.Proxy = http.ProxyURL(pu)
 	base.DisableKeepAlives = !opts.KeepAlive
 	// Capture the upstream id from the CONNECT 200 response; the proxy
@@ -182,11 +182,11 @@ func New(opts Options) (*http.Client, error) {
 		return nil
 	}
 
-	// Same defaulting story for the report-plane transport: clone
-	// DefaultTransport so dial / TLS / idle timeouts are non-zero, then
-	// pin Proxy to nil so /v1/report never accidentally tunnels through
-	// HTTP_PROXY (or, worse, back through tunnelsmith itself).
-	reportTr := http.DefaultTransport.(*http.Transport).Clone()
+	// Same defaulting story for the report-plane transport: build a
+	// transport with sane timeouts, then pin Proxy to nil so /v1/report
+	// never accidentally tunnels through HTTP_PROXY (or, worse, back
+	// through tunnelsmith itself).
+	reportTr := newSDKTransport()
 	reportTr.Proxy = func(*http.Request) (*url.URL, error) { return nil, nil }
 	reportTr.MaxIdleConnsPerHost = 4
 
@@ -423,4 +423,32 @@ func postReportSync(b *upstreamBox, host, upstream, outcome string, httpStatus *
 		return fmt.Errorf("control endpoint returned %s", resp.Status)
 	}
 	return nil
+}
+
+// newSDKTransport returns an *http.Transport seeded with sane network
+// timeouts. We start from a clone of http.DefaultTransport when it
+// still holds the stdlib's *http.Transport, so the SDK inherits any
+// future stdlib defaulting tweaks for free. When a host application
+// has replaced http.DefaultTransport with a custom RoundTripper (it
+// is a public var), the type assertion would panic, so we fall back
+// to a hand-rolled transport that mirrors the stdlib defaults from
+// Go 1.23+ — DialContext / IdleConnTimeout / TLSHandshakeTimeout /
+// ExpectContinueTimeout / ForceAttemptHTTP2 / MaxIdleConns. The fall-
+// back keeps the SDK robust in real applications instead of crashing
+// at construction time.
+func newSDKTransport() *http.Transport {
+	if t, ok := http.DefaultTransport.(*http.Transport); ok {
+		return t.Clone()
+	}
+	return &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
 }
