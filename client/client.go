@@ -42,6 +42,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -134,8 +135,18 @@ func New(opts Options) (*http.Client, error) {
 	if pu.Scheme != "http" && pu.Scheme != "https" {
 		return nil, fmt.Errorf("client: ProxyURL scheme must be http or https, got %q", pu.Scheme)
 	}
-	if _, err := url.Parse(opts.ControlURL); err != nil {
+	cu, err := url.Parse(opts.ControlURL)
+	if err != nil {
 		return nil, fmt.Errorf("client: parse ControlURL: %w", err)
+	}
+	if cu.Scheme != "http" && cu.Scheme != "https" {
+		return nil, fmt.Errorf("client: ControlURL scheme must be http or https, got %q", cu.Scheme)
+	}
+	if cu.Host == "" {
+		return nil, errors.New("client: ControlURL must include host")
+	}
+	if cu.Path != "" && cu.Path != "/" {
+		return nil, fmt.Errorf("client: ControlURL path must be empty or '/', got %q", cu.Path)
 	}
 
 	timeout := opts.Timeout
@@ -270,10 +281,44 @@ func autoOutcomeForStatus(status int) string {
 // used only as a fallback for synthetic requests that did not populate
 // the URL.
 func hostForReport(req *http.Request) string {
+	scheme := ""
+	if req.URL != nil {
+		scheme = req.URL.Scheme
+	}
 	if req.URL != nil && req.URL.Host != "" {
+		if normalized := normalizeHostPort(req.URL.Host, scheme); normalized != "" {
+			return normalized
+		}
 		return req.URL.Host
 	}
+	if req.Host != "" {
+		if normalized := normalizeHostPort(req.Host, scheme); normalized != "" {
+			return normalized
+		}
+	}
 	return req.Host
+}
+
+func normalizeHostPort(hostport, scheme string) string {
+	host := hostport
+	port := ""
+	if strings.Contains(hostport, ":") {
+		if splitHost, splitPort, err := net.SplitHostPort(hostport); err == nil {
+			host = splitHost
+			port = splitPort
+		}
+	}
+	if port == "" {
+		switch strings.ToLower(scheme) {
+		case "https":
+			port = "443"
+		case "http":
+			port = "80"
+		default:
+			return ""
+		}
+	}
+	return net.JoinHostPort(host, port)
 }
 
 // reportPayload mirrors internal/control/handlers.go's reportRequest.

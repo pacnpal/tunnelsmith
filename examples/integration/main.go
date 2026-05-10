@@ -55,8 +55,7 @@ func main() {
 	defer func() { _ = resp.Body.Close() }()
 
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
-	upstream := resp.Header.Get("X-Tunnelsmith-Upstream")
-	fmt.Printf("status=%d upstream=%s bytes=%d\n", resp.StatusCode, upstream, len(body))
+	fmt.Printf("status=%d bytes=%d\n", resp.StatusCode, len(body))
 
 	// App-driven outcome: soft geo-block detection a regex inside the
 	// proxy could not see because this is HTTPS.

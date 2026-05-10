@@ -19,11 +19,10 @@ import (
 // Backend is the small surface the report handler calls into. The real
 // implementation is *scoreboard.Scoreboard; tests pass a fake.
 type Backend interface {
-	// PoolIDs returns the set of valid upstream ids. Used to reject
-	// reports for upstream ids the operator has no record of, so a
-	// typo on the client surfaces as 404 rather than silently inflating
-	// scoreboard cardinality.
-	PoolIDs() []string
+	// HasUpstream reports whether an upstream id exists in the live pool.
+	// Used to reject reports for unknown ids (404) without needing to
+	// allocate/copy the full pool id list on every request.
+	HasUpstream(id string) bool
 
 	// RecordSuccess applies success bookkeeping for one (host, upstreamID)
 	// pair. Latency is informational only on this path; the control
@@ -145,7 +144,7 @@ func handleReport(w http.ResponseWriter, r *http.Request, backend Backend, m Met
 		return
 	}
 
-	if !knownUpstream(backend, req.Upstream) {
+	if !backend.HasUpstream(req.Upstream) {
 		rejectReport(w, m, metrics.ReportRejectUnknownUpstream, http.StatusNotFound,
 			fmt.Sprintf("unknown upstream %q", req.Upstream))
 		return
@@ -170,7 +169,7 @@ func handleReport(w http.ResponseWriter, r *http.Request, backend Backend, m Met
 	if req.HTTPStatus != nil {
 		logArgs = append(logArgs, "http_status", *req.HTTPStatus)
 	}
-	logger.Info("report accepted", logArgs...)
+	logger.Debug("report accepted", logArgs...)
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -199,16 +198,6 @@ func missingFields(req reportRequest) string {
 		return "outcome"
 	}
 	return ""
-}
-
-// knownUpstream reports whether id is in backend.PoolIDs().
-func knownUpstream(backend Backend, id string) bool {
-	for _, candidate := range backend.PoolIDs() {
-		if candidate == id {
-			return true
-		}
-	}
-	return false
 }
 
 // allowedOutcomes returns a sorted, comma-joined list of the accepted

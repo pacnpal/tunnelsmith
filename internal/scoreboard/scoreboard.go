@@ -364,6 +364,20 @@ func (s *Scoreboard) PoolIDs() []string {
 	return out
 }
 
+// HasUpstream reports whether id exists in the live pool snapshot.
+// Used by control-plane report validation on the per-request path to
+// avoid allocating a full id list for each membership check.
+func (s *Scoreboard) HasUpstream(id string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, e := range s.poolEntries {
+		if e.Up.ID() == id {
+			return true
+		}
+	}
+	return false
+}
+
 // ReplaceRules swaps the per-host rule set in place. Used by the SIGHUP
 // hot-reload path: the request path's reads of s.rules happen under
 // the same RLock that ReplaceRules takes for its write, so a Pick in

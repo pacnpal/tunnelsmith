@@ -36,12 +36,15 @@ type recordedFailure struct {
 	cooldown         *time.Duration
 }
 
-func (f *fakeBackend) PoolIDs() []string {
+func (f *fakeBackend) HasUpstream(id string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	out := make([]string, len(f.poolIDs))
-	copy(out, f.poolIDs)
-	return out
+	for _, candidate := range f.poolIDs {
+		if candidate == id {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *fakeBackend) RecordSuccess(host, upstreamID string, latency time.Duration) {
