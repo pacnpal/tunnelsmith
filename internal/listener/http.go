@@ -115,10 +115,10 @@ func WithHTTPBodyBufferKB(kb int) HTTPOption {
 // detected by the HTTP forward path scores a penalty against the upstream.
 // When false, RecordFailure is skipped for true ECONNREFUSED errors (as
 // detected by failure.IsConnectionRefused) in handleForward; timeouts and
-// other failures are unaffected. The default (zero value) is false, so
-// production callers must pass this option with cfg.Failure.ConnectionRefused
-// to match the TOML default of true. SIGHUP reloads should call
-// ReloadConnectionRefused to keep the value live.
+// other failures are unaffected. NewHTTP initializes the field to true so
+// any call site that omits this option keeps the production default; pass
+// cfg.Failure.ConnectionRefused explicitly to override. SIGHUP reloads
+// should call ReloadConnectionRefused to keep the value live.
 func WithHTTPConnectionRefused(v bool) HTTPOption {
 	return func(h *HTTPServer) {
 		h.connectionRefused = v
@@ -144,14 +144,15 @@ func NewHTTP(addr string, sb *scoreboard.Scoreboard, detector *failure.StatusDet
 		logger = slog.Default()
 	}
 	h := &HTTPServer{
-		addr:       addr,
-		sb:         sb,
-		detector:   detector,
-		retryCap:   retryCap,
-		logger:     logger.With("listener", "http"),
-		ready:      make(chan struct{}),
-		tunnels:    make(map[*tunnel]struct{}),
-		transports: make(map[string]*http.Transport),
+		addr:              addr,
+		sb:                sb,
+		detector:          detector,
+		retryCap:          retryCap,
+		connectionRefused: true, // match the TOML default; callers pass WithHTTPConnectionRefused(false) to opt out
+		logger:            logger.With("listener", "http"),
+		ready:             make(chan struct{}),
+		tunnels:           make(map[*tunnel]struct{}),
+		transports:        make(map[string]*http.Transport),
 	}
 	// Reload knobs default to the constructor arguments above; the
 	// runtimeMu fields are populated implicitly via the struct literal.
