@@ -9,13 +9,19 @@ These are incremental fixes against the v1 surface and may land in a v1.x point 
 - **`failure.connection_refused` opt-out actually works.** The config field is parsed and defaulted to `true`; the runtime does not yet consult it. Tracked in [#20](https://github.com/pacnpal/tunnelsmith/issues/20).
 - **Hot-reload of `[[upstream_pool]]` Mullvad relay churn.** Today the refresh tick logs added/removed upstream ids but the running pool is whatever startup produced. SIGHUP also leaves the pool frozen on purpose so a reload does not block on Mullvad's API. A follow-up should swap the pool on the refresh tick directly so a relay rotation lands without a restart.
 
+## Planned
+
+Designs that have been locked in but not yet implemented. Each has an ADR in `docs/decisions.md`.
+
+- **Phase 12: bearer-token auth on the control endpoint.** Optional bearer tokens for `POST /v1/report` so operators in multi-tenant deployments or LAN-exposed setups can gate reporting. Tokens defined inline or in a hot-reloadable file; constant-time compare; new metrics reject reasons. See [ADR-007](decisions.md).
+
 ## v2 candidates
 
 Bigger design decisions worth their own ADR before any code lands.
 
 - **Global degradation detection.** "Upstream X is failing for every host, demote it globally." Tunnelsmith's per-(host, upstream) scoreboard intentionally keeps every host's view independent; a global signal would require either a second aggregated table or a periodic sweep. The proposal lists this as a refinement; the v1 alternative (cascade cooling per host) covers most of the value.
 - **UDP support.** v1 is HTTP and SOCKS5 (TCP) only. UDP-over-SOCKS5 is in the SOCKS5 spec; the failure-detection model would have to change since UDP has no connection-refused.
-- **Transparent HTTPS interception.** v1 sees plain-HTTP responses fully and tunnels HTTPS opaquely. Interception would let the body-regex and status-code paths cover HTTPS too, at the cost of a CA-on-the-clients deployment story.
+- ~~**Transparent HTTPS interception.**~~ Resolved by Phase 11 cooperative reporting; superseded by [`ADR-006`](decisions.md). Apps that already terminate TLS submit per-request outcomes back to Tunnelsmith instead of the proxy decrypting the stream. MITM may be revisited if a workload demands coverage of uninstrumented HTTPS clients (browsers, closed-source binaries).
 - **Custom failure-detection hooks.** Lua or Starlark scripts that decide failure from the response. The Phase 8 `[[rule]].body_regex` handles the most common case; full scripting is more flexibility than v1 needed.
 - **Multi-instance clustering.** Two Tunnelsmith binaries sharing one scoreboard. v1 is single-process; a second instance starts cold. Useful for HA but adds a coordination dependency.
 - **Authentication on the proxy listeners.** v1 binds to loopback or a private network and trusts the network boundary. A token or basic-auth gate would let it run on a public interface; matches Squid's model.

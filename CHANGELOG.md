@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (Phase 11)
+
+- Cooperative outcome reporting for HTTPS coverage. Apps submit per-request outcomes (`ok` / `rate_limited` / `forbidden` / `legal_block` / `geo_block` / `timeout` / `refused`) to a new control listener (`[control]`, default `:9092`) so the per-(host, upstream) scoreboard learns from HTTPS traffic the proxy cannot inspect on its own. Outcomes map to existing `failure.Kind` values; no new kinds were introduced.
+- New `internal/control` package: `POST /v1/report` handler with closed outcome vocabulary, `GET /healthz`, 4 KiB body cap, JSON parsing rejects unknown fields and trailing content, full unit tests.
+- `X-Tunnelsmith-Upstream` is now injected on the CONNECT 200 response so cooperating clients can read the chosen exit id via `http.Transport.OnProxyConnectResponse` (already injected on plain-HTTP responses since Phase 5).
+- Drop-in Go SDK at `github.com/pacnpal/tunnelsmith/client`. Three lines of integration: `client.New(Options{...})` returns an `*http.Client` that captures the upstream id, auto-reports `429` / `403` / `451`, and exposes `client.Report(resp, outcome)` for app-driven semantic outcomes.
+- Wire-protocol reference at `docs/cooperative-reporting.md` so non-Go apps can implement the integration in ~30 lines.
+- Runnable Go example at `examples/integration/main.go`.
+- Two Prometheus counters for the control plane: `tunnelsmith_reports_received_total{outcome,upstream_id}` and `tunnelsmith_reports_rejected_total{reason}`.
+- ADR-006 in `docs/decisions.md` documents the decision to ship cooperative reporting instead of MITM TLS interception (the v2-candidate item from `docs/roadmap.md`, now resolved).
+
 ## [1.0.0] - 2026-05-09
 
 First public release. Tunnelsmith ships as a per-destination egress router for HTTP and SOCKS5: the proxy listeners, the per-(host, upstream) scoreboard with cooldowns and decay, Mullvad WireGuard pool integration, status- and body-regex failure detection, per-host rules, Prometheus metrics with persistence and SIGHUP hot-reload, and the embedded web UI for inspection and admin actions. ADR-005 records that release-image verification runs in CI.

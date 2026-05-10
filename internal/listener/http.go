@@ -20,6 +20,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/net/http/httpguts"
+
 	"github.com/pacnpal/tunnelsmith/internal/failure"
 	"github.com/pacnpal/tunnelsmith/internal/scoreboard"
 	"github.com/pacnpal/tunnelsmith/internal/upstream"
@@ -438,7 +440,7 @@ func (h *HTTPServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 		h.logger.Warn("connect hijack failed", "host", host, "err", err)
 		return
 	}
-	if _, err := clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
+	if _, err := clientConn.Write(buildConnectResponse(upID)); err != nil {
 		_ = clientConn.Close()
 		_ = upConn.Close()
 		h.logger.Warn("connect write 200 failed", "host", host, "err", err)
@@ -1090,4 +1092,39 @@ func (h *HTTPServer) snapshotTunnels() []*tunnel {
 		out = append(out, t)
 	}
 	return out
+}
+
+// buildConnectResponse formats the CONNECT 200 response. When upID is a
+// safe header value, the response advertises X-Tunnelsmith-Upstream so
+// cooperating clients can capture the exit id via
+// http.Transport.OnProxyConnectResponse and feed it back to the Phase 11
+// control endpoint. When upID contains bytes that would corrupt the
+// response stream, the header is omitted; the tunnel still works, the
+// reporting integration just degrades to no-op for that one request.
+// Upstream ids come from config and from [[upstream_pool]] expansion,
+// which already produce printable ASCII; the validation here is defense
+// in depth for raw-byte header writes.
+func buildConnectResponse(upID string) []byte {
+	if !validHeaderFieldValue(upID) {
+		return []byte("HTTP/1.1 200 Connection Established\r\n\r\n")
+	}
+	return []byte("HTTP/1.1 200 Connection Established\r\nX-Tunnelsmith-Upstream: " + upID + "\r\n\r\n")
+}
+
+// validHeaderFieldValue reports whether v is safe to embed in the raw
+// CONNECT 200 response we hand-write. We delegate to
+// httpguts.ValidHeaderFieldValue (the same rule net/http applies to
+// header values on the plain-HTTP forward path) so a single
+// config-defined upstream id either passes both validators or fails
+// both — there is no shape an id can take that would emit
+// X-Tunnelsmith-Upstream on plain-HTTP responses but get silently
+// dropped on CONNECT, or vice versa. The empty-string guard stops us
+// from writing a header line with no value, which would still be
+// well-formed HTTP but useless to a client trying to read the
+// upstream id.
+func validHeaderFieldValue(v string) bool {
+	if v == "" {
+		return false
+	}
+	return httpguts.ValidHeaderFieldValue(v)
 }

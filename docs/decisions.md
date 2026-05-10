@@ -157,3 +157,113 @@ The release workflow already builds and pushes the image to GHCR for `v*` tags. 
 - One workflow runs the entire release including verification. A failed verify fails the release rather than passing CI but failing on someone's laptop later.
 - The verify step adds ~30 seconds to the release workflow. Acceptable for a per-release operation that ships a public artifact.
 - ADR-001's note ("Release verification for v1.0.0 (Phase 10) still pulls from GHCR, which technically requires a local daemon. That is a release sanity check, not a build-time loop, and is fine to revisit when Phase 10 starts.") is now resolved by this ADR.
+
+---
+
+## ADR-006: HTTPS coverage uses cooperative app reporting, not TLS interception
+
+**Date:** 2026-05-09
+**Status:** Accepted
+
+### Context
+
+Through Phase 10, Tunnelsmith inspects HTTP status codes and (Phase 8) response-body regexes only on the plain-HTTP forward path. CONNECT and SOCKS5 carry TLS payloads the proxy cannot decrypt, so the scoreboard learns nothing from HTTPS bodies and only sees dial-level signals (refused, timeout) for the majority of modern traffic.
+
+`docs/roadmap.md` listed "Transparent HTTPS interception" as a v2 candidate: terminate TLS at the proxy with a self-signed CA, mint per-host leaf certs on the fly, decrypt, run the existing body-regex inspector, re-originate TLS to the upstream. The cost is concrete and well-known: every client must trust the proxy's CA, anything pinned (banking SDKs, OS update channels, gRPC mTLS, ECH-using stacks) breaks, and the CA private key becomes a high-value secret on the host.
+
+The user-facing problem the interception was trying to solve — soft geo-blocks served over HTTPS as 200 with a "not available in your region" body — has another solution. The legitimate TLS endpoint already has the decrypted response in memory: it is the app. If the app reports the outcome out-of-band, Tunnelsmith gets richer signal than MITM could ever recover (semantic outcomes, not just regex matches) without touching the TLS.
+
+Tunnelsmith's deployment shape makes this practical. The user controls the apps that benefit from per-destination egress routing: containers in their own stack, sitting behind the proxy on a private network. Browsers and closed-source binaries are not the workload.
+
+### Decision
+
+1. v1 ships **cooperative outcome reporting** as the HTTPS coverage mechanism (Phase 11):
+   - Tunnelsmith adds `X-Tunnelsmith-Upstream: <id>` to the CONNECT 200 response so the client learns which exit served the request before the TLS handshake. (Already injected on plain-HTTP responses since Phase 5.)
+   - A new control listener (`internal/control`, default `:9092`) accepts `POST /v1/report` with a JSON object (`host`, `upstream`, `outcome`, optional `http_status`) and feeds the scoreboard via `RecordSuccess` or `RecordFailure`.
+   - Outcomes are a closed vocabulary mapped to existing `failure.Kind` values. Unknown outcomes return 400 so typos surface.
+   - A small Go SDK (`client/`) wraps `http.Transport` so a maintainer integrates in under 10 lines.
+   - The wire protocol is documented in `docs/cooperative-reporting.md` so non-Go apps can implement it in ~30 lines.
+2. v1 does **not** ship transparent HTTPS interception. The "Transparent HTTPS interception" item is removed from `docs/roadmap.md`'s v2-candidates list with a pointer to this ADR.
+3. The control listener trusts the network boundary, same as the UI listener (`docs/ui.md`). Bind defaults to `:9092`; operators run it on loopback or a private subnet. Bearer-token auth is deferred until a workload runs the listener on a public interface.
+4. No new `failure.Kind` is introduced. The outcome→Kind mapping table lives in `internal/control` and reuses `KindBodyMatch` for soft geo-blocks, `KindRateLimit` for app-detected 429-equivalents, and so on.
+
+### Non-goals (named explicitly so they do not become bugs)
+
+- **Browsers.** No JS access to CONNECT response headers and no general way to POST a report tied to a specific browser request without a privileged extension.
+- **Closed-source binaries.** Anything the operator cannot modify is also out of scope.
+- **Active health probing.** Still a v2 candidate.
+- **Idempotency / dedup of reports.** Apps that retry a report are penalized twice. Document it; let the app dedupe.
+- **SOCKS5 upstream discovery.** SOCKS5 has no header channel. v1 leaves it unaddressed; a future `/v1/upstreams?host=...` lookup endpoint is the obvious add.
+
+### Consequences
+
+- HTTPS soft geo-blocks become first-class once the maintainer integrates. Signal quality exceeds what MITM could recover (semantic outcomes vs. byte-level regex on a buffered prefix).
+- The CA-on-the-clients deployment story disappears entirely. Pinned clients keep working unmodified.
+- The proxy's security stance does not escalate. No private key on disk worth more than the existing config.
+- Coverage is bounded by integration. Maintainers who do nothing get the existing dial-level signals. The integration guide (`docs/integration-guide.md`) makes the cost visible: ≤10 lines for Go, ~30 lines for any other language.
+- The Phase 8 body-regex path keeps working unchanged; cooperative reporting is additive, not a replacement for the plain-HTTP inspector.
+- Reports are not idempotent (see Non-goals). When an app retries a report — for example, after a transient control-endpoint failure — the scoreboard records the same penalty twice, which can compound an upstream's score and produce false-negative health signals that misroute subsequent traffic. Apps that care about this either deduplicate on their side or accept the over-penalty as a cost of the at-least-once delivery model.
+- If a future workload demands coverage of uninstrumented HTTPS clients, MITM can be revisited then with the v2-candidate text from `docs/roadmap.md` (now removed) preserved in this ADR's history.
+
+### References
+
+- `docs/cooperative-reporting.md` — the wire-protocol contract maintainers integrate against.
+- `docs/integration-guide.md` — Level 8 walks through the integration.
+- Go `net/http.Transport.OnProxyConnectResponse` (stable since Go 1.20) — how Go clients read the upstream id from the CONNECT 200 response.
+
+---
+
+## ADR-007: Bearer-token auth on the control endpoint (Phase 12)
+
+**Date:** 2026-05-09
+**Status:** Proposed (flips to Accepted when the Phase 12 implementation lands).
+
+### Context
+
+ADR-006 ships the cooperative-reporting endpoint (`POST /v1/report` on `internal/control`, default `:9092`) with the same trust stance as the UI listener: no auth, network boundary is the control. The trade-off was explicit and documented in `docs/cooperative-reporting.md`.
+
+That stance fails in two real cases:
+
+1. **Multi-tenant Docker networks.** Multiple distinct apps on the same network can all reach `:9092`. Any one of them can submit reports attributed to any upstream id, polluting the scoreboard for the others.
+2. **Operators who deliberately reach `:9092` from elsewhere on a LAN.** Network-boundary trust dissolves the moment the listener is reachable from a host the operator does not also control.
+
+Phase 11 named "bearer-token auth as a follow-up" in the trade-offs section. Phase 12 ships it.
+
+The design space was small. Bearer is the simplest credible primitive: stateless, no key infrastructure, fits in one HTTP header, every HTTP client supports it. The alternatives (mTLS, OAuth/JWT, signed payloads) all add infrastructure the workload does not need yet.
+
+### Decision
+
+1. Add an optional bearer-token auth gate to `POST /v1/report`. Tokens are configured via:
+   - `[control].auth_tokens = ["t1", "t2"]` (inline list), and/or
+   - `[control].auth_tokens_file = "/etc/tunnelsmith/control_tokens"` (one token per line, `#` comments OK, hot-reloadable on SIGHUP).
+2. Empty token set is the **default** and is identical to Phase 11 behavior. Upgrade is non-breaking; operators opt in by adding tokens.
+3. Token verification uses `crypto/subtle.ConstantTimeCompare` to defeat timing oracles. Lint enforces no `==` against credential bytes.
+4. 401 responses include `WWW-Authenticate: Bearer realm="tunnelsmith"`.
+5. Two new reject reasons in `tunnelsmith_reports_rejected_total{reason}`: `auth_missing` (no `Authorization` header but auth enabled) and `auth_failed` (header present but token did not match or was malformed).
+6. SIGHUP re-reads tokens from config and from `auth_tokens_file`. New tokens take effect for the next request; in-flight requests keep their existing accept/reject decision.
+7. The Go SDK adds `Options.Token`. When non-empty, every report POST (auto-report and synchronous `Report`) carries `Authorization: Bearer <token>`.
+8. `GET /healthz` stays ungated by default so liveness probes work without a token.
+
+### Non-goals (named explicitly)
+
+- **TLS on the control listener.** Auth without TLS still leaks tokens to anyone sniffing the network. Operators who need both should run the listener behind a reverse proxy that terminates TLS, or wait for a future phase that lands TLS on `internal/control`. Phase 12 does not bundle TLS because the two changes have independent rollouts and combining them would slow both.
+- **mTLS, OAuth, JWT, JWKS, OIDC.** Bearer is the right size for v1 of auth. Anything richer is a separate ADR if a workload demands it.
+- **Per-token rate limits or scopes.** A token that can submit reports submits any report. Multi-token support is for rotation and (future) auditability, not for limiting any single token's surface.
+- **Token storage.** Tunnelsmith does not generate, rotate, or persist tokens. Operators do that out of band.
+- **Auth on the UI listener.** Same network-boundary stance there; orthogonal change.
+
+### Consequences
+
+- Operators who run the control endpoint on loopback or a private subnet can keep doing so unchanged. Empty token set = same wire shape as Phase 11.
+- Operators in multi-tenant or LAN-exposed deployments get a credible auth gate without ceremony. Each app gets its own token; rotation is a SIGHUP away.
+- Token compromise is a real failure mode. Without TLS on the control listener, bearer tokens travel in plaintext over the network path between the app and Tunnelsmith and can be captured by any observer on the Docker network, the LAN, or any intermediate hop — see the TLS entry under Non-goals above. Mitigations: bind the listener to loopback or to a network segment the operator already trusts, use short-lived tokens, rotate periodically, and when Phase 13 lands the listener-side TLS, terminate TLS at the listener. Operators evaluating Phase 12 for multi-tenant or LAN-exposed deployments should treat plaintext-token transmission as the primary risk to plan around until that follow-up ships.
+- The wire protocol stays backward-compatible. Existing apps without tokens keep working as long as the operator has not configured tokens server-side. Once tokens are configured, every app must opt in or it gets 401.
+- The metrics reject vocabulary grows by two labels. Operators with alerting on `tunnelsmith_reports_rejected_total` should add a panel for `auth_missing` + `auth_failed` to catch misconfigured clients.
+- The control package gains a small `auth.go` and a `tokenSet` abstraction; the rest of the surface is one new option per existing constructor.
+
+### References
+
+- `docs/cooperative-reporting.md` — wire-protocol contract that grows the optional `Authorization` header.
+- `docs/roadmap.md` — planned follow-up tracking for Phase 12.
+- ADR-006 — the Phase 11 decision this builds on.
+- RFC 6750 — Bearer Token usage in HTTP Authorization headers.

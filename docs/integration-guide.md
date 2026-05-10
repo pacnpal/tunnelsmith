@@ -150,6 +150,39 @@ deploy/
 
 Users who want VPN routing get a known-good baseline they can adapt.
 
+## Level 8: report HTTPS outcomes back to Tunnelsmith (Phase 11)
+
+Tunnelsmith cannot inspect HTTPS responses; the proxy carries TLS bytes blindly. Your app *can* see those responses — it terminates the TLS, so the cleartext is right there. The cooperative reporting protocol lets your app submit per-request outcomes back to Tunnelsmith so the scoreboard learns from HTTPS the same way it does from plain HTTP. This is the difference between "Tunnelsmith only sees dial failures on HTTPS" and "Tunnelsmith fully understands which exits are working for which destinations".
+
+**Go: three lines.** Use the SDK at [`github.com/pacnpal/tunnelsmith/client`](../client). The wrapped `*http.Client` captures the chosen upstream id automatically, auto-reports HTTPS `429` / `403` / `451`, and lets you submit semantic outcomes (soft geo-block, app-detected timeout, custom signals) via `client.Report`.
+
+```go
+import "github.com/pacnpal/tunnelsmith/client"
+
+c, err := client.New(client.Options{
+    ProxyURL:   "http://tunnelsmith:8080",
+    ControlURL: "http://tunnelsmith:9092",
+})
+resp, err := c.Get("https://example.com/api/things")
+// HTTPS 429/403/451 auto-report. For semantic outcomes:
+_ = client.Report(resp, "geo_block")
+```
+
+A runnable example lives at [`examples/integration/main.go`](../examples/integration/main.go).
+
+**Other languages: ~30 lines.** The wire protocol is documented in [`docs/cooperative-reporting.md`](cooperative-reporting.md) — read one HTTP header off the response, POST one JSON object to the control endpoint. Any HTTP client in any language can implement it.
+
+When this is worth doing:
+
+- Your app fetches HTTPS resources where the upstream's behavior matters (rate limiting, regional content, soft geo-blocks served as `200 OK` with a "not available in your region" page).
+- You already have the response in your app and can classify it.
+- You want Tunnelsmith's per-(host, upstream) scoreboard to rotate exits intelligently for your specific traffic.
+
+When to skip it:
+
+- Your app's HTTPS requests are uniform and you only care about hard failures (refused, timeout). The dial path already covers those.
+- You can't modify your app (third-party SDK, closed-source binary). MITM is the alternative; see [ADR-006](decisions.md) for why Tunnelsmith does not ship MITM.
+
 ## Common integration mistakes
 
 These show up repeatedly and are worth calling out.
@@ -191,7 +224,7 @@ myapp:
   # no ports section
 ```
 
-**Expecting status-code detection for HTTPS.** Tunnelsmith cannot see status codes inside an HTTPS tunnel. If your app relies on Tunnelsmith handling 429s for HTTPS endpoints, it will not. Configure your app to handle 429s itself for HTTPS, and let Tunnelsmith handle them for HTTP. See [`docs/request-lifecycle.md`](request-lifecycle.md) for the full explanation.
+**Expecting status-code detection for HTTPS without integrating.** Tunnelsmith cannot see status codes inside an HTTPS tunnel on its own. If your app relies on Tunnelsmith handling 429s for HTTPS endpoints, it will not — unless you opt in to cooperative reporting (Level 8 above). Without that, configure your app to handle 429s itself for HTTPS, and let Tunnelsmith handle them for HTTP. See [`docs/request-lifecycle.md`](request-lifecycle.md) for the full explanation, and [`docs/cooperative-reporting.md`](cooperative-reporting.md) for the integration that lifts this restriction.
 
 ## Verifying your integration works
 

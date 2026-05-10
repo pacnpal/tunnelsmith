@@ -55,6 +55,8 @@ Setup is a one-time keypair generation (counts against Mullvad's 5-device cap) p
 
 If you build a container that benefits from outbound proxying (`*arr` apps, scrapers, downloaders, RSS pollers, federated services), [`docs/integration-guide.md`](docs/integration-guide.md) is a layered checklist for shipping Tunnelsmith support, from "document the standard env-var pattern" to "ship an official compose snippet". The lowest level is no code changes.
 
+For HTTPS coverage of the per-host scoreboard, the optional Phase 11 cooperative reporting protocol lets your app submit per-request outcomes back to Tunnelsmith. Three lines of Go via the [`client`](client) package, or any HTTP client in any language using the wire protocol at [`docs/cooperative-reporting.md`](docs/cooperative-reporting.md).
+
 ## Documentation
 
 - [`docs/configuration.md`](docs/configuration.md): every config key explained
@@ -64,6 +66,7 @@ If you build a container that benefits from outbound proxying (`*arr` apps, scra
 - [`docs/ui.md`](docs/ui.md): the web UI, the four action endpoints, and the security stance (Phase 9)
 - [`docs/request-lifecycle.md`](docs/request-lifecycle.md): end-to-end trace of a single request
 - [`docs/integration-guide.md`](docs/integration-guide.md): for container maintainers adding Tunnelsmith support
+- [`docs/cooperative-reporting.md`](docs/cooperative-reporting.md): wire protocol for app-driven outcome reporting (Phase 11)
 - [`docs/decisions.md`](docs/decisions.md): architecture decision records
 
 ## Metrics and persistence

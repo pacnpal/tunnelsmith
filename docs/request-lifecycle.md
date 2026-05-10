@@ -155,11 +155,12 @@ A 429 from the destination over HTTPS is invisible to Tunnelsmith and is passed 
 
 This is a real limitation. Workarounds:
 
+- **Phase 11 cooperative reporting (recommended).** Apps you control can post per-request outcomes back to Tunnelsmith via [`/v1/report`](cooperative-reporting.md). The app already has the cleartext response — it's the legitimate TLS endpoint — and a small reporting call lets the scoreboard see HTTPS the same way it sees plain HTTP. The Go SDK at [`github.com/pacnpal/tunnelsmith/client`](../client) auto-reports HTTPS `429`/`403`/`451` and lets the app submit semantic outcomes (`geo_block`, `timeout`, etc.) for HTTPS responses with a single call.
 - Use plain HTTP wherever the client can (many internal APIs and tracker endpoints support both).
 - Rely on application-level retry logic (most libraries handle 429 with backoff already).
-- Accept that HTTPS-only sites only get TCP-level failover, which still helps with hard blocks and outages.
+- Accept that HTTPS-only sites you cannot modify only get TCP-level failover, which still helps with hard blocks and outages.
 
-A future v2 could add a mitmproxy-style TLS interceptor in front of Tunnelsmith, but that requires CA trust distribution to every client and significantly increases complexity.
+[`ADR-006`](decisions.md) explains why Tunnelsmith ships cooperative reporting instead of MITM TLS interception (CA-on-the-clients deployment story, broken pinned clients, and a security stance the project deliberately avoids).
 
 ### SOCKS5 hostname mode matters
 

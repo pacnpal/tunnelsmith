@@ -61,6 +61,7 @@ type Config struct {
 	Cache         CacheConfig          `toml:"cache"`
 	Metrics       MetricsConfig        `toml:"metrics"`
 	UI            UIConfig             `toml:"ui"`
+	Control       ControlConfig        `toml:"control"`
 	Upstreams     []UpstreamConfig     `toml:"upstream"`
 	UpstreamPools []UpstreamPoolConfig `toml:"upstream_pool"`
 	Failure       FailureConfig        `toml:"failure"`
@@ -112,6 +113,22 @@ type MetricsConfig struct {
 // the Docker / host network, documented in docs/ui.md.
 type UIConfig struct {
 	Bind string `toml:"bind"` // default: ":9091"; "" disables
+}
+
+// ControlConfig controls the cooperative-reporting endpoint added in
+// Phase 11. Bind sets the host:port the control HTTP listener serves on;
+// setting it to the empty string disables the listener entirely. The
+// endpoint exposes POST /v1/report so app integrations can feed
+// per-request outcomes (success / soft geo-block / app-detected rate
+// limit / etc.) into the scoreboard, giving HTTPS coverage that the
+// proxy cannot derive from CONNECT or SOCKS5 traffic on its own.
+//
+// There is no auth on the port; the security boundary is the same as
+// the UI listener — bind to loopback or to a private subnet only
+// trusted clients can reach. docs/cooperative-reporting.md spells out
+// the trust stance.
+type ControlConfig struct {
+	Bind string `toml:"bind"` // default: ":9092"; "" disables
 }
 
 // UpstreamConfig declares one egress option that the router can pick.
@@ -353,6 +370,9 @@ func (c *Config) applyDefaults(md toml.MetaData) {
 	if !md.IsDefined("ui", "bind") {
 		c.UI.Bind = ":9091"
 	}
+	if !md.IsDefined("control", "bind") {
+		c.Control.Bind = ":9092"
+	}
 	if !md.IsDefined("failure", "timeout_ms") {
 		c.Failure.TimeoutMS = 8000
 	}
@@ -476,6 +496,12 @@ func (c *Config) Validate() error {
 
 	if c.UI.Bind != "" {
 		if err := validateAddr(c.UI.Bind, "ui.bind"); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	if c.Control.Bind != "" {
+		if err := validateAddr(c.Control.Bind, "control.bind"); err != nil {
 			errs = append(errs, err)
 		}
 	}

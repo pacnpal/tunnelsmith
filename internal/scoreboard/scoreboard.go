@@ -150,14 +150,14 @@ func FromConfig(s config.ScoringConfig, status []config.StatusRule, connectionRe
 	return Config{
 		ConnectionRefused: connectionRefused,
 		KindPolicy:        policy,
-		SuccessWeight:  s.SuccessWeight,
-		ScoreCap:       s.ScoreCap,
-		ProbeChance:    s.ProbeChance,
-		DecayInterval:  s.DecayInterval.Duration(),
-		DecayStep:      s.DecayStep,
-		CascadeTTL:     s.CascadeTTL.Duration(),
-		DebounceWindow: s.DebounceWindow.Duration(),
-		PruneAfter:     s.PruneAfter.Duration(),
+		SuccessWeight:     s.SuccessWeight,
+		ScoreCap:          s.ScoreCap,
+		ProbeChance:       s.ProbeChance,
+		DecayInterval:     s.DecayInterval.Duration(),
+		DecayStep:         s.DecayStep,
+		CascadeTTL:        s.CascadeTTL.Duration(),
+		DebounceWindow:    s.DebounceWindow.Duration(),
+		PruneAfter:        s.PruneAfter.Duration(),
 	}
 }
 
@@ -382,6 +382,20 @@ func (s *Scoreboard) PoolIDs() []string {
 		out[i] = e.Up.ID()
 	}
 	return out
+}
+
+// HasUpstream reports whether id exists in the live pool snapshot.
+// Used by control-plane report validation on the per-request path to
+// avoid allocating a full id list for each membership check.
+func (s *Scoreboard) HasUpstream(id string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, e := range s.poolEntries {
+		if e.Up.ID() == id {
+			return true
+		}
+	}
+	return false
 }
 
 // ReplaceRules swaps the per-host rule set in place. Used by the SIGHUP
