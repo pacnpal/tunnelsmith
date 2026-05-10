@@ -7,7 +7,7 @@ What's deliberately out of scope for v1, in rough priority order. Items listed h
 These are incremental fixes against the v1 surface and may land in a v1.x point release rather than waiting for v2.
 
 - **`failure.connection_refused` opt-out actually works.** The config field is parsed and defaulted to `true`; the runtime does not yet consult it. Tracked in [#20](https://github.com/pacnpal/tunnelsmith/issues/20).
-- **Hot-reload of `[[upstream_pool]]` Mullvad relay churn.** Today the refresh tick logs added/removed upstream ids but the running pool is whatever startup produced. SIGHUP also leaves the pool frozen on purpose so a reload does not block on Mullvad's API. A follow-up should swap the pool on the refresh tick directly so a relay rotation lands without a restart.
+- ~~**Hot-reload of `[[upstream_pool]]` Mullvad relay churn.**~~ Shipped in Phase 11.1. The refresh tick now hot-swaps the running priority pool on every successful diff via `Scoreboard.ReplacePool`; cached HTTP transports are dropped, the gauge refresher updates, and `tunnelsmith_pool_hotswap_total{result}` records the swap. SIGHUP still skips pool changes when `[[upstream_pool]]` is configured (static `[[upstream]]` edits remain restart-only in pool deployments) since the refresh ticker now owns pool-shape changes end-to-end.
 
 ## Planned
 

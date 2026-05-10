@@ -52,6 +52,7 @@ detail.
 | `tunnelsmith_probe_picks_total` | none | Number of times the probe roll picked a non-top eligible candidate. |
 | `tunnelsmith_persistence_writes_total` | `result` | Snapshot-write outcomes. Result is `success` or `error`. |
 | `tunnelsmith_config_reloads_total` | `result` | SIGHUP-driven reload outcomes. Result is `success` or `error`. |
+| `tunnelsmith_pool_hotswap_total` | `result` | `[[upstream_pool]]` refresh-tick hot-swap outcomes (Phase 11.1). One increment per refresh tick whose diff was non-empty; `result=success` when `Scoreboard.ReplacePool` installed the new pool, `result=error` when a build error left the running pool untouched. |
 
 ### Histograms
 

@@ -125,7 +125,7 @@ countries = ["Sweden", "Netherlands", "Switzerland"]
 
 A config that uses only `[[upstream_pool]]` and no `[[upstream]]` is valid; a config with neither is rejected.
 
-The pool expansion runs at startup to seed the priority pool, and a per-block refresh goroutine keeps polling the relay list at the configured interval. In v1.0.0 the refresh tick logs the diff (added / removed upstream ids) so operators can see relay churn; the live running pool is whatever startup produced. To pick up a refreshed pool, restart the binary. SIGHUP re-reads the config file, but pools backed by `[[upstream_pool]]` are deliberately frozen across SIGHUP because re-fetching the relay list under signal would block the reload on Mullvad's API. `refresh = "0s"` is allowed and disables periodic refresh entirely; any positive value below 1m is rejected so a typo cannot hammer Mullvad's public relay-list API.
+The pool expansion runs at startup to seed the priority pool, and a per-block refresh goroutine keeps polling the relay list at the configured interval. As of Phase 11.1, the refresh tick **hot-swaps the running priority pool** on every successful diff: a new `*upstream.Pool` is built from the merged `(static [[upstream]]) ∪ (every block's latest expansion)` slice and installed via `Scoreboard.ReplacePool`. Cached HTTP transports are dropped during the swap so the new pool's `Upstream` objects use freshly-pinned `DialContext` closures. Force pins to upstream ids that disappear in the new expansion are evicted automatically. Per-(host, upstream) entries for removed ids stay in the scoreboard's table but become unreachable through `Pick`; they age out via score decay. The diff is logged at `INFO` (counts plus a small sample) and at `DEBUG` (full id lists), and `tunnelsmith_pool_hotswap_total{result}` counts every swap. SIGHUP still does not touch the pool when `[[upstream_pool]]` is configured — pool-shape changes are owned end-to-end by the refresh ticker, and changes to `[[upstream]]` (static entries) under a pool deployment still require a binary restart. `refresh = "0s"` is allowed and disables periodic refresh entirely; any positive value below 1m is rejected so a typo cannot hammer Mullvad's public relay-list API.
 
 ## `[failure]`
 
@@ -265,7 +265,8 @@ What hot-reload does NOT change (restart required):
 - `ui.bind`
 - `cache.persist_path` and `cache.persist_interval`
 - `failure.scoring.decay_interval`
-- `[[upstream_pool]]` (Mullvad refresh schedule)
+- `[[upstream_pool]]` block shape (`provider`, `id_prefix`, `priority`, `countries`, `include_inactive`, `refresh`, `cache_path`). The pool's *expansion* is hot-swapped on every refresh tick (Phase 11.1); the *block configuration* itself is not.
+- `[[upstream]]` static entries when an `[[upstream_pool]]` block is present. Static-only deployments hot-reload static entries fine; pool deployments need a restart so the composer's startup-captured static slice picks up the change.
 
 The reload outcome is reported on `tunnelsmith_config_reloads_total{result="success" | "error"}`.
 
