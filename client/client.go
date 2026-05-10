@@ -299,14 +299,15 @@ func hostForReport(req *http.Request) string {
 	return req.Host
 }
 
+// normalizeHostPort returns host:port for reporting by adding a default
+// port when one is absent (443 for https, 80 for http). Returns empty
+// string for unsupported schemes so callers can fall back to raw host.
 func normalizeHostPort(hostport, scheme string) string {
 	host := hostport
 	port := ""
-	if strings.Contains(hostport, ":") {
-		if splitHost, splitPort, err := net.SplitHostPort(hostport); err == nil {
-			host = splitHost
-			port = splitPort
-		}
+	if splitHost, splitPort, err := net.SplitHostPort(hostport); err == nil {
+		host = splitHost
+		port = splitPort
 	}
 	if port == "" {
 		switch strings.ToLower(scheme) {
