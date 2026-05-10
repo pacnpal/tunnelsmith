@@ -152,8 +152,12 @@ func TestPoolComposerSwapsRunningPool(t *testing.T) {
 		directUpstream("mvd-002", 200),
 		directUpstream("mvd-003", 200),
 	}
-	if err := c.Update("mvd", next); err != nil {
+	applied, err := c.Update("mvd", next)
+	if err != nil {
 		t.Fatalf("Update: %v", err)
+	}
+	if !applied {
+		t.Fatalf("Update reported applied=false on a real change")
 	}
 	if got, want := sortedIDs(sb.PoolIDs()), []string{"mvd-002", "mvd-003", "static-direct"}; !equalStrings(got, want) {
 		t.Fatalf("after Update PoolIDs = %v, want %v", got, want)
@@ -177,7 +181,7 @@ func TestPoolComposerPreservesStaticEntries(t *testing.T) {
 	c, sb, _ := composerForTest(t, statics, []*poolBlock{pb}, initialPool)
 
 	// Empty the block entirely.
-	if err := c.Update("mvd", nil); err != nil {
+	if _, err := c.Update("mvd", nil); err != nil {
 		t.Fatalf("Update with empty next: %v", err)
 	}
 	if got, want := sortedIDs(sb.PoolIDs()), []string{"static-A", "static-B"}; !equalStrings(got, want) {
@@ -185,7 +189,7 @@ func TestPoolComposerPreservesStaticEntries(t *testing.T) {
 	}
 
 	// Block comes back with new ids.
-	if err := c.Update("mvd", []config.UpstreamConfig{directUpstream("mvd-099", 200)}); err != nil {
+	if _, err := c.Update("mvd", []config.UpstreamConfig{directUpstream("mvd-099", 200)}); err != nil {
 		t.Fatalf("Update with one entry: %v", err)
 	}
 	if got, want := sortedIDs(sb.PoolIDs()), []string{"mvd-099", "static-A", "static-B"}; !equalStrings(got, want) {
@@ -212,7 +216,7 @@ func TestPoolComposerEvictsForcePinForRemovedID(t *testing.T) {
 	if got := sb.ForceSnapshot(); len(got) != 1 || got[0].UpstreamID != "mvd-001" {
 		t.Fatalf("pre-swap ForceSnapshot = %+v, want one pin to mvd-001", got)
 	}
-	if err := c.Update("mvd", []config.UpstreamConfig{directUpstream("mvd-002", 200)}); err != nil {
+	if _, err := c.Update("mvd", []config.UpstreamConfig{directUpstream("mvd-002", 200)}); err != nil {
 		t.Fatalf("Update: %v", err)
 	}
 	if got := sb.ForceSnapshot(); len(got) != 0 {
@@ -239,8 +243,8 @@ func TestPoolComposerErrorLeavesPoolUntouched(t *testing.T) {
 	bad := config.UpstreamConfig{ID: "broken", Kind: ""}
 	prio := 200
 	bad.Priority = &prio
-	if err := c.Update("mvd", []config.UpstreamConfig{bad}); err == nil {
-		t.Fatalf("Update with malformed entry: want error, got nil")
+	if applied, err := c.Update("mvd", []config.UpstreamConfig{bad}); err == nil {
+		t.Fatalf("Update with malformed entry: want error, got nil (applied=%v)", applied)
 	}
 
 	if got := sortedIDs(sb.PoolIDs()); !equalStrings(got, beforeIDs) {
@@ -272,7 +276,7 @@ func TestPoolComposerErrorDoesNotPoisonCacheForOtherBlocks(t *testing.T) {
 	c, sb, _ := composerForTest(t, statics, []*poolBlock{pbA, pbB}, initialPool)
 
 	// First, confirm a healthy update on B installs cleanly.
-	if err := c.Update("mvd-b", []config.UpstreamConfig{directUpstream("b-002", 200)}); err != nil {
+	if _, err := c.Update("mvd-b", []config.UpstreamConfig{directUpstream("b-002", 200)}); err != nil {
 		t.Fatalf("Update b: %v", err)
 	}
 
@@ -280,7 +284,7 @@ func TestPoolComposerErrorDoesNotPoisonCacheForOtherBlocks(t *testing.T) {
 	prio := 200
 	bad := config.UpstreamConfig{ID: "broken", Kind: ""}
 	bad.Priority = &prio
-	if err := c.Update("mvd-a", []config.UpstreamConfig{bad}); err == nil {
+	if _, err := c.Update("mvd-a", []config.UpstreamConfig{bad}); err == nil {
 		t.Fatalf("Update a (malformed): want error, got nil")
 	}
 
@@ -289,12 +293,72 @@ func TestPoolComposerErrorDoesNotPoisonCacheForOtherBlocks(t *testing.T) {
 	// "broken" entry. If the cache had been poisoned, the next pool
 	// would either include "broken" (and fail to build) or be missing
 	// "a-001".
-	if err := c.Update("mvd-b", []config.UpstreamConfig{directUpstream("b-003", 200)}); err != nil {
+	if _, err := c.Update("mvd-b", []config.UpstreamConfig{directUpstream("b-003", 200)}); err != nil {
 		t.Fatalf("Update b again: %v", err)
 	}
 	want := []string{"a-001", "b-003", "static-direct"}
 	if got := sortedIDs(sb.PoolIDs()); !equalStrings(got, want) {
 		t.Fatalf("after recovery PoolIDs = %v, want %v (failed Update on a must not have committed its cached expansion)", got, want)
+	}
+}
+
+// TestPoolComposerRetriesAfterTransientError — pins the swap-retry
+// contract: when an Update for a snapshot fails, the cache stays at
+// the prior good snapshot, so a subsequent Update with the same
+// snapshot re-attempts the swap. Without this, a one-time failure
+// would go silent forever if Mullvad's relay list happens to be
+// stable post-failure (the expander's prev/next diff would be empty
+// on later ticks). The success counter ticks once after recovery.
+func TestPoolComposerRetriesAfterTransientError(t *testing.T) {
+	t.Parallel()
+	statics := []config.UpstreamConfig{directUpstream("static-direct", 100)}
+	pb := &poolBlock{idPrefix: "mvd", initial: []config.UpstreamConfig{directUpstream("mvd-001", 200)}, logger: quietTestLogger()}
+	initialPool := append([]config.UpstreamConfig{}, statics...)
+	initialPool = append(initialPool, pb.initial...)
+	c, sb, reg := composerForTest(t, statics, []*poolBlock{pb}, initialPool)
+
+	// Tick 1: malformed entry — Update fails, cache stays at mvd-001.
+	prio := 200
+	bad := config.UpstreamConfig{ID: "broken", Kind: ""}
+	bad.Priority = &prio
+	if _, err := c.Update("mvd", []config.UpstreamConfig{bad}); err == nil {
+		t.Fatalf("Update with malformed entry: want error, got nil")
+	}
+	if got := poolHotSwapCount(t, reg, "error"); got != 1 {
+		t.Fatalf("error counter after first failure = %v, want 1", got)
+	}
+
+	// Tick 2: same call (stable Mullvad snapshot post-failure) still
+	// errors. Without the cache-on-success fix the composer would
+	// have advanced its cache to "broken" and a second call would
+	// behave differently. The test asserts both error-counter ticks
+	// land and the running pool stays at mvd-001.
+	if _, err := c.Update("mvd", []config.UpstreamConfig{bad}); err == nil {
+		t.Fatalf("Update again with malformed entry: want error, got nil")
+	}
+	if got := poolHotSwapCount(t, reg, "error"); got != 2 {
+		t.Fatalf("error counter after retry = %v, want 2", got)
+	}
+	if got, want := sortedIDs(sb.PoolIDs()), []string{"mvd-001", "static-direct"}; !equalStrings(got, want) {
+		t.Fatalf("PoolIDs after two failed Updates = %v, want %v", got, want)
+	}
+
+	// Tick 3: snapshot recovers. Update succeeds, success counter
+	// ticks, running pool catches up.
+	if applied, err := c.Update("mvd", []config.UpstreamConfig{directUpstream("mvd-002", 200)}); err != nil || !applied {
+		t.Fatalf("recovery Update: applied=%v err=%v, want applied=true err=nil", applied, err)
+	}
+	if got := poolHotSwapCount(t, reg, "success"); got != 1 {
+		t.Fatalf("success counter after recovery = %v, want 1", got)
+	}
+
+	// Tick 4: stable snapshot equal to last-applied — Update is a
+	// silent no-op. applied=false, no metric tick, no swap.
+	if applied, err := c.Update("mvd", []config.UpstreamConfig{directUpstream("mvd-002", 200)}); err != nil || applied {
+		t.Fatalf("no-op Update: applied=%v err=%v, want applied=false err=nil", applied, err)
+	}
+	if got := poolHotSwapCount(t, reg, "success"); got != 1 {
+		t.Fatalf("success counter after no-op = %v, want still 1", got)
 	}
 }
 
@@ -310,7 +374,7 @@ func TestPoolComposerUnknownIDPrefixReturnsError(t *testing.T) {
 	c, sb, reg := composerForTest(t, statics, []*poolBlock{pb}, initialPool)
 	beforeIDs := sortedIDs(sb.PoolIDs())
 
-	err := c.Update("ghost", []config.UpstreamConfig{directUpstream("ghost-001", 200)})
+	_, err := c.Update("ghost", []config.UpstreamConfig{directUpstream("ghost-001", 200)})
 	if err == nil {
 		t.Fatal("Update with unknown id_prefix: want error, got nil")
 	}

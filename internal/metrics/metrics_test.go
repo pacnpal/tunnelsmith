@@ -28,6 +28,9 @@ func TestRegistryExpositionShape(t *testing.T) {
 	reg.ObserveProbePick()
 	reg.ObservePersistenceWrite(metrics.ResultSuccess)
 	reg.ObserveConfigReload(metrics.ResultError)
+	reg.ObserveReportReceived("ok", "upstream-a")
+	reg.ObserveReportRejected(metrics.ReportRejectBadJSON)
+	reg.ObservePoolHotSwap(metrics.ResultSuccess)
 	reg.SetUpstreamPoolSize(7)
 	reg.SetScoreboardSnapshot(3, map[string]int{"upstream-a": 2}, 1, []string{"upstream-a"})
 
@@ -45,6 +48,9 @@ func TestRegistryExpositionShape(t *testing.T) {
 		"tunnelsmith_scoreboard_entries",
 		"tunnelsmith_upstream_cooled_hosts",
 		"tunnelsmith_cascade_active_hosts",
+		"tunnelsmith_reports_received_total",
+		"tunnelsmith_reports_rejected_total",
+		"tunnelsmith_pool_hotswap_total",
 	}
 	for _, name := range wantNames {
 		if !strings.Contains(body, name) {
