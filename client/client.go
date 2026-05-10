@@ -135,6 +135,12 @@ func New(opts Options) (*http.Client, error) {
 	if pu.Scheme != "http" && pu.Scheme != "https" {
 		return nil, fmt.Errorf("client: ProxyURL scheme must be http or https, got %q", pu.Scheme)
 	}
+	if pu.Host == "" {
+		return nil, errors.New("client: ProxyURL must include host")
+	}
+	if pu.Path != "" && pu.Path != "/" {
+		return nil, fmt.Errorf("client: ProxyURL path must be empty or '/', got %q", pu.Path)
+	}
 	if pu.RawQuery != "" || pu.Fragment != "" {
 		return nil, fmt.Errorf("client: ProxyURL must not include a query or fragment, got %q", opts.ProxyURL)
 	}

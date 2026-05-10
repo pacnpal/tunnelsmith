@@ -149,6 +149,8 @@ func TestNewValidatesOptions(t *testing.T) {
 		{"missing proxy", client.Options{ControlURL: "http://x"}},
 		{"missing control", client.Options{ProxyURL: "http://x"}},
 		{"bad proxy scheme", client.Options{ProxyURL: "ftp://x", ControlURL: "http://y"}},
+		{"proxy missing host", client.Options{ProxyURL: "http://", ControlURL: "http://y"}},
+		{"proxy with non-root path", client.Options{ProxyURL: "http://proxy:8080/base", ControlURL: "http://y"}},
 		{"proxy with query", client.Options{ProxyURL: "http://x?a=1", ControlURL: "http://y"}},
 		{"proxy with fragment", client.Options{ProxyURL: "http://x#frag", ControlURL: "http://y"}},
 		{"control with query", client.Options{ProxyURL: "http://x", ControlURL: "http://y?a=1"}},
