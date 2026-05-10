@@ -182,6 +182,8 @@ func handleReport(w http.ResponseWriter, r *http.Request, backend Backend, m Met
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// hostLabelRe matches one RFC 1123-ish DNS label used in report host
+// validation. Compiled once at package init and reused per request.
 var hostLabelRe = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 
 func normalizeReportHost(host string) (string, error) {
@@ -204,6 +206,9 @@ func normalizeReportHost(host string) (string, error) {
 		return net.JoinHostPort(normalizedHost, splitPort), nil
 	}
 
+	// When SplitHostPort fails, a colon still indicates malformed
+	// host:port input (for example "example.com:abc"), not a plain host.
+	// Bare hosts without any colon are accepted and validated below.
 	if strings.Contains(host, ":") {
 		return "", fmt.Errorf("host %q must be hostname or host:port", host)
 	}

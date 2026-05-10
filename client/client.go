@@ -326,6 +326,9 @@ func splitHostAndPort(raw string) (string, string) {
 	if splitHost, splitPort, err := net.SplitHostPort(raw); err == nil {
 		return splitHost, splitPort
 	}
+	// Fallback path for host values without an explicit port, or inputs
+	// where SplitHostPort fails to split. We intentionally leverage
+	// url.URL's Hostname/Port helpers on a host-only value.
 	u := &url.URL{Host: raw}
 	return u.Hostname(), u.Port()
 }
