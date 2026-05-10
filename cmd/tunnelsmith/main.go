@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -439,13 +440,17 @@ func newPoolComposer(
 ) *poolComposer {
 	cb := make([]composerBlock, 0, len(blocks))
 	for _, b := range blocks {
+		// slices.Clone preserves the nil-vs-empty distinction so a
+		// stably-empty Mullvad snapshot ([]T{}, non-nil) doesn't
+		// collapse into nil here and then mismatch every refresh tick
+		// under reflect.DeepEqual.
 		cb = append(cb, composerBlock{
 			idPrefix: b.idPrefix,
-			current:  append([]config.UpstreamConfig(nil), b.initial...),
+			current:  slices.Clone(b.initial),
 		})
 	}
 	return &poolComposer{
-		static:      append([]config.UpstreamConfig(nil), staticUpstreams...),
+		static:      slices.Clone(staticUpstreams),
 		blocks:      cb,
 		sb:          sb,
 		httpSrv:     httpSrv,
@@ -544,8 +549,11 @@ func (c *poolComposer) Update(idPrefix string, next []config.UpstreamConfig) (bo
 	}
 
 	// Swap succeeded: commit the new expansion to the cache so the next
-	// Update merges from the actually-installed view.
-	c.blocks[idx].current = append([]config.UpstreamConfig(nil), next...)
+	// Update merges from the actually-installed view. slices.Clone (not
+	// append([]T(nil), …)) so an empty-but-non-nil next stays empty-but-
+	// non-nil — otherwise the DeepEqual short-circuit above would fail
+	// on every subsequent tick when the snapshot is stably empty.
+	c.blocks[idx].current = slices.Clone(next)
 
 	// Drop cached HTTP transports so a new pool's Upstream objects
 	// build fresh DialContext closures rather than routing through the

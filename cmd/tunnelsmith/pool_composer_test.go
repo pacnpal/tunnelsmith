@@ -389,6 +389,45 @@ func TestPoolComposerUnknownIDPrefixReturnsError(t *testing.T) {
 	}
 }
 
+// TestPoolComposerEmptyExpansionStableNoSwap regresses the nil-vs-empty
+// slice bug where the cache seed and post-swap cache commit collapsed
+// an empty-but-non-nil snapshot (`[]config.UpstreamConfig{}`) into nil.
+// `reflect.DeepEqual(nil, []T{}) == false`, so before the fix every
+// refresh tick on a stably-empty Mullvad block triggered a redundant
+// pool rebuild and an unexpected `pool_hotswap_total` increment.
+func TestPoolComposerEmptyExpansionStableNoSwap(t *testing.T) {
+	t.Parallel()
+	staticUC := directUpstream("static-direct", 100)
+	emptyExpansion := []config.UpstreamConfig{} // non-nil, len 0 — what mullvad.Expander.Snapshot returns
+	pb := &poolBlock{idPrefix: "mvd", initial: emptyExpansion, logger: quietTestLogger()}
+	initialPool := []config.UpstreamConfig{staticUC}
+	c, sb, reg := composerForTest(t, []config.UpstreamConfig{staticUC}, []*poolBlock{pb}, initialPool)
+
+	beforeIDs := sortedIDs(sb.PoolIDs())
+	if !equalStrings(beforeIDs, []string{"static-direct"}) {
+		t.Fatalf("initial PoolIDs = %v, want [static-direct]", beforeIDs)
+	}
+
+	// Same empty-but-non-nil snapshot on the next tick — Update must see
+	// it as equal to the cached seed and short-circuit. Try a few times
+	// to lock in that no slow drift accumulates.
+	for i := 0; i < 3; i++ {
+		applied, err := c.Update("mvd", []config.UpstreamConfig{})
+		if err != nil {
+			t.Fatalf("tick %d Update: %v", i, err)
+		}
+		if applied {
+			t.Fatalf("tick %d Update reported applied=true on a stably-empty snapshot", i)
+		}
+	}
+	if got := poolHotSwapCount(t, reg, "success"); got != 0 {
+		t.Fatalf("pool_hotswap_total{result=success} = %v, want 0 (no swap should fire)", got)
+	}
+	if got := poolHotSwapCount(t, reg, "error"); got != 0 {
+		t.Fatalf("pool_hotswap_total{result=error} = %v, want 0", got)
+	}
+}
+
 func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
