@@ -194,6 +194,7 @@ func run(args []string, stdout, stderr *os.File) error {
 		listener.WithHTTPMetrics(metricsRegistry),
 		listener.WithHTTPRules(rules),
 		listener.WithHTTPBodyBufferKB(cfg.Failure.BodyBufferKB),
+		listener.WithHTTPConnectionRefused(cfg.Failure.ConnectionRefused),
 	)
 	if err != nil {
 		return fmt.Errorf("build http listener: %w", err)
@@ -564,6 +565,7 @@ func (r *reloader) reload(ctx context.Context) {
 	// are independent of the pool shape.
 	r.sb.Reload(scoreboard.FromConfig(newCfg.Failure.Scoring, newCfg.Failure.Status, newCfg.Failure.ConnectionRefused))
 	r.httpSrv.Reload(failure.NewStatusDetector(newCfg.Failure.Status), newCfg.Failure.MaxRetriesPerRequest)
+	r.httpSrv.ReloadConnectionRefused(newCfg.Failure.ConnectionRefused)
 
 	switch {
 	case r.runningHasPool || len(newCfg.UpstreamPools) > 0:

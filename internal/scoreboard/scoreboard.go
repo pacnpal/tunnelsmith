@@ -55,10 +55,11 @@ type Config struct {
 	// this field. Logging and metrics are unaffected either way.
 	//
 	// The Go zero value is false (scoring off). Production callers build
-	// Config via FromConfig, which reads [failure].connection_refused; that
-	// key defaults to true via config.applyDefaults, so refused scoring is
-	// on by default in production. Test helpers that hand-roll Config must
-	// set this field explicitly when they need scoring-on behavior.
+	// Config via FromConfig, passing cfg.Failure.ConnectionRefused as the
+	// connectionRefused argument; that value is defaulted to true by
+	// config.applyDefaults, so refused scoring is on by default in
+	// production. Test helpers that hand-roll Config must set this field
+	// explicitly when they need scoring-on behavior.
 	ConnectionRefused bool
 
 	// KindPolicy maps each failure.Kind the listener can report to its
@@ -104,7 +105,10 @@ type Config struct {
 
 // FromConfig builds a scoreboard Config from the parsed [failure.scoring]
 // section plus the [[failure.status]] entries. connectionRefused mirrors the
-// [failure].connection_refused key: false disables KindRefused scoring.
+// [failure].connection_refused key: false disables scoring for true ECONNREFUSED
+// dial errors (as determined by failure.IsConnectionRefused) while still scoring
+// other dial failures that ClassifyDialError maps to KindRefused via its default
+// branch (DNS failure, network unreachable, etc.).
 // Phase 4 fires refused and timeout from the dial path; Phase 5 wires the
 // status-rule kinds; Phase 8 fires KindBodyMatch from the listener's
 // response-body inspector. The kind→policy table is complete at construction

@@ -43,11 +43,12 @@ type HTTPServer struct {
 	// runtime is the slice of knobs SIGHUP hot-reload can swap in place.
 	// Guarded by runtimeMu so the request path's reads stay consistent
 	// with concurrent Reload calls.
-	runtimeMu       sync.RWMutex
-	detector        *failure.StatusDetector
-	retryCap        int
-	rules           *upstream.RuleSet
-	bodyBufferBytes int
+	runtimeMu         sync.RWMutex
+	detector          *failure.StatusDetector
+	retryCap          int
+	rules             *upstream.RuleSet
+	bodyBufferBytes   int
+	connectionRefused bool
 
 	server *http.Server
 
@@ -107,6 +108,20 @@ func WithHTTPBodyBufferKB(kb int) HTTPOption {
 			kb = 0
 		}
 		h.bodyBufferBytes = kb * 1024
+	}
+}
+
+// WithHTTPConnectionRefused controls whether a dial-side ECONNREFUSED
+// detected by the HTTP forward path scores a penalty against the upstream.
+// When false, RecordFailure is skipped for true ECONNREFUSED errors (as
+// detected by failure.IsConnectionRefused) in handleForward; timeouts and
+// other failures are unaffected. The default (zero value) is false, so
+// production callers must pass this option with cfg.Failure.ConnectionRefused
+// to match the TOML default of true. SIGHUP reloads should call
+// ReloadConnectionRefused to keep the value live.
+func WithHTTPConnectionRefused(v bool) HTTPOption {
+	return func(h *HTTPServer) {
+		h.connectionRefused = v
 	}
 }
 
@@ -179,6 +194,13 @@ func (h *HTTPServer) currentInspectionConfig() (*upstream.RuleSet, int) {
 	return h.rules, h.bodyBufferBytes
 }
 
+// currentConnectionRefused returns the live connection-refused gate value.
+func (h *HTTPServer) currentConnectionRefused() bool {
+	h.runtimeMu.RLock()
+	defer h.runtimeMu.RUnlock()
+	return h.connectionRefused
+}
+
 // Reload swaps the live detector and retry cap. Called from the SIGHUP
 // hot-reload path. Invalid retryCap values (< 1) are ignored with a
 // log line so a misconfigured reload does not zero out the cap.
@@ -219,6 +241,18 @@ func (h *HTTPServer) ReloadBodyBufferKB(kb int) {
 	h.bodyBufferBytes = kb * 1024
 	h.runtimeMu.Unlock()
 	h.logger.Info("http listener body buffer reloaded", "body_buffer_kb", kb)
+}
+
+// ReloadConnectionRefused swaps the live connection-refused gate.
+// When false, dial-side ECONNREFUSED errors (detected by
+// failure.IsConnectionRefused) in handleForward no longer call
+// RecordFailure against the upstream. SIGHUP calls this after the
+// scoreboard's own gate has been updated so both paths stay in sync.
+func (h *HTTPServer) ReloadConnectionRefused(v bool) {
+	h.runtimeMu.Lock()
+	h.connectionRefused = v
+	h.runtimeMu.Unlock()
+	h.logger.Info("http listener connection_refused gate reloaded", "connection_refused", v)
 }
 
 // CloseTransportsExcept closes idle conns and drops cached transports for
@@ -595,7 +629,7 @@ func (h *HTTPServer) handleForward(w http.ResponseWriter, r *http.Request) {
 			case failure.IsConnectionRefused(rtErr):
 				kind = failure.KindRefused
 			}
-			if kind != "" {
+			if kind != "" && (kind != failure.KindRefused || h.currentConnectionRefused()) {
 				h.sb.RecordFailure(host, up.ID(), kind, nil)
 			}
 			h.observeForwardDial(up.ID(), forwardDialOutcome(kind), latency)
