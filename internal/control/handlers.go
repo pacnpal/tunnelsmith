@@ -178,7 +178,8 @@ func handleReport(w http.ResponseWriter, r *http.Request, backend Backend, m Met
 	}
 
 	logArgs := []any{
-		"host", req.Host,
+		"host", normalizedHost,
+		"scoreboard_host", scoreboardHost,
 		"upstream", req.Upstream,
 		"outcome", req.Outcome,
 	}

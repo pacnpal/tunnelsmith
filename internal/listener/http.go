@@ -1109,17 +1109,21 @@ func buildConnectResponse(upID string) []byte {
 	return []byte("HTTP/1.1 200 Connection Established\r\nX-Tunnelsmith-Upstream: " + upID + "\r\n\r\n")
 }
 
-// validHeaderFieldValue reports whether v is safe to embed in a raw HTTP
-// header value. Rejects empty strings and any byte outside printable
-// ASCII (0x20..0x7E). Tighter than RFC 7230 token rules but fine for the
-// upstream-id space, which is alphanumeric in practice.
+// validHeaderFieldValue reports whether v is safe to embed in the raw
+// CONNECT 200 response we hand-write. We reject only the three bytes
+// that would actually corrupt the response stream: NUL, CR, and LF.
+// This matches the rule golang.org/x/net/http/httpguts.ValidHeaderFieldValue
+// applies to header values that flow through net/http.Header on the
+// plain-HTTP forward path, so a single config-defined upstream id
+// either passes both validators or fails both — no inconsistency
+// between CONNECT and plain-HTTP responses.
 func validHeaderFieldValue(v string) bool {
 	if v == "" {
 		return false
 	}
 	for i := 0; i < len(v); i++ {
-		b := v[i]
-		if b < 0x20 || b > 0x7E {
+		switch v[i] {
+		case 0x00, '\r', '\n':
 			return false
 		}
 	}
