@@ -289,6 +289,51 @@ func TestHealthzUngatedByDefault(t *testing.T) {
 	}
 }
 
+// TestHealthzGatedDoesNotTickReportsRejected pins the scoping rule for
+// tunnelsmith_reports_rejected_total: it is the *report* rejection
+// counter, not a generic auth-failure counter. A gated /healthz that
+// 401s for a missing or bad token must NOT increment this metric,
+// otherwise operator dashboards and rate-rejection alerts get noisy
+// from misconfigured liveness probes that have nothing to do with
+// cooperative reporting.
+func TestHealthzGatedDoesNotTickReportsRejected(t *testing.T) {
+	t.Parallel()
+	backend := &fakeBackend{poolIDs: []string{"u1"}}
+	m := &fakeMetrics{}
+	srv := newTestServerWithAuth(t, backend, m, []string{"tok"}, true)
+
+	// No header on /healthz → 401, but the report-rejection counter
+	// must stay untouched.
+	resp1, err := http.Get(srv.URL + "/healthz")
+	if err != nil {
+		t.Fatalf("GET healthz: %v", err)
+	}
+	_ = resp1.Body.Close()
+	if resp1.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status (no auth) = %d, want 401", resp1.StatusCode)
+	}
+
+	// Bad token on /healthz → 401, same expectation.
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/healthz", nil)
+	req.Header.Set("Authorization", "Bearer wrong")
+	resp2, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET healthz with bad token: %v", err)
+	}
+	_ = resp2.Body.Close()
+	if resp2.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status (bad token) = %d, want 401", resp2.StatusCode)
+	}
+
+	// The two /healthz failures must not have ticked the report metric.
+	if m.hasReject("auth_missing") {
+		t.Errorf("auth_missing was ticked on /healthz; want untouched (report counter must not include liveness-probe auth fails)")
+	}
+	if m.hasReject("auth_failed") {
+		t.Errorf("auth_failed was ticked on /healthz; want untouched")
+	}
+}
+
 func TestHealthzGatedWhenConfigured(t *testing.T) {
 	t.Parallel()
 	backend := &fakeBackend{poolIDs: []string{"u1"}}

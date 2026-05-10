@@ -91,8 +91,17 @@ func mountHandlers(mux *http.ServeMux, backend Backend, metricsSink MetricsSink,
 		// without secrets. Operators who fronted the listener with
 		// something that already authenticates can opt in to gating
 		// via [control].gate_healthz = true (ADR-007 phase boundary).
+		//
+		// Pass nil metrics sink: tunnelsmith_reports_rejected_total is
+		// semantically scoped to cooperative outcome *reports*, so
+		// counting a gated-/healthz auth failure on the same counter
+		// would skew dashboards and rate-rejection alerts that watch
+		// it. The 401 + WWW-Authenticate response is enough for a
+		// misconfigured probe runner; if /healthz auth-failure
+		// observability ever becomes important, give it its own
+		// counter rather than overloading this one.
 		if gateHealthz && tokens != nil && tokens.Enabled() {
-			if !checkAuth(w, r, tokens, metricsSink) {
+			if !checkAuth(w, r, tokens, nil) {
 				return
 			}
 		}
