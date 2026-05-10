@@ -529,6 +529,17 @@ func (c *poolComposer) Update(idPrefix string, next []config.UpstreamConfig) (bo
 		}
 	}
 
+	// Re-assert the uniqueness invariant that startup enforces. If a
+	// later relay snapshot ever produces an id that collides with a
+	// static [[upstream]] or another block's expansion, the scoreboard
+	// would key multiple upstreams under the same upstream_id and
+	// silently scramble routing/scoring. Treat duplicates as a swap
+	// error and leave the running pool untouched.
+	if err := assertUniqueUpstreamIDs(merged); err != nil {
+		c.registry.ObservePoolHotSwap(metrics.ResultError)
+		return false, err
+	}
+
 	entries := make([]upstream.PoolEntry, 0, len(merged))
 	for _, uc := range merged {
 		up, err := upstream.New(uc, c.dialTimeout)
@@ -639,7 +650,6 @@ func expandMullvadPool(ctx context.Context, block config.UpstreamPoolConfig, log
 	if err != nil {
 		return nil, err
 	}
-	_ = ctx // keep signature stable; runRefresh uses its own ctx parameter
 	return &poolBlock{
 		idPrefix: block.IDPrefix,
 		exp:      exp,

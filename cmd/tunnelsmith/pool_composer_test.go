@@ -389,6 +389,47 @@ func TestPoolComposerUnknownIDPrefixReturnsError(t *testing.T) {
 	}
 }
 
+// TestPoolComposerRejectsDuplicateIDs locks in the post-swap uniqueness
+// invariant. If a refresh tick ever produces an id that collides with a
+// static [[upstream]] (or another block's expansion), the scoreboard
+// would silently key multiple upstreams under one id and scramble
+// routing/scoring. Update must reject the merged view, leave the
+// running pool untouched, and tick result=error.
+func TestPoolComposerRejectsDuplicateIDs(t *testing.T) {
+	t.Parallel()
+	staticUC := directUpstream("collide-id", 100)
+	pb := &poolBlock{idPrefix: "mvd", initial: []config.UpstreamConfig{directUpstream("mvd-001", 200)}, logger: quietTestLogger()}
+	initialPool := append([]config.UpstreamConfig{staticUC}, pb.initial...)
+	c, sb, reg := composerForTest(t, []config.UpstreamConfig{staticUC}, []*poolBlock{pb}, initialPool)
+
+	beforeIDs := sortedIDs(sb.PoolIDs())
+	if !equalStrings(beforeIDs, []string{"collide-id", "mvd-001"}) {
+		t.Fatalf("initial PoolIDs = %v, want [collide-id mvd-001]", beforeIDs)
+	}
+
+	// Update introduces an id that already exists in static.
+	colliding := []config.UpstreamConfig{directUpstream("collide-id", 200)}
+	applied, err := c.Update("mvd", colliding)
+	if err == nil {
+		t.Fatal("Update with colliding id: want error, got nil")
+	}
+	if applied {
+		t.Fatalf("Update with colliding id reported applied=true; want false")
+	}
+	if !strings.Contains(err.Error(), "collide-id") {
+		t.Errorf("error message %q should name the duplicate id", err.Error())
+	}
+	if got := sortedIDs(sb.PoolIDs()); !equalStrings(got, beforeIDs) {
+		t.Errorf("PoolIDs changed after rejected Update: got %v, want %v", got, beforeIDs)
+	}
+	if got := poolHotSwapCount(t, reg, "error"); got != 1 {
+		t.Errorf("pool_hotswap_total{result=error} = %v, want 1", got)
+	}
+	if got := poolHotSwapCount(t, reg, "success"); got != 0 {
+		t.Errorf("pool_hotswap_total{result=success} = %v, want 0", got)
+	}
+}
+
 // TestPoolComposerEmptyExpansionStableNoSwap regresses the nil-vs-empty
 // slice bug where the cache seed and post-swap cache commit collapsed
 // an empty-but-non-nil snapshot (`[]config.UpstreamConfig{}`) into nil.

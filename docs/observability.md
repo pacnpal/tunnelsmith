@@ -52,7 +52,7 @@ detail.
 | `tunnelsmith_probe_picks_total` | none | Number of times the probe roll picked a non-top eligible candidate. |
 | `tunnelsmith_persistence_writes_total` | `result` | Snapshot-write outcomes. Result is `success` or `error`. |
 | `tunnelsmith_config_reloads_total` | `result` | SIGHUP-driven reload outcomes. Result is `success` or `error`. |
-| `tunnelsmith_pool_hotswap_total` | `result` | `[[upstream_pool]]` refresh-tick hot-swap outcomes (Phase 11.1). One increment per attempted hot-swap: the snapshot from the expander differs from the last successfully installed expansion for that pool block (`poolComposer.Update`), which includes retries on ticks where the expander's prev/next diff is empty but a prior swap failed and the composer's cache hasn't advanced. `result=success` when `Scoreboard.ReplacePool` installed the new pool; `result=error` when a build error left the running pool untouched. |
+| `tunnelsmith_pool_hotswap_total` | `result` | `[[upstream_pool]]` refresh-tick hot-swap outcomes (Phase 11.1). One increment per attempted hot-swap: the snapshot from the expander differs from the last successfully installed expansion for that pool block (`poolComposer.Update`), which includes retries on ticks where the expander's prev/next diff is empty but a prior swap failed and the composer's cache hasn't advanced. `result=success` when `Scoreboard.ReplacePool` installed the new pool; `result=error` for any failure that left the running pool untouched — duplicate-id rejection, `upstream.New` / `NewPool` build error, `Scoreboard.ReplacePool` install error, or an `Update` against an unregistered `id_prefix`. |
 
 ### Histograms
 
