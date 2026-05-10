@@ -78,8 +78,8 @@ Phase 11 cooperative-reporting endpoint. Apps that integrate via [`docs/cooperat
 | key                | type     | default | notes |
 |--------------------|----------|---------|-------|
 | `bind`             | string   | `:9092` | host:port for the control HTTP listener; empty disables it entirely |
-| `auth_tokens`      | []string | `[]`    | Phase 12 inline bearer tokens; empty = no auth (Phase 11 wire shape). Empty strings inside the list are rejected at config-load time |
-| `auth_tokens_file` | string   | `""`    | Phase 12 absolute path to a one-token-per-line file; `#` comments and blank lines ignored. A missing file at startup warns and is treated as empty (SIGHUP retries). Combined with `auth_tokens` as a dedup'd union |
+| `auth_tokens`      | []string | `[]`    | Phase 12 inline bearer tokens; empty = no auth (Phase 11 wire shape). Each token must be an RFC 6750 token68 string — empty strings **and any token containing whitespace** (leading, trailing, or embedded) are rejected at config-load time, since `extractBearer` either trims them away or fails them as malformed |
+| `auth_tokens_file` | string   | `""`    | Phase 12 absolute path to a one-token-per-line file; `#` comments and blank lines ignored, leading/trailing line whitespace trimmed. A line whose token contains internal whitespace returns an error at load time (same RFC 6750 token68 rule as `auth_tokens`). A missing file at startup warns and is treated as empty (SIGHUP retries). Combined with `auth_tokens` as a dedup'd union |
 | `gate_healthz`     | bool     | `false` | when `true` and auth is enabled, `/healthz` also requires `Authorization: Bearer <token>`. Default `false` keeps liveness probes ungated for orchestrators that cannot inject a token |
 
 When set, `bind` must parse via `net.SplitHostPort` with a port in `1-65535`.

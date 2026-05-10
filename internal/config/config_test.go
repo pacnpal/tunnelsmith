@@ -763,7 +763,7 @@ auth_tokens = [" alpha"]
 id = "d"
 kind = "direct"
 `,
-			contains: "leading or trailing whitespace",
+			contains: "contains whitespace",
 		},
 		{
 			name: "control auth_tokens rejects trailing whitespace",
@@ -774,7 +774,18 @@ auth_tokens = ["alpha\t"]
 id = "d"
 kind = "direct"
 `,
-			contains: "leading or trailing whitespace",
+			contains: "contains whitespace",
+		},
+		{
+			name: "control auth_tokens rejects embedded whitespace",
+			toml: `
+[control]
+auth_tokens = ["alpha beta"]
+[[upstream]]
+id = "d"
+kind = "direct"
+`,
+			contains: "contains whitespace",
 		},
 		{
 			name: "control auth_tokens_file rejects relative path",

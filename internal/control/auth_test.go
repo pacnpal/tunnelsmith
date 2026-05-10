@@ -134,6 +134,16 @@ func TestExtractBearerVariants(t *testing.T) {
 			},
 			wantStatus: authMalformed,
 		},
+		{
+			name:       "embedded space in token",
+			setup:      func(r *http.Request) { r.Header.Set("Authorization", "Bearer abc def") },
+			wantStatus: authMalformed,
+		},
+		{
+			name:       "embedded tab in token",
+			setup:      func(r *http.Request) { r.Header.Set("Authorization", "Bearer abc\tdef") },
+			wantStatus: authMalformed,
+		},
 	}
 	for _, tc := range tests {
 		tc := tc
@@ -354,6 +364,24 @@ func TestLoadTokensFileParsesCommentsAndDedups(t *testing.T) {
 		if got[i] != want[i] {
 			t.Errorf("got[%d]=%q, want %q", i, got[i], want[i])
 		}
+	}
+}
+
+// TestLoadTokensFileRejectsEmbeddedWhitespace pins the round-5 rule:
+// a token file with internal whitespace inside a token is rejected
+// with a load-time error rather than silently producing a token that
+// can never match what extractBearer accepts.
+func TestLoadTokensFileRejectsEmbeddedWhitespace(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "tokens")
+	if err := os.WriteFile(path, []byte("good-token\nbad token with space\n"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := LoadTokensFile(path); err == nil {
+		t.Fatal("LoadTokensFile: want error for embedded whitespace, got nil")
+	} else if !strings.Contains(err.Error(), "whitespace") {
+		t.Errorf("error %q should mention whitespace", err.Error())
 	}
 }
 

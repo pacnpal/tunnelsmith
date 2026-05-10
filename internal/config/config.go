@@ -526,14 +526,14 @@ func (c *Config) Validate() error {
 			errs = append(errs, fmt.Errorf("control.auth_tokens[%d]: empty token (a stray comma in TOML?)", i))
 			continue
 		}
-		// Inbound tokens are TrimSpace'd by extractBearer (RFC 6750
-		// allows leading/trailing whitespace around the credential)
-		// and LoadTokensFile also strips line whitespace, so an inline
-		// token with leading/trailing whitespace would validate but
-		// could never match a real request. Reject that footgun at
-		// config-load with an actionable message.
-		if t != strings.TrimSpace(t) {
-			errs = append(errs, fmt.Errorf("control.auth_tokens[%d]: token has leading or trailing whitespace; inbound headers are trimmed so this token could never match", i))
+		// RFC 6750 §2.1 bearer credentials are token68 (no whitespace
+		// anywhere). extractBearer rejects embedded whitespace as
+		// malformed and trims leading/trailing whitespace; an inline
+		// token with any whitespace could either never match (leading/
+		// trailing) or only match a malformed header that extractBearer
+		// would reject (embedded). Catch the footgun at config-load.
+		if strings.ContainsAny(t, " \t\r\n\v\f") {
+			errs = append(errs, fmt.Errorf("control.auth_tokens[%d]: token contains whitespace; bearer credentials are RFC 6750 token68 (no whitespace) and inbound headers are trimmed so this token could never match", i))
 		}
 	}
 	if c.Control.AuthTokensFile != "" && !filepath.IsAbs(c.Control.AuthTokensFile) {

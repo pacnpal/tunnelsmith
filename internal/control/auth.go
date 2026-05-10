@@ -147,6 +147,14 @@ func extractBearer(r *http.Request) (token string, status authStatus) {
 	if t == "" {
 		return "", authMalformed
 	}
+	// RFC 6750 §2.1 bearer credentials are token68 (no whitespace
+	// anywhere). Reject embedded whitespace as malformed so an operator
+	// who accidentally configured a token with an internal space cannot
+	// have it slip through here; mirrors the inline-token whitespace
+	// rule in config.Validate.
+	if strings.ContainsAny(t, " \t\r\n\v\f") {
+		return "", authMalformed
+	}
 	return t, authPresent
 }
 
@@ -183,6 +191,14 @@ func LoadTokensFile(path string) ([]string, error) {
 		trim := strings.TrimLeft(raw, " \t")
 		if trim == "" || strings.HasPrefix(trim, "#") {
 			continue
+		}
+		// Tokens are RFC 6750 token68; reject any line with internal
+		// whitespace so a stray space inside a token can't slip in
+		// (extractBearer would reject the inbound match anyway, but a
+		// loud error at load time is more actionable than silent auth
+		// failures at request time).
+		if strings.ContainsAny(trim, " \t\v\f") {
+			return nil, fmt.Errorf("auth_tokens_file %q line %d: token contains whitespace; bearer credentials are RFC 6750 token68 (no whitespace)", path, lineNo)
 		}
 		if _, dup := seen[trim]; dup {
 			continue

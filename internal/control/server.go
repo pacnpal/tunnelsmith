@@ -9,10 +9,17 @@
 // them into Scoreboard.RecordSuccess / Scoreboard.RecordFailure exactly
 // like the listener-detected status codes from Phase 5.
 //
-// The endpoint deliberately has no auth. The security boundary is the
-// host network or Docker bridge, same as the UI listener; the operator
-// binds Bind to loopback or a private subnet that only trusted clients
-// can reach. docs/cooperative-reporting.md spells this out.
+// Auth is opt-in. Phase 11 shipped the endpoint with no credential
+// check; the operator's only line of defence was binding Bind to
+// loopback or a private subnet. Phase 12 adds optional bearer-token
+// auth (ServerOptions.Tokens; GateHealthz pulls /healthz under the
+// same gate when set). An empty token set keeps the Phase 11 wire
+// shape byte-for-byte; a non-empty set requires Authorization: Bearer
+// <token> on POST /v1/report (and on GET /healthz when GateHealthz is
+// true). docs/cooperative-reporting.md and ADR-007 spell out the
+// trust stance and the threat model around plaintext tokens on this
+// listener (TLS termination on the control listener itself is a
+// Phase 13 candidate).
 //
 // The wire protocol:
 //

@@ -14,7 +14,7 @@ You decide what counts as "the request worked" or "this exit is broken for this 
 
 ## What this is not
 
-- Not authentication. The control endpoint trusts the network boundary, same as the UI listener. Bind it to loopback or to a private subnet only.
+- Not authentication by default. Phase 11 ships with no credential check; the security boundary is the network (bind to loopback or a private subnet). Phase 12 adds **opt-in** bearer-token auth on top — see the Auth section below. Even with tokens on, the network is still part of the trust story (tokens travel in plaintext until Phase 13 ships TLS on the control listener).
 - Not idempotent. If your app retries a report, the scoreboard gets penalized twice. Deduplicate on your side if you care.
 - Not sufficient for uninstrumented clients. Browsers, closed-source SDKs, OS update channels, and anything else you cannot modify do not benefit. ADR-006 lists this explicitly as a non-goal.
 
@@ -142,7 +142,7 @@ Token rotation is a SIGHUP away. On a clean reload the inline list and the file 
 
 **Client side**, attach the bearer credential. For Go apps using the SDK, set `client.Options.Token` and the SDK adds the header to every report. For non-Go apps, add one header to your existing POST:
 
-```
+```http
 POST /v1/report HTTP/1.1
 Content-Type: application/json
 Authorization: Bearer <token>
@@ -185,7 +185,7 @@ The control endpoint emits two Prometheus counters under the `tunnelsmith_` name
 | metric | labels | meaning |
 |---|---|---|
 | `tunnelsmith_reports_received_total` | `outcome`, `upstream_id` | Reports the endpoint accepted (status 204). |
-| `tunnelsmith_reports_rejected_total` | `reason` | Reports the endpoint refused. `reason` is one of `bad_json`, `missing_field`, `unknown_outcome`, `unknown_upstream`, `scoreboard_unavailable`. |
+| `tunnelsmith_reports_rejected_total` | `reason` | Reports the endpoint refused. `reason` is one of `bad_json`, `missing_field`, `unknown_outcome`, `unknown_upstream`, `scoreboard_unavailable`, `auth_missing` (Phase 12: no `Authorization` header on a gated endpoint), or `auth_failed` (Phase 12: header malformed, multiple `Authorization` headers, or token unknown). SDK clients see Phase 12 401 responses surfaced as errors from `client.Report` — the SDK does **not** retry 401 since it always indicates a configuration mismatch. |
 
 Watch these as you ship the integration. A spike in `tunnelsmith_reports_rejected_total{reason="unknown_upstream"}` after a config change usually means the app cached an old upstream id; restart the app to clear it.
 
