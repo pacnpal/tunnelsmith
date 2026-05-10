@@ -150,14 +150,14 @@ func FromConfig(s config.ScoringConfig, status []config.StatusRule, connectionRe
 	return Config{
 		ConnectionRefused: connectionRefused,
 		KindPolicy:        policy,
-		SuccessWeight:  s.SuccessWeight,
-		ScoreCap:       s.ScoreCap,
-		ProbeChance:    s.ProbeChance,
-		DecayInterval:  s.DecayInterval.Duration(),
-		DecayStep:      s.DecayStep,
-		CascadeTTL:     s.CascadeTTL.Duration(),
-		DebounceWindow: s.DebounceWindow.Duration(),
-		PruneAfter:     s.PruneAfter.Duration(),
+		SuccessWeight:     s.SuccessWeight,
+		ScoreCap:          s.ScoreCap,
+		ProbeChance:       s.ProbeChance,
+		DecayInterval:     s.DecayInterval.Duration(),
+		DecayStep:         s.DecayStep,
+		CascadeTTL:        s.CascadeTTL.Duration(),
+		DebounceWindow:    s.DebounceWindow.Duration(),
+		PruneAfter:        s.PruneAfter.Duration(),
 	}
 }
 
