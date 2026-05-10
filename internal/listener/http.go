@@ -20,6 +20,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/net/http/httpguts"
+
 	"github.com/pacnpal/tunnelsmith/internal/failure"
 	"github.com/pacnpal/tunnelsmith/internal/scoreboard"
 	"github.com/pacnpal/tunnelsmith/internal/upstream"
@@ -1110,22 +1112,19 @@ func buildConnectResponse(upID string) []byte {
 }
 
 // validHeaderFieldValue reports whether v is safe to embed in the raw
-// CONNECT 200 response we hand-write. We reject only the three bytes
-// that would actually corrupt the response stream: NUL, CR, and LF.
-// This matches the rule golang.org/x/net/http/httpguts.ValidHeaderFieldValue
-// applies to header values that flow through net/http.Header on the
-// plain-HTTP forward path, so a single config-defined upstream id
-// either passes both validators or fails both — no inconsistency
-// between CONNECT and plain-HTTP responses.
+// CONNECT 200 response we hand-write. We delegate to
+// httpguts.ValidHeaderFieldValue (the same rule net/http applies to
+// header values on the plain-HTTP forward path) so a single
+// config-defined upstream id either passes both validators or fails
+// both — there is no shape an id can take that would emit
+// X-Tunnelsmith-Upstream on plain-HTTP responses but get silently
+// dropped on CONNECT, or vice versa. The empty-string guard stops us
+// from writing a header line with no value, which would still be
+// well-formed HTTP but useless to a client trying to read the
+// upstream id.
 func validHeaderFieldValue(v string) bool {
 	if v == "" {
 		return false
 	}
-	for i := 0; i < len(v); i++ {
-		switch v[i] {
-		case 0x00, '\r', '\n':
-			return false
-		}
-	}
-	return true
+	return httpguts.ValidHeaderFieldValue(v)
 }
