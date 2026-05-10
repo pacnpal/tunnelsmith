@@ -206,9 +206,18 @@ func normalizeReportHost(host string) (string, error) {
 		return net.JoinHostPort(normalizedHost, splitPort), nil
 	}
 
-	// When SplitHostPort fails, a colon still indicates malformed
-	// host:port input (for example "example.com:abc"), not a plain host.
-	// Bare hosts without any colon are accepted and validated below.
+	// IP literals without a port are valid hosts but trip up
+	// SplitHostPort. A bracketed IPv6 ("[::1]") and a bare IPv6
+	// ("::1") both arrive here even though they are real addresses;
+	// hand them to the host-part normalizer directly.
+	if ip := net.ParseIP(strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")); ip != nil {
+		return normalizeReportHostPart(host)
+	}
+
+	// When SplitHostPort fails and the input is not an IP literal, a
+	// colon still indicates malformed host:port input (for example
+	// "example.com:abc"), not a plain host. Bare hostnames without
+	// any colon are accepted and validated below.
 	if strings.Contains(host, ":") {
 		return "", fmt.Errorf("host %q must be hostname or host:port", host)
 	}

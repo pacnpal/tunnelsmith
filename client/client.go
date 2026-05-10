@@ -135,6 +135,9 @@ func New(opts Options) (*http.Client, error) {
 	if pu.Scheme != "http" && pu.Scheme != "https" {
 		return nil, fmt.Errorf("client: ProxyURL scheme must be http or https, got %q", pu.Scheme)
 	}
+	if pu.RawQuery != "" || pu.Fragment != "" {
+		return nil, fmt.Errorf("client: ProxyURL must not include a query or fragment, got %q", opts.ProxyURL)
+	}
 	cu, err := url.Parse(opts.ControlURL)
 	if err != nil {
 		return nil, fmt.Errorf("client: parse ControlURL: %w", err)
@@ -148,6 +151,9 @@ func New(opts Options) (*http.Client, error) {
 	if cu.Path != "" && cu.Path != "/" {
 		return nil, fmt.Errorf("client: ControlURL path must be empty or '/', got %q", cu.Path)
 	}
+	if cu.RawQuery != "" || cu.Fragment != "" {
+		return nil, fmt.Errorf("client: ControlURL must not include a query or fragment, got %q", opts.ControlURL)
+	}
 
 	timeout := opts.Timeout
 	if timeout < 0 {
@@ -156,41 +162,48 @@ func New(opts Options) (*http.Client, error) {
 		timeout = 2 * time.Second
 	}
 
-	base := &http.Transport{
-		Proxy:             http.ProxyURL(pu),
-		DisableKeepAlives: !opts.KeepAlive,
-		// Capture the upstream id from the CONNECT 200 response; the
-		// proxy injects X-Tunnelsmith-Upstream there for HTTPS.
-		OnProxyConnectResponse: func(ctx context.Context, _ *url.URL, _ *http.Request, res *http.Response) error {
-			box, ok := ctx.Value(ctxKeyUpstream{}).(*upstreamBox)
-			if !ok || box == nil {
-				return nil
-			}
-			if up := res.Header.Get("X-Tunnelsmith-Upstream"); up != "" {
-				box.upstream.Store(up)
-			}
+	// Start from a clone of http.DefaultTransport so we inherit the
+	// stdlib's tested DialContext / TLS handshake / idle conn timeouts
+	// rather than zeroing them out (which would let a partial network
+	// failure stall a user-facing request indefinitely).
+	base := http.DefaultTransport.(*http.Transport).Clone()
+	base.Proxy = http.ProxyURL(pu)
+	base.DisableKeepAlives = !opts.KeepAlive
+	// Capture the upstream id from the CONNECT 200 response; the proxy
+	// injects X-Tunnelsmith-Upstream there for HTTPS.
+	base.OnProxyConnectResponse = func(ctx context.Context, _ *url.URL, _ *http.Request, res *http.Response) error {
+		box, ok := ctx.Value(ctxKeyUpstream{}).(*upstreamBox)
+		if !ok || box == nil {
 			return nil
-		},
+		}
+		if up := res.Header.Get("X-Tunnelsmith-Upstream"); up != "" {
+			box.upstream.Store(up)
+		}
+		return nil
 	}
+
+	// Same defaulting story for the report-plane transport: clone
+	// DefaultTransport so dial / TLS / idle timeouts are non-zero, then
+	// pin Proxy to nil so /v1/report never accidentally tunnels through
+	// HTTP_PROXY (or, worse, back through tunnelsmith itself).
+	reportTr := http.DefaultTransport.(*http.Transport).Clone()
+	reportTr.Proxy = func(*http.Request) (*url.URL, error) { return nil, nil }
+	reportTr.MaxIdleConnsPerHost = 4
 
 	rt := &reportingTransport{
 		base:       base,
 		controlURL: strings.TrimRight(opts.ControlURL, "/"),
 		timeout:    timeout,
 		logger:     opts.Logger,
-		// Reuse a single client (with its own short-lived transport)
-		// for control-plane POSTs so report bursts share a connection.
-		// The control endpoint is local to tunnelsmith and never goes
-		// through the proxy itself. CheckRedirect refuses every redirect
-		// because net/http silently downgrades POST to GET on 301/302/303,
-		// which would let a misconfigured front-end (or trailing-slash
-		// redirect) drop reports without surfacing the misconfiguration.
+		// Reuse a single client for control-plane POSTs so report
+		// bursts share a connection. CheckRedirect refuses every
+		// redirect because net/http silently downgrades POST to GET on
+		// 301/302/303, which would let a misconfigured front-end (or
+		// trailing-slash redirect) drop reports without surfacing the
+		// misconfiguration.
 		reporter: &http.Client{
-			Timeout: timeout,
-			Transport: &http.Transport{
-				Proxy:               func(*http.Request) (*url.URL, error) { return nil, nil },
-				MaxIdleConnsPerHost: 4,
-			},
+			Timeout:   timeout,
+			Transport: reportTr,
 			CheckRedirect: func(req *http.Request, _ []*http.Request) error {
 				return fmt.Errorf("client: control endpoint redirected to %s; reports must hit /v1/report directly", req.URL)
 			},

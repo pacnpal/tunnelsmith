@@ -149,6 +149,10 @@ func TestNewValidatesOptions(t *testing.T) {
 		{"missing proxy", client.Options{ControlURL: "http://x"}},
 		{"missing control", client.Options{ProxyURL: "http://x"}},
 		{"bad proxy scheme", client.Options{ProxyURL: "ftp://x", ControlURL: "http://y"}},
+		{"proxy with query", client.Options{ProxyURL: "http://x?a=1", ControlURL: "http://y"}},
+		{"proxy with fragment", client.Options{ProxyURL: "http://x#frag", ControlURL: "http://y"}},
+		{"control with query", client.Options{ProxyURL: "http://x", ControlURL: "http://y?a=1"}},
+		{"control with fragment", client.Options{ProxyURL: "http://x", ControlURL: "http://y#frag"}},
 		{"bad control scheme", client.Options{ProxyURL: "http://x", ControlURL: "ftp://y"}},
 		{"control missing host", client.Options{ProxyURL: "http://x", ControlURL: "http:///"}},
 		{"control non-root path", client.Options{ProxyURL: "http://x", ControlURL: "http://y/base"}},
@@ -559,6 +563,7 @@ func TestConcurrentReportsDoNotRace(t *testing.T) {
 			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, dest.URL, nil)
 			resp, err := c.Do(req)
 			if err != nil {
+				t.Errorf("c.Do: %v", err)
 				return
 			}
 			_ = resp.Body.Close()

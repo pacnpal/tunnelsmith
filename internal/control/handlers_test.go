@@ -3,6 +3,7 @@ package control
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -148,6 +149,41 @@ func TestReportNormalizesHostBeforeRecording(t *testing.T) {
 	}
 	if backend.successes[0].host != "example.com:443" {
 		t.Fatalf("normalized host = %q, want %q", backend.successes[0].host, "example.com:443")
+	}
+}
+
+// TestReportAcceptsIPLiteralHosts pins normalization for IPv4 and IPv6
+// reports without an explicit port. Plain-HTTP traffic to an IP literal
+// arrives here as a bare address; SplitHostPort cannot parse it, but the
+// host is still valid and must reach the scoreboard.
+func TestReportAcceptsIPLiteralHosts(t *testing.T) {
+	t.Parallel()
+	cases := map[string]string{
+		"192.0.2.1":     "192.0.2.1",
+		"[::1]":         "::1",
+		"::1":           "::1",
+		"[::1]:443":     "[::1]:443",
+		"192.0.2.1:443": "192.0.2.1:443",
+	}
+	for inHost, wantHost := range cases {
+		inHost, wantHost := inHost, wantHost
+		t.Run(inHost, func(t *testing.T) {
+			t.Parallel()
+			backend := &fakeBackend{poolIDs: []string{"u1"}}
+			srv := newTestServer(t, backend, nil)
+			payload := fmt.Sprintf(`{"host":%q,"upstream":"u1","outcome":"ok"}`, inHost)
+			resp := postJSON(t, srv, "/v1/report", payload)
+			defer func() { _ = resp.Body.Close() }()
+			if resp.StatusCode != http.StatusNoContent {
+				t.Fatalf("status = %d, want 204", resp.StatusCode)
+			}
+			if got := len(backend.successes); got != 1 {
+				t.Fatalf("RecordSuccess calls = %d, want 1", got)
+			}
+			if backend.successes[0].host != wantHost {
+				t.Fatalf("normalized host = %q, want %q", backend.successes[0].host, wantHost)
+			}
+		})
 	}
 }
 
