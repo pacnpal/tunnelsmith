@@ -52,26 +52,42 @@ type Server struct {
 	addr   string
 	logger *slog.Logger
 	srv    *http.Server
+	tokens *tokenSet // nil when ServerOptions.Tokens was empty; auth.go's Allow handles nil
 
 	ready    chan struct{}
 	listener net.Listener
 	bindErr  error
 }
 
+// ServerOptions threads the Phase 12 auth knobs into NewServer without
+// growing the positional signature past 4 params (the original Phase 11
+// shape). Empty Tokens + GateHealthz=false reproduces Phase 11 behavior
+// exactly; the unauthenticated wire shape stays the default.
+type ServerOptions struct {
+	// Tokens is the initial auth token set. Empty/nil = no auth.
+	Tokens []string
+	// GateHealthz pulls /healthz under the auth gate when Tokens is
+	// also non-empty. Default false keeps liveness probes ungated.
+	GateHealthz bool
+}
+
 // NewServer builds a control HTTP server that serves on addr. backend is
 // the scoreboard surface the report handler calls into; tests pass a fake
 // to drive every endpoint without spinning up a real scoreboard. metrics
 // may be nil; when set, the handlers emit Phase 11 counters through it.
-func NewServer(addr string, backend Backend, metrics MetricsSink, logger *slog.Logger) *Server {
+// opts may be a zero value, which keeps the Phase 11 no-auth default.
+func NewServer(addr string, backend Backend, metrics MetricsSink, opts ServerOptions, logger *slog.Logger) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	logger = logger.With("component", "control")
+	tokens := NewTokenSet(opts.Tokens)
 	mux := http.NewServeMux()
-	mountHandlers(mux, backend, metrics, logger)
+	mountHandlers(mux, backend, metrics, tokens, opts.GateHealthz, logger)
 	return &Server{
 		addr:   addr,
 		logger: logger,
+		tokens: tokens,
 		srv: &http.Server{
 			Addr:              addr,
 			Handler:           mux,
@@ -79,6 +95,19 @@ func NewServer(addr string, backend Backend, metrics MetricsSink, logger *slog.L
 		},
 		ready: make(chan struct{}),
 	}
+}
+
+// ReplaceTokens atomically swaps the live auth token set, used by the
+// SIGHUP reloader so an operator can rotate tokens without bouncing the
+// process. Safe to call concurrently with in-flight requests; readers
+// load the pointer snapshot once per request so an in-flight check
+// keeps its decision even if the swap happens mid-handler.
+func (s *Server) ReplaceTokens(tokens []string) {
+	if s == nil || s.tokens == nil {
+		return
+	}
+	s.tokens.Replace(tokens)
+	s.logger.Info("control auth tokens reloaded", "count", len(tokens))
 }
 
 // Ready returns a channel that closes once Serve has either bound the

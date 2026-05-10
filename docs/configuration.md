@@ -75,13 +75,22 @@ When set, `bind` must parse via `net.SplitHostPort` with a port in `1-65535`. Th
 
 Phase 11 cooperative-reporting endpoint. Apps that integrate via [`docs/cooperative-reporting.md`](cooperative-reporting.md) POST per-request outcomes here so Tunnelsmith's scoreboard learns from HTTPS traffic the proxy cannot inspect on its own.
 
-| key    | type   | default | notes |
-|--------|--------|---------|-------|
-| `bind` | string | `:9092` | host:port for the control HTTP listener; empty disables it entirely |
+| key                | type     | default | notes |
+|--------------------|----------|---------|-------|
+| `bind`             | string   | `:9092` | host:port for the control HTTP listener; empty disables it entirely |
+| `auth_tokens`      | []string | `[]`    | Phase 12 inline bearer tokens; empty = no auth (Phase 11 wire shape). Empty strings inside the list are rejected at config-load time |
+| `auth_tokens_file` | string   | `""`    | Phase 12 absolute path to a one-token-per-line file; `#` comments and blank lines ignored. A missing file at startup warns and is treated as empty (SIGHUP retries). Combined with `auth_tokens` as a dedup'd union |
+| `gate_healthz`     | bool     | `false` | when `true` and auth is enabled, `/healthz` also requires `Authorization: Bearer <token>`. Default `false` keeps liveness probes ungated for orchestrators that cannot inject a token |
 
-When set, `bind` must parse via `net.SplitHostPort` with a port in `1-65535`. Like `[ui]`, the control port is **unauthenticated**: there is no login, no token, no rate limit. `POST /v1/report` mutates scoreboard state every time it is called. Bind it to a loopback address or to the private subnet your trusted apps reach Tunnelsmith over. See [`docs/cooperative-reporting.md`](cooperative-reporting.md) for the wire protocol, outcome vocabulary, and the trust boundary.
+When set, `bind` must parse via `net.SplitHostPort` with a port in `1-65535`.
+
+The control port is **unauthenticated by default**: `auth_tokens` empty and `auth_tokens_file` unset is the Phase 11 wire shape, and `POST /v1/report` mutates scoreboard state every time it is called. Operators relying on that default should bind to a loopback address or to a private subnet that only trusted apps reach Tunnelsmith over.
+
+When `auth_tokens` and/or `auth_tokens_file` is non-empty (Phase 12), every `POST /v1/report` must carry `Authorization: Bearer <token>`. A missing or malformed header returns `401 Unauthorized` with `WWW-Authenticate: Bearer realm="tunnelsmith"`; rejections tick `tunnelsmith_reports_rejected_total{reason}` with `auth_missing` or `auth_failed`. **Tokens travel in plaintext on the control listener** — TLS on the listener itself is a Phase 13 candidate. Until then, bind the listener to a network segment the operator already trusts, treat tokens as rotatable secrets, and prefer short-lived values. See [`docs/cooperative-reporting.md`](cooperative-reporting.md) for the wire protocol, outcome vocabulary, the auth section, and the full trust boundary.
 
 `control.bind` is **restart-only**. SIGHUP hot-reload does not move the listener; the same constraint applies as `[metrics]` and `[ui]`. Restart the binary to change the address.
+
+`auth_tokens` and `auth_tokens_file` **are** hot-reloaded on SIGHUP: after re-reading the config the runtime rebuilds the merged token set and rotates it through `control.Server.ReplaceTokens`. A missing `auth_tokens_file` on SIGHUP is warned and the file portion is treated as empty (same as the startup behaviour); inline `auth_tokens` keep applying. Hard errors (permission denied, IO failure) preserve the current set instead of dropping it. `gate_healthz` is also re-read on SIGHUP, but because it is wired at mount time the running listener does not yet pick it up live — restart the binary if you need to flip it. (Phase 13 candidate: also hot-rebind `gate_healthz`.)
 
 ## `[[upstream]]`
 

@@ -216,7 +216,7 @@ Tunnelsmith's deployment shape makes this practical. The user controls the apps 
 ## ADR-007: Bearer-token auth on the control endpoint (Phase 12)
 
 **Date:** 2026-05-09
-**Status:** Proposed (flips to Accepted when the Phase 12 implementation lands).
+**Status:** Accepted (Phase 12 implementation landed 2026-05-10).
 
 ### Context
 

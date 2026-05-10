@@ -218,7 +218,19 @@ func run(args []string, stdout, stderr *os.File) error {
 	}
 	var controlSrv *control.Server
 	if cfg.Control.Bind != "" {
-		controlSrv = control.NewServer(cfg.Control.Bind, sb, metricsRegistry, logger)
+		// Phase 12: build the initial token set from inline + file. A
+		// missing auth_tokens_file at startup is warned and treated as
+		// empty (ADR-007) so a typo'd path does not break boot; SIGHUP
+		// can correct it later. Inline tokens have already passed
+		// config.Validate.
+		initialTokens, err := buildControlTokens(cfg.Control, logger)
+		if err != nil {
+			return fmt.Errorf("control auth tokens: %w", err)
+		}
+		controlSrv = control.NewServer(cfg.Control.Bind, sb, metricsRegistry, control.ServerOptions{
+			Tokens:      initialTokens,
+			GateHealthz: cfg.Control.GateHealthz,
+		}, logger)
 	}
 
 	g, gctx := errgroup.WithContext(ctx)
@@ -260,6 +272,7 @@ func run(args []string, stdout, stderr *os.File) error {
 		logger:         logger,
 		sb:             sb,
 		httpSrv:        httpSrv,
+		controlSrv:     controlSrv,
 		registry:       metricsRegistry,
 		gauges:         gaugeRefresh,
 		runningHasPool: len(cfg.UpstreamPools) > 0,
@@ -369,6 +382,32 @@ func assertRulePreferIDs(rules []config.RuleConfig, upstreams []config.UpstreamC
 // logical upstream and produce incorrect routing and scoring. The error
 // message names every colliding id so the operator can point at the right
 // pool block or [[upstream]] entry.
+// buildControlTokens merges the inline [control].auth_tokens list with
+// tokens loaded from [control].auth_tokens_file (Phase 12). A missing
+// file at startup is warned and treated as empty per ADR-007 — a typo
+// in the path must not break boot; SIGHUP picks up the corrected file
+// later. The returned slice is the dedup'd union, inline-first.
+func buildControlTokens(cfg config.ControlConfig, logger *slog.Logger) ([]string, error) {
+	var fromFile []string
+	if cfg.AuthTokensFile != "" {
+		loaded, err := control.LoadTokensFile(cfg.AuthTokensFile)
+		switch {
+		case err == nil:
+			fromFile = loaded
+		case os.IsNotExist(err):
+			logger.Warn("control.auth_tokens_file missing at startup; treating as empty (SIGHUP will retry)",
+				"path", cfg.AuthTokensFile)
+		default:
+			return nil, err
+		}
+	}
+	merged := control.MergeTokens(cfg.AuthTokens, fromFile)
+	if len(merged) > 0 {
+		logger.Info("control auth enabled", "tokens", len(merged), "gate_healthz", cfg.GateHealthz)
+	}
+	return merged, nil
+}
+
 func assertUniqueUpstreamIDs(upstreams []config.UpstreamConfig) error {
 	seen := make(map[string]int, len(upstreams))
 	var duplicates []string
@@ -767,6 +806,7 @@ type reloader struct {
 	logger         *slog.Logger
 	sb             *scoreboard.Scoreboard
 	httpSrv        *listener.HTTPServer
+	controlSrv     *control.Server // nil when control.bind disabled
 	registry       *metrics.Registry
 	gauges         *scoreboardGaugeRefresher
 	runningHasPool bool
@@ -862,6 +902,21 @@ func (r *reloader) reload(ctx context.Context) {
 	r.sb.ReplaceRules(newRules)
 	r.httpSrv.ReloadRules(newRules)
 	r.httpSrv.ReloadBodyBufferKB(newCfg.Failure.BodyBufferKB)
+
+	// Phase 12: rotate control auth tokens. Missing auth_tokens_file on
+	// SIGHUP keeps the current token set rather than dropping to empty
+	// (which would silently disable auth on a typo'd path) — only the
+	// happy path or an empty configured set advances the runtime state.
+	if r.controlSrv != nil {
+		newTokens, err := buildControlTokens(newCfg.Control, r.logger)
+		switch {
+		case err != nil:
+			r.logger.Warn("control auth tokens not rotated (file read error); keeping current set",
+				"err", err)
+		default:
+			r.controlSrv.ReplaceTokens(newTokens)
+		}
+	}
 
 	r.registry.ObserveConfigReload(metrics.ResultSuccess)
 	r.logger.Info("config reloaded",

@@ -123,12 +123,25 @@ type UIConfig struct {
 // limit / etc.) into the scoreboard, giving HTTPS coverage that the
 // proxy cannot derive from CONNECT or SOCKS5 traffic on its own.
 //
-// There is no auth on the port; the security boundary is the same as
-// the UI listener — bind to loopback or to a private subnet only
-// trusted clients can reach. docs/cooperative-reporting.md spells out
-// the trust stance.
+// AuthTokens and AuthTokensFile add Phase 12 opt-in bearer-token auth.
+// When the resulting token set is empty (the default) the endpoint
+// accepts every request, preserving Phase 11 behaviour. When non-empty
+// every POST /v1/report must carry Authorization: Bearer <token>; a
+// missing header gets `auth_missing` and a bad/unknown token gets
+// `auth_failed` in tunnelsmith_reports_rejected_total. SIGHUP re-reads
+// both the inline list and (if set) the file so tokens rotate without
+// a restart. GateHealthz pulls /healthz under the same gate; default
+// false keeps liveness probes ungated.
+//
+// The trust boundary is still the network: tokens travel in plaintext
+// on the control listener (TLS is Phase 13 candidate), so operators
+// should still bind to loopback or a private subnet. docs/cooperative-
+// reporting.md spells out the trust stance.
 type ControlConfig struct {
-	Bind string `toml:"bind"` // default: ":9092"; "" disables
+	Bind           string   `toml:"bind"`             // default: ":9092"; "" disables
+	AuthTokens     []string `toml:"auth_tokens"`      // inline bearer tokens; empty = no auth
+	AuthTokensFile string   `toml:"auth_tokens_file"` // absolute path; one token per line, # comments OK
+	GateHealthz    bool     `toml:"gate_healthz"`     // default false: /healthz stays ungated for liveness probes
 }
 
 // UpstreamConfig declares one egress option that the router can pick.
@@ -504,6 +517,17 @@ func (c *Config) Validate() error {
 		if err := validateAddr(c.Control.Bind, "control.bind"); err != nil {
 			errs = append(errs, err)
 		}
+	}
+	for i, t := range c.Control.AuthTokens {
+		// Empty strings in the inline list would silently match a
+		// missing/malformed Authorization header through nothing —
+		// catch the typo at Validate time rather than at request time.
+		if strings.TrimSpace(t) == "" {
+			errs = append(errs, fmt.Errorf("control.auth_tokens[%d]: empty token (a stray comma in TOML?)", i))
+		}
+	}
+	if c.Control.AuthTokensFile != "" && !filepath.IsAbs(c.Control.AuthTokensFile) {
+		errs = append(errs, fmt.Errorf("control.auth_tokens_file must be an absolute path, got %q", c.Control.AuthTokensFile))
 	}
 
 	if len(c.Upstreams) == 0 && len(c.UpstreamPools) == 0 {

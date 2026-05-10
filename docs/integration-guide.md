@@ -168,9 +168,11 @@ resp, err := c.Get("https://example.com/api/things")
 _ = client.Report(resp, "geo_block")
 ```
 
-A runnable example lives at [`examples/integration/main.go`](../examples/integration/main.go).
+A runnable example lives at [`examples/integration/main.go`](../examples/integration/main.go). Pass `--token <value>` to test against an operator who has opted into Phase 12 bearer-token auth.
 
 **Other languages: ~30 lines.** The wire protocol is documented in [`docs/cooperative-reporting.md`](cooperative-reporting.md) — read one HTTP header off the response, POST one JSON object to the control endpoint. Any HTTP client in any language can implement it.
+
+**If the operator has Phase 12 auth on**, attach a bearer credential to every `POST /v1/report`. With the Go SDK, set `client.Options.Token`; it is added as `Authorization: Bearer <token>` to every report POST. For non-Go apps the wire change is one header. The operator-side knobs (`[control].auth_tokens`, `[control].auth_tokens_file`, SIGHUP rotation, the `401` + `WWW-Authenticate` response, and the `auth_missing` / `auth_failed` metric labels) are documented in [`docs/cooperative-reporting.md`](cooperative-reporting.md#auth-phase-12) and [`docs/configuration.md`](configuration.md#control). The SDK does not retry 401, since it always indicates a configuration mismatch rather than a transient fault.
 
 When this is worth doing:
 
