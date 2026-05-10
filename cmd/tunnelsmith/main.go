@@ -223,9 +223,13 @@ func run(args []string, stdout, stderr *os.File) error {
 		// empty (ADR-007) so a typo'd path does not break boot; SIGHUP
 		// can correct it later. Inline tokens have already passed
 		// config.Validate.
-		initialTokens, _, err := buildControlTokens(cfg.Control, logger)
+		initialTokens, missingFile, err := buildControlTokens(cfg.Control)
 		if err != nil {
 			return fmt.Errorf("control auth tokens: %w", err)
+		}
+		if missingFile {
+			logger.Warn("control.auth_tokens_file missing at startup; file portion treated as empty (SIGHUP will retry)",
+				"path", cfg.Control.AuthTokensFile)
 		}
 		if len(initialTokens) > 0 {
 			logger.Info("control auth enabled at startup",
@@ -388,34 +392,6 @@ func assertRulePreferIDs(rules []config.RuleConfig, upstreams []config.UpstreamC
 // logical upstream and produce incorrect routing and scoring. The error
 // message names every colliding id so the operator can point at the right
 // pool block or [[upstream]] entry.
-// buildControlTokens merges the inline [control].auth_tokens list with
-// tokens loaded from [control].auth_tokens_file (Phase 12). The
-// returned missingFile flag is true when the configured file was set
-// but did not exist on disk — callers handle that case differently:
-// startup warns and treats the file portion as empty (per ADR-007:
-// a typo in the path must not break boot); the SIGHUP reload path
-// preserves the *current* live token set instead of rotating, so a
-// logrotate-style brief disappearance does not silently disable auth.
-// The returned slice is the dedup'd union of inline + file, inline-first.
-func buildControlTokens(cfg config.ControlConfig, logger *slog.Logger) (tokens []string, missingFile bool, err error) {
-	var fromFile []string
-	if cfg.AuthTokensFile != "" {
-		loaded, lerr := control.LoadTokensFile(cfg.AuthTokensFile)
-		switch {
-		case lerr == nil:
-			fromFile = loaded
-		case errors.Is(lerr, os.ErrNotExist):
-			logger.Warn("control.auth_tokens_file missing; file portion treated as empty",
-				"path", cfg.AuthTokensFile)
-			missingFile = true
-		default:
-			return nil, false, lerr
-		}
-	}
-	tokens = control.MergeTokens(cfg.AuthTokens, fromFile)
-	return tokens, missingFile, nil
-}
-
 func assertUniqueUpstreamIDs(upstreams []config.UpstreamConfig) error {
 	seen := make(map[string]int, len(upstreams))
 	var duplicates []string
@@ -430,6 +406,34 @@ func assertUniqueUpstreamIDs(upstreams []config.UpstreamConfig) error {
 		return fmt.Errorf("duplicate upstream ids after expanding [[upstream_pool]]: %s", strings.Join(duplicates, ", "))
 	}
 	return nil
+}
+
+// buildControlTokens merges the inline [control].auth_tokens list with
+// tokens loaded from [control].auth_tokens_file (Phase 12). The
+// returned missingFile flag is true when the configured file was set
+// but did not exist on disk — callers handle that case differently and
+// log their own context-appropriate message (startup warns and treats
+// the file portion as empty per ADR-007; the SIGHUP reload path
+// preserves the current live token set without rotating so a
+// logrotate-style brief disappearance does not silently disable auth).
+// The function itself does not log: each call site owns the policy and
+// the operator-facing message that fits its phase.
+// The returned slice is the dedup'd union of inline + file, inline-first.
+func buildControlTokens(cfg config.ControlConfig) (tokens []string, missingFile bool, err error) {
+	var fromFile []string
+	if cfg.AuthTokensFile != "" {
+		loaded, lerr := control.LoadTokensFile(cfg.AuthTokensFile)
+		switch {
+		case lerr == nil:
+			fromFile = loaded
+		case errors.Is(lerr, os.ErrNotExist):
+			missingFile = true
+		default:
+			return nil, false, lerr
+		}
+	}
+	tokens = control.MergeTokens(cfg.AuthTokens, fromFile)
+	return tokens, missingFile, nil
 }
 
 // poolComposer rebuilds the running priority pool whenever an
@@ -921,7 +925,7 @@ func (r *reloader) reload(ctx context.Context) {
 	// reporting it during a reload would mislead operators about what
 	// the running listener is actually using.
 	if r.controlSrv != nil {
-		newTokens, missingFile, err := buildControlTokens(newCfg.Control, r.logger)
+		newTokens, missingFile, err := buildControlTokens(newCfg.Control)
 		switch {
 		case err != nil:
 			r.logger.Warn("control auth tokens not rotated (file read error); keeping current set",
@@ -930,8 +934,10 @@ func (r *reloader) reload(ctx context.Context) {
 			r.logger.Warn("control auth tokens not rotated (auth_tokens_file missing); keeping current set",
 				"path", newCfg.Control.AuthTokensFile)
 		default:
+			// Server.ReplaceTokens emits the post-swap Info log itself,
+			// so the reloader does not also log here — otherwise every
+			// SIGHUP would produce a duplicate "auth tokens" line.
 			r.controlSrv.ReplaceTokens(newTokens)
-			r.logger.Info("control auth tokens rotated", "tokens", len(newTokens))
 		}
 	}
 

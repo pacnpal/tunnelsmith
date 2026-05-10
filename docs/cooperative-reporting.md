@@ -138,7 +138,7 @@ auth_tokens = ["replace-me-with-a-long-random-string"]
 # gate_healthz = false                                  # default false; true gates /healthz too
 ```
 
-Token rotation is a SIGHUP away. Both the inline list and the file are re-read; the dedup'd union becomes the live token set. A missing `auth_tokens_file` at startup warns and is treated as empty (the next SIGHUP re-reads it). At runtime, the inline list and the file form one set: if you list a token both ways, the inline ordering wins.
+Token rotation is a SIGHUP away. On a clean reload the inline list and the file are re-read and the dedup'd union becomes the live token set. A missing `auth_tokens_file` at startup warns and is treated as empty (the next SIGHUP re-reads it). A missing `auth_tokens_file` on SIGHUP is different: the runtime warns but **preserves the current live token set** rather than rotating, so a logrotate-style brief disappearance does not silently disable auth (side-effect: inline edits made in the same config bump are also deferred until the file resolves cleanly). At runtime, the inline list and the file form one set: if you list a token both ways, the inline ordering wins.
 
 **Client side**, attach the bearer credential. For Go apps using the SDK, set `client.Options.Token` and the SDK adds the header to every report. For non-Go apps, add one header to your existing POST:
 
