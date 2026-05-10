@@ -32,6 +32,7 @@ import (
 func scoreboardFor(t *testing.T, pool *upstream.Pool) *scoreboard.Scoreboard {
 	t.Helper()
 	cfg := scoreboard.Config{
+		ConnectionRefused: true, // match the TOML production default
 		KindPolicy: map[failure.Kind]scoreboard.Policy{
 			failure.KindRefused:    {Penalty: 3, Cooldown: 30 * time.Second},
 			failure.KindTimeout:    {Penalty: 2, Cooldown: 15 * time.Second},

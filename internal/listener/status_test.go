@@ -499,6 +499,7 @@ func TestForwardCascadeWhenPickReportsCascade(t *testing.T) {
 
 	pool := directPoolWith(t, "a")
 	cfg := scoreboard.Config{
+		ConnectionRefused: true, // match the TOML production default
 		KindPolicy: map[failure.Kind]scoreboard.Policy{
 			failure.KindRefused: {Penalty: 3, Cooldown: 30 * time.Second},
 		},
