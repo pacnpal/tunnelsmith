@@ -75,6 +75,7 @@ type Registry struct {
 	CascadeActiveHosts  prometheus.Gauge
 	ReportsReceived     *prometheus.CounterVec
 	ReportsRejected     *prometheus.CounterVec
+	PoolHotSwaps        *prometheus.CounterVec
 }
 
 // New constructs a Registry with all metric vectors registered in a fresh
@@ -158,6 +159,11 @@ func New() *Registry {
 			Name:      "reports_rejected_total",
 			Help:      "Number of cooperative outcome reports the control endpoint rejected, labelled by reason (bad_json, missing_field, unknown_outcome, unknown_upstream, scoreboard_unavailable).",
 		}, []string{"reason"}),
+		PoolHotSwaps: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "tunnelsmith",
+			Name:      "pool_hotswap_total",
+			Help:      "Number of [[upstream_pool]] refresh-tick hot-swaps, labelled by result (success, error). Phase 11.1.",
+		}, []string{"result"}),
 	}
 
 	reg.MustRegister(
@@ -175,6 +181,7 @@ func New() *Registry {
 		r.CascadeActiveHosts,
 		r.ReportsReceived,
 		r.ReportsRejected,
+		r.PoolHotSwaps,
 	)
 
 	return r
@@ -253,6 +260,15 @@ func (r *Registry) ObserveConfigReload(result string) {
 		return
 	}
 	r.ConfigReloads.WithLabelValues(result).Inc()
+}
+
+// ObservePoolHotSwap increments pool_hotswap_total for one [[upstream_pool]]
+// refresh-tick swap. result is one of ResultSuccess or ResultError. Phase 11.1.
+func (r *Registry) ObservePoolHotSwap(result string) {
+	if r == nil {
+		return
+	}
+	r.PoolHotSwaps.WithLabelValues(result).Inc()
 }
 
 // ObserveReportReceived increments reports_received_total for an accepted

@@ -13,6 +13,8 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -109,7 +111,7 @@ func run(args []string, stdout, stderr *os.File) error {
 	defer signal.Stop(hupCh)
 
 	dialTimeout := time.Duration(cfg.Failure.TimeoutMS) * time.Millisecond
-	expandedPools, expanders, err := expandUpstreamPools(ctx, cfg.UpstreamPools, logger)
+	expandedPools, poolBlocks, err := expandUpstreamPools(ctx, cfg.UpstreamPools, logger)
 	if err != nil {
 		return fmt.Errorf("expand upstream pools: %w", err)
 	}
@@ -272,9 +274,26 @@ func run(args []string, stdout, stderr *os.File) error {
 			}
 		}
 	})
-	for _, run := range expanders {
-		run := run
-		g.Go(func() error { return run(gctx) })
+	// Build the pool composer now that sb / httpSrv / gauges / registry
+	// all exist, then start the refresh-tick runners with composer
+	// attached so every successful diff hot-swaps the running pool. The
+	// composer captures the startup static [[upstream]] slice and each
+	// block's initial expansion, so the merged view at swap time is
+	// deterministic across blocks.
+	composer := newPoolComposer(
+		cfg.Upstreams,
+		poolBlocks,
+		sb,
+		httpSrv,
+		gaugeRefresh,
+		metricsRegistry,
+		logger,
+		cfg.Failure.MaxRetriesPerRequest,
+		dialTimeout,
+	)
+	for _, pb := range poolBlocks {
+		pb := pb
+		g.Go(func() error { return pb.runRefresh(gctx, composer) })
 	}
 
 	// Wait for either ctx cancellation (signal) or a listener error.
@@ -366,26 +385,232 @@ func assertUniqueUpstreamIDs(upstreams []config.UpstreamConfig) error {
 	return nil
 }
 
+// poolComposer rebuilds the running priority pool whenever an
+// [[upstream_pool]] expander's refresh tick produces a non-empty diff
+// (Phase 11.1). It captures the static [[upstream]] slice and the
+// per-block expansion state at startup, holds a reference to the
+// scoreboard / HTTP listener / gauge refresher / metrics registry, and
+// applies the swap atomically through Scoreboard.ReplacePool. The
+// SIGHUP reload path stays restart-only for pool-shape changes; the
+// composer only handles refresh-tick churn.
+type poolComposer struct {
+	mu sync.Mutex
+	// static is the [[upstream]] slice as captured at startup. It does
+	// not change across the lifetime of the binary; SIGHUP changes to
+	// [[upstream]] when an [[upstream_pool]] block is present require a
+	// restart by design (see reloader.reload).
+	static []config.UpstreamConfig
+	// blocks tracks each [[upstream_pool]] block's current expansion in
+	// declaration order so the merged slice is deterministic.
+	blocks []composerBlock
+
+	sb       *scoreboard.Scoreboard
+	httpSrv  *listener.HTTPServer
+	gauges   *scoreboardGaugeRefresher
+	registry *metrics.Registry
+	logger   *slog.Logger
+
+	// retryCap and dialTimeout are captured at startup so a refresh-tick
+	// swap never silently changes the values an operator configured.
+	retryCap    int
+	dialTimeout time.Duration
+}
+
+// composerBlock holds the live expansion for one [[upstream_pool]]
+// block. Updated on every successful refresh tick via poolComposer.Update.
+type composerBlock struct {
+	idPrefix string
+	current  []config.UpstreamConfig
+}
+
+// newPoolComposer wires every dependency the swap path needs and seeds
+// each block's current expansion with what the startup pool was built
+// from. Call after sb / httpSrv / gauges / registry exist so the first
+// refresh tick has a complete dependency graph.
+func newPoolComposer(
+	staticUpstreams []config.UpstreamConfig,
+	blocks []*poolBlock,
+	sb *scoreboard.Scoreboard,
+	httpSrv *listener.HTTPServer,
+	gauges *scoreboardGaugeRefresher,
+	registry *metrics.Registry,
+	logger *slog.Logger,
+	retryCap int,
+	dialTimeout time.Duration,
+) *poolComposer {
+	cb := make([]composerBlock, 0, len(blocks))
+	for _, b := range blocks {
+		// slices.Clone preserves the nil-vs-empty distinction so a
+		// stably-empty Mullvad snapshot ([]T{}, non-nil) doesn't
+		// collapse into nil here and then mismatch every refresh tick
+		// under reflect.DeepEqual.
+		cb = append(cb, composerBlock{
+			idPrefix: b.idPrefix,
+			current:  slices.Clone(b.initial),
+		})
+	}
+	return &poolComposer{
+		static:      slices.Clone(staticUpstreams),
+		blocks:      cb,
+		sb:          sb,
+		httpSrv:     httpSrv,
+		gauges:      gauges,
+		registry:    registry,
+		logger:      logger,
+		retryCap:    retryCap,
+		dialTimeout: dialTimeout,
+	}
+}
+
+// Update is invoked by a poolBlock's refresh callback on every fresh
+// snapshot. It compares next to the composer's last successfully-
+// installed expansion for the block; when they match it returns
+// (applied=false, nil) without rebuilding the pool. Otherwise it
+// rebuilds the merged priority pool from static + every block's
+// latest applied expansion (substituting next for the matching
+// block), installs the new pool on the scoreboard, commits next into
+// the cache, and returns (applied=true, nil).
+//
+// Failures (build error in upstream.New, NewPool, or ReplacePool)
+// leave both the running pool and the composer's cache untouched,
+// increment pool_hotswap_total{result="error"}, and return
+// (applied=false, err). Returning err — combined with the cache not
+// advancing — means a subsequent Update with the same next will
+// re-attempt the swap on the next refresh tick rather than going
+// silent if the Mullvad expander's prev/next happens to be stable
+// post-failure.
+//
+// The lock is held for the entire build-and-swap so two concurrent
+// Updates from different blocks serialize end-to-end. Refresh ticks
+// fire on hour-scale schedules; lock granularity is a non-issue here
+// and the simpler ordering is worth more than the contention saved.
+func (c *poolComposer) Update(idPrefix string, next []config.UpstreamConfig) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	idx := -1
+	for i := range c.blocks {
+		if c.blocks[i].idPrefix == idPrefix {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		c.registry.ObservePoolHotSwap(metrics.ResultError)
+		return false, fmt.Errorf("poolComposer: no block registered for id_prefix %q", idPrefix)
+	}
+
+	// No-op short-circuit: if next equals the last successfully-
+	// installed expansion for this block, the running pool is already
+	// what next would build. Skip without touching the metric — only
+	// real swap attempts (success or failure) tick pool_hotswap_total.
+	if reflect.DeepEqual(c.blocks[idx].current, next) {
+		return false, nil
+	}
+
+	// Build the merged view substituting next for the matching block
+	// without mutating cached state. If anything below this point fails
+	// the cache stays at the last-installed snapshot, so a later Update
+	// for next on the same or another block will re-attempt the swap.
+	totalLen := len(c.static) + len(next)
+	for i, b := range c.blocks {
+		if i == idx {
+			continue
+		}
+		totalLen += len(b.current)
+	}
+	merged := make([]config.UpstreamConfig, 0, totalLen)
+	merged = append(merged, c.static...)
+	for i, b := range c.blocks {
+		if i == idx {
+			merged = append(merged, next...)
+		} else {
+			merged = append(merged, b.current...)
+		}
+	}
+
+	// Re-assert the uniqueness invariant that startup enforces. If a
+	// later relay snapshot ever produces an id that collides with a
+	// static [[upstream]] or another block's expansion, the scoreboard
+	// would key multiple upstreams under the same upstream_id and
+	// silently scramble routing/scoring. Treat duplicates as a swap
+	// error and leave the running pool untouched.
+	if err := assertUniqueUpstreamIDs(merged); err != nil {
+		c.registry.ObservePoolHotSwap(metrics.ResultError)
+		return false, err
+	}
+
+	entries := make([]upstream.PoolEntry, 0, len(merged))
+	for _, uc := range merged {
+		up, err := upstream.New(uc, c.dialTimeout)
+		if err != nil {
+			c.registry.ObservePoolHotSwap(metrics.ResultError)
+			return false, fmt.Errorf("build upstream %q: %w", uc.ID, err)
+		}
+		entries = append(entries, upstream.PoolEntry{Up: up, Priority: uc.PriorityValue()})
+	}
+	newPool, err := upstream.NewPool(entries, c.retryCap, c.logger)
+	if err != nil {
+		c.registry.ObservePoolHotSwap(metrics.ResultError)
+		return false, fmt.Errorf("build pool: %w", err)
+	}
+	if err := c.sb.ReplacePool(newPool); err != nil {
+		c.registry.ObservePoolHotSwap(metrics.ResultError)
+		return false, fmt.Errorf("scoreboard ReplacePool: %w", err)
+	}
+
+	// Swap succeeded: commit the new expansion to the cache so the next
+	// Update merges from the actually-installed view. slices.Clone (not
+	// append([]T(nil), …)) so an empty-but-non-nil next stays empty-but-
+	// non-nil — otherwise the DeepEqual short-circuit above would fail
+	// on every subsequent tick when the snapshot is stably empty.
+	c.blocks[idx].current = slices.Clone(next)
+
+	// Drop cached HTTP transports so a new pool's Upstream objects
+	// build fresh DialContext closures rather than routing through the
+	// previous Upstream's pinned dialer. swapStaticPool does the same.
+	if c.httpSrv != nil {
+		c.httpSrv.CloseTransportsExcept(map[string]struct{}{})
+	}
+	if c.gauges != nil {
+		c.gauges.setPoolIDs(newPool.IDs())
+	}
+	c.registry.SetUpstreamPoolSize(newPool.Len())
+	c.registry.ObservePoolHotSwap(metrics.ResultSuccess)
+	return true, nil
+}
+
+// poolBlock carries the live state for one [[upstream_pool]] block so a
+// poolComposer can drive its refresh ticker and hot-swap the running
+// priority pool when the expansion changes. The expander instance is
+// kept for its RunRefresh loop; the initial expansion seeds the diff
+// comparison and is also returned to the caller for the startup pool.
+type poolBlock struct {
+	idPrefix string
+	exp      *mullvad.Expander
+	initial  []config.UpstreamConfig
+	logger   *slog.Logger
+}
+
 // expandUpstreamPools turns each [[upstream_pool]] block into a slice of
 // synthetic upstream entries by calling the relevant provider's expander.
 // Only "mullvad" is implemented for Phase 6.
 //
-// Returns two parallel sets of values: the resolved upstream list (used
-// once at startup to build the priority pool), and a slice of refresh
-// callbacks the caller is expected to fire from the signal-context
-// errgroup. Each callback drives the expander's periodic refresh ticker,
-// which currently logs the diff between snapshots; Phase 7's hot-reload
-// path will swap the live pool in on each tick.
+// Returns the resolved initial upstream list (used once at startup to
+// build the priority pool) and a parallel slice of *poolBlock values
+// the caller wires into a poolComposer to drive refresh-tick hot-swaps
+// (Phase 11.1). Order in both return values matches the declaration
+// order of [[upstream_pool]] in the config.
 //
 // Failures during the initial expansion are fatal at startup so the
 // operator notices a broken upstream_pool before traffic is sent.
-func expandUpstreamPools(ctx context.Context, blocks []config.UpstreamPoolConfig, logger *slog.Logger) ([]config.UpstreamConfig, []func(context.Context) error, error) {
+func expandUpstreamPools(ctx context.Context, blocks []config.UpstreamPoolConfig, logger *slog.Logger) ([]config.UpstreamConfig, []*poolBlock, error) {
 	var out []config.UpstreamConfig
-	var runs []func(context.Context) error
+	var poolBlocks []*poolBlock
 	for i, block := range blocks {
 		switch block.Provider {
 		case config.UpstreamPoolMullvad:
-			expanded, run, err := expandMullvadPool(ctx, block, logger)
+			pb, err := expandMullvadPool(ctx, block, logger)
 			if err != nil {
 				return nil, nil, fmt.Errorf("upstream_pool[%d] (id_prefix=%q): %w", i, block.IDPrefix, err)
 			}
@@ -393,18 +618,18 @@ func expandUpstreamPools(ctx context.Context, blocks []config.UpstreamPoolConfig
 				"id_prefix", block.IDPrefix,
 				"provider", block.Provider,
 				"countries", block.Countries,
-				"upstreams", len(expanded),
+				"upstreams", len(pb.initial),
 			)
-			out = append(out, expanded...)
-			runs = append(runs, run)
+			out = append(out, pb.initial...)
+			poolBlocks = append(poolBlocks, pb)
 		default:
 			return nil, nil, fmt.Errorf("upstream_pool[%d]: provider %q is not implemented", i, block.Provider)
 		}
 	}
-	return out, runs, nil
+	return out, poolBlocks, nil
 }
 
-func expandMullvadPool(ctx context.Context, block config.UpstreamPoolConfig, logger *slog.Logger) ([]config.UpstreamConfig, func(context.Context) error, error) {
+func expandMullvadPool(ctx context.Context, block config.UpstreamPoolConfig, logger *slog.Logger) (*poolBlock, error) {
 	expLogger := logger.With("component", "mullvad-expander", "id_prefix", block.IDPrefix)
 	client := mullvad.NewClient()
 	client.Logger = expLogger
@@ -419,39 +644,70 @@ func expandMullvadPool(ctx context.Context, block config.UpstreamPoolConfig, log
 		Refresh:         block.RefreshDuration(),
 	}, client, expLogger)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	initial, err := exp.Snapshot(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	// Phase 6 only logs diffs; Phase 7 will rewire this callback to
-	// hot-swap the live pool on every tick.
-	run := func(ctx context.Context) error {
-		return exp.RunRefresh(ctx, initial, func(prev, next []config.UpstreamConfig) {
-			added, removed := diffUpstreams(prev, next)
-			if len(added) == 0 && len(removed) == 0 {
-				expLogger.Debug("upstream_pool refresh: no change", "upstreams", len(next))
-				return
-			}
+	return &poolBlock{
+		idPrefix: block.IDPrefix,
+		exp:      exp,
+		initial:  initial,
+		logger:   expLogger,
+	}, nil
+}
+
+// runRefresh drives one block's refresh ticker. The callback logs the
+// snapshot-level diff (prev vs. next, the existing INFO/DEBUG
+// behaviour) and, when composer is non-nil, hands every snapshot to
+// composer.Update. The composer is the authority on whether a swap is
+// needed: if next equals the last-applied expansion, Update returns
+// (applied=false, nil) and we stay quiet. If a previous swap failed,
+// the composer's cache is still at the prior good snapshot, so the
+// next call to Update with the same next re-attempts the swap — the
+// retry does not depend on the Mullvad expander's prev advancing.
+// composer may be nil during construction or for tests that only want
+// to observe the log path.
+func (b *poolBlock) runRefresh(ctx context.Context, composer *poolComposer) error {
+	return b.exp.RunRefresh(ctx, b.initial, func(prev, next []config.UpstreamConfig) {
+		added, removed := diffUpstreams(prev, next)
+		if len(added) == 0 && len(removed) == 0 {
+			b.logger.Debug("upstream_pool refresh: snapshot unchanged",
+				"upstreams", len(next))
+		} else {
 			// INFO carries counts plus a small sample so a normal log
 			// line stays small even when Mullvad rolls out or removes
 			// dozens of relays at once. Operators who need the full
 			// diff can drop the level to DEBUG.
-			expLogger.Info("upstream_pool refresh",
+			b.logger.Info("upstream_pool refresh",
 				"upstreams", len(next),
 				"added_count", len(added),
 				"removed_count", len(removed),
 				"added_sample", truncateIDs(added, refreshLogSampleSize),
 				"removed_sample", truncateIDs(removed, refreshLogSampleSize),
 			)
-			expLogger.Debug("upstream_pool refresh full diff",
+			b.logger.Debug("upstream_pool refresh full diff",
 				"added", added,
 				"removed", removed,
 			)
-		})
-	}
-	return initial, run, nil
+		}
+		if composer == nil {
+			return
+		}
+		applied, err := composer.Update(b.idPrefix, next)
+		if err != nil {
+			b.logger.Warn("upstream_pool hot-swap failed; running pool unchanged",
+				"err", err,
+			)
+			return
+		}
+		if applied {
+			b.logger.Info("upstream_pool hot-swap applied",
+				"upstreams", len(next),
+			)
+		}
+	})
 }
 
 // refreshLogSampleSize bounds the number of upstream ids included in the

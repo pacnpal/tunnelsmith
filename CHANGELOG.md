@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (Phase 11.1)
+
+- `[[upstream_pool]]` refresh tick now hot-swaps the running priority pool. Each successful diff (a fresh Mullvad relay snapshot that differs from the last) rebuilds the pool from `(static [[upstream]]) ∪ (every block's latest expansion)` and installs it via `Scoreboard.ReplacePool`. Cached HTTP transports drop on swap so new `Upstream` objects use freshly-pinned `DialContext` closures; force pins to upstreams that disappeared in the new expansion are evicted automatically; per-(host, upstream) scoreboard entries for removed ids age out via score decay. Resolves the v1.x maintenance bullet about Mullvad relay churn — operators no longer need to bounce the binary to pick up a Mullvad rotation.
+- New Prometheus counter `tunnelsmith_pool_hotswap_total{result}` tracks every refresh-tick swap with `result="success"` or `result="error"`.
+- `cmd/tunnelsmith/main.go` gains a `poolComposer` that owns the swap, captures the static `[[upstream]]` slice and per-block expansion at startup, and serializes concurrent refreshes through a mutex so multiple `[[upstream_pool]]` blocks can coexist without tearing the merged view. SIGHUP behavior is unchanged: pool-shape changes still bypass the reloader, since the refresh ticker now owns them end-to-end.
+
 ### Added (Phase 11)
 
 - Cooperative outcome reporting for HTTPS coverage. Apps submit per-request outcomes (`ok` / `rate_limited` / `forbidden` / `legal_block` / `geo_block` / `timeout` / `refused`) to a new control listener (`[control]`, default `:9092`) so the per-(host, upstream) scoreboard learns from HTTPS traffic the proxy cannot inspect on its own. Outcomes map to existing `failure.Kind` values; no new kinds were introduced.

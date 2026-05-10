@@ -52,6 +52,7 @@ detail.
 | `tunnelsmith_probe_picks_total` | none | Number of times the probe roll picked a non-top eligible candidate. |
 | `tunnelsmith_persistence_writes_total` | `result` | Snapshot-write outcomes. Result is `success` or `error`. |
 | `tunnelsmith_config_reloads_total` | `result` | SIGHUP-driven reload outcomes. Result is `success` or `error`. |
+| `tunnelsmith_pool_hotswap_total` | `result` | `[[upstream_pool]]` refresh-tick hot-swap outcomes (Phase 11.1). One increment per attempted hot-swap: the snapshot from the expander differs from the last successfully installed expansion for that pool block (`poolComposer.Update`), which includes retries on ticks where the expander's prev/next diff is empty but a prior swap failed and the composer's cache hasn't advanced. `result=success` when `Scoreboard.ReplacePool` installed the new pool; `result=error` for any failure that left the running pool untouched — duplicate-id rejection, `upstream.New` / `NewPool` build error, `Scoreboard.ReplacePool` install error, or an `Update` against an unregistered `id_prefix`. |
 
 ### Histograms
 
@@ -63,7 +64,7 @@ detail.
 
 | Name | Labels | Meaning |
 | --- | --- | --- |
-| `tunnelsmith_upstream_pool_size` | none | Number of upstreams currently in the pool. Updates at startup and after a SIGHUP reload. |
+| `tunnelsmith_upstream_pool_size` | none | Number of upstreams currently in the pool. Updated at startup, after a SIGHUP reload, and on every successful `[[upstream_pool]]` hot-swap (`poolComposer.Update` calls `SetUpstreamPoolSize` after each accepted swap — Phase 11.1). |
 | `tunnelsmith_scoreboard_entries` | none | Total number of (host, upstream) entries the scoreboard is tracking. Refreshes every 5 seconds. |
 | `tunnelsmith_upstream_cooled_hosts` | `upstream_id` | Number of hosts currently on cooldown for the labelled upstream. Refreshes every 5 seconds. |
 | `tunnelsmith_cascade_active_hosts` | none | Number of hosts currently in cascade-failure cooldown. Refreshes every 5 seconds. |
@@ -161,9 +162,12 @@ What hot-reload does NOT change (restart required):
 - `failure.scoring.decay_interval` - the decay goroutine reads its
   ticker once at start; retuning mid-flight is more risk than benefit
   for v1
-- `[[upstream_pool]]` (Mullvad refresh schedule) - pool blocks are
-  expanded once at startup; the periodic refresh inside each block uses
-  its own ticker
+- `[[upstream_pool]]` block configuration (provider, id_prefix,
+  priority, countries, include_inactive, refresh, cache_path) - the
+  block shape is captured at startup. The *running expansion* is
+  hot-swapped on every successful refresh tick via `poolComposer.Update`
+  (Phase 11.1), so a Mullvad relay rotation lands without a restart;
+  only the block configuration itself stays restart-frozen.
 
 ## Logs
 
