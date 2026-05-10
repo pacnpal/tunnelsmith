@@ -52,7 +52,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "fetch:", err)
 		os.Exit(1)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 	upstream := resp.Header.Get("X-Tunnelsmith-Upstream")

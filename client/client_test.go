@@ -43,7 +43,7 @@ func fakeProxy(t *testing.T, upstreamID string) (proxyURL *url.URL, srv *httptes
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		for k, v := range resp.Header {
 			for _, vv := range v {
 				w.Header().Add(k, vv)
@@ -172,7 +172,7 @@ func TestPlainHTTPCapturesUpstreamFromResponse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if got := resp.Header.Get("X-Tunnelsmith-Upstream"); got != "mullvad-se-got" {
 		t.Errorf("response header = %q, want mullvad-se-got", got)
@@ -327,10 +327,10 @@ func TestReportOnSDKResponseWithoutHeaderReturnsErrNoUpstream(t *testing.T) {
 		req, _ := http.NewRequestWithContext(r.Context(), r.Method, r.URL.String(), nil)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
-			http.Error(w, err.Error(), 502)
+			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		// No X-Tunnelsmith-Upstream header.
 		w.WriteHeader(resp.StatusCode)
 		_, _ = io.Copy(w, resp.Body)
@@ -346,7 +346,7 @@ func TestReportOnSDKResponseWithoutHeaderReturnsErrNoUpstream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if err := client.Report(resp, "ok"); !errors.Is(err, client.ErrNoUpstream) {
 		t.Fatalf("Report: %v, want ErrNoUpstream", err)
@@ -410,7 +410,7 @@ func TestReportRespectsTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	start := time.Now()
 	err = client.Report(resp, "ok")
@@ -441,10 +441,10 @@ func TestConcurrentReportsDoNotRace(t *testing.T) {
 		req, _ := http.NewRequestWithContext(r.Context(), r.Method, r.URL.String(), nil)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
-			http.Error(w, err.Error(), 502)
+			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		id := "u" + strings.Repeat("x", int(counter.Add(1))%5)
 		w.Header().Set("X-Tunnelsmith-Upstream", id)
 		w.WriteHeader(resp.StatusCode)
