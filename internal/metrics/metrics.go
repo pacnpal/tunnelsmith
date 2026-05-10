@@ -46,6 +46,16 @@ const (
 	ResultError   = "error"
 )
 
+// Reason labels for reports_rejected_total. Phase 11 uses these from
+// internal/control so the metric stays consistent across packages.
+const (
+	ReportRejectBadJSON              = "bad_json"
+	ReportRejectMissingField         = "missing_field"
+	ReportRejectUnknownOutcome       = "unknown_outcome"
+	ReportRejectUnknownUpstream      = "unknown_upstream"
+	ReportRejectScoreboardNotStarted = "scoreboard_unavailable"
+)
+
 // Registry holds Tunnelsmith's metric vectors and the Prometheus registry
 // they live in. Methods are safe for concurrent use.
 type Registry struct {
@@ -63,6 +73,8 @@ type Registry struct {
 	ScoreboardEntries   prometheus.Gauge
 	UpstreamCooledHosts *prometheus.GaugeVec
 	CascadeActiveHosts  prometheus.Gauge
+	ReportsReceived     *prometheus.CounterVec
+	ReportsRejected     *prometheus.CounterVec
 }
 
 // New constructs a Registry with all metric vectors registered in a fresh
@@ -136,6 +148,16 @@ func New() *Registry {
 			Name:      "cascade_active_hosts",
 			Help:      "Number of hosts currently in cascade-failure cooldown.",
 		}),
+		ReportsReceived: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "tunnelsmith",
+			Name:      "reports_received_total",
+			Help:      "Number of cooperative outcome reports the control endpoint accepted, labelled by outcome and upstream.",
+		}, []string{"outcome", "upstream_id"}),
+		ReportsRejected: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "tunnelsmith",
+			Name:      "reports_rejected_total",
+			Help:      "Number of cooperative outcome reports the control endpoint rejected, labelled by reason (bad_json, missing_field, unknown_outcome, unknown_upstream, scoreboard_unavailable).",
+		}, []string{"reason"}),
 	}
 
 	reg.MustRegister(
@@ -151,6 +173,8 @@ func New() *Registry {
 		r.ScoreboardEntries,
 		r.UpstreamCooledHosts,
 		r.CascadeActiveHosts,
+		r.ReportsReceived,
+		r.ReportsRejected,
 	)
 
 	return r
@@ -229,6 +253,24 @@ func (r *Registry) ObserveConfigReload(result string) {
 		return
 	}
 	r.ConfigReloads.WithLabelValues(result).Inc()
+}
+
+// ObserveReportReceived increments reports_received_total for an accepted
+// cooperative outcome report. Phase 11.
+func (r *Registry) ObserveReportReceived(outcome, upstreamID string) {
+	if r == nil {
+		return
+	}
+	r.ReportsReceived.WithLabelValues(outcome, upstreamID).Inc()
+}
+
+// ObserveReportRejected increments reports_rejected_total for a report the
+// control endpoint refused. reason is one of the ReportReject* constants.
+func (r *Registry) ObserveReportRejected(reason string) {
+	if r == nil {
+		return
+	}
+	r.ReportsRejected.WithLabelValues(reason).Inc()
 }
 
 // SetUpstreamPoolSize updates the gauge tracking the active upstream pool

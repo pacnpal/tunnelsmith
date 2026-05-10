@@ -123,6 +123,12 @@ Body-regex inspection is separately gated by `failure.body_buffer_kb` and runs o
 
 The RuleSet is hot-reloadable: `Scoreboard.ReplaceRules` and `HTTPServer.ReloadRules` install the same compiled set sequentially, each under its own component's write lock. Both calls take their write lock for the swap, so a request reading either component's pointer sees one self-consistent rule set, never a half-written state. Across components the swap is sequential, not atomic: a request mid-reload may briefly observe the new rules in one component and the old in the other (for example, the listener could route through the old prefer set while inspecting bodies with the new patterns). The window is short and bounded; routing decisions converge on the next request once both swaps complete.
 
+## Cooperative outcome reporting (Phase 11)
+
+Body-regex inspection only sees plain HTTP. CONNECT and SOCKS5 carry TLS opaquely, so the listener has no signal beyond dial-level failure for HTTPS. Phase 11 closes that gap with an out-of-band channel: the proxy advertises which exit served a request via `X-Tunnelsmith-Upstream` (already on plain-HTTP responses; now also on the CONNECT 200 response), and apps that opt in POST per-request outcomes back to a small control listener (`internal/control`, default `:9092`).
+
+The control endpoint maps a closed outcome vocabulary (`ok`, `rate_limited`, `forbidden`, `legal_block`, `geo_block`, `timeout`, `refused`) to existing `failure.Kind` values and calls `Scoreboard.RecordSuccess` or `Scoreboard.RecordFailure`. No new kinds are introduced; the scoreboard treats app-reported failures identically to listener-detected ones. The full wire protocol is in [`docs/cooperative-reporting.md`](cooperative-reporting.md). The rationale for choosing this over MITM TLS interception is in [`ADR-006`](decisions.md).
+
 ## What v1.0.0 deliberately does not have
 
 - Global degradation detection ("upstream X is failing for every host, mark it globally degraded"). The proposal lists this as a refinement; tracked in [docs/roadmap.md](roadmap.md#v2-candidates) for post-v1 consideration.

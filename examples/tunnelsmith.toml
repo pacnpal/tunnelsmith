@@ -50,6 +50,17 @@ bind = ":9090"
 bind = ":9091"
 
 # --------------------------------------------------------------------
+# Cooperative-reporting endpoint (Phase 11). Defaults to :9092; empty
+# disables the listener entirely. The control port is unauthenticated;
+# bind it to a private interface only. Apps integrate via the wire
+# protocol documented in docs/cooperative-reporting.md or the Go SDK
+# at github.com/pacnpal/tunnelsmith/client. The endpoint exposes
+# POST /v1/report (submit per-request outcomes) and GET /healthz.
+# --------------------------------------------------------------------
+[control]
+bind = ":9092"
+
+# --------------------------------------------------------------------
 # Upstreams. At least one is required. Every upstream needs a unique id.
 #
 # Tunnelsmith builds a priority pool from these entries and tries them

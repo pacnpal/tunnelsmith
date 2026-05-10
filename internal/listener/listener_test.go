@@ -595,6 +595,109 @@ func TestHTTPConnectPipelinedBytesReachUpstream(t *testing.T) {
 	}
 }
 
+// TestHTTPConnectAdvertisesUpstreamHeader asserts the CONNECT 200 response
+// carries X-Tunnelsmith-Upstream so Phase 11 cooperating clients can read
+// the chosen exit id via http.Transport.OnProxyConnectResponse and feed it
+// back to the control endpoint when reporting outcomes.
+func TestHTTPConnectAdvertisesUpstreamHeader(t *testing.T) {
+	t.Parallel()
+
+	dest, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen dest: %v", err)
+	}
+	t.Cleanup(func() { _ = dest.Close() })
+	go func() {
+		for {
+			c, err := dest.Accept()
+			if err != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
+
+	srv, err := listener.NewHTTP("127.0.0.1:0", directScoreboard(t), defaultDetector(), 5, quietLogger())
+	if err != nil {
+		t.Fatalf("build http listener: %v", err)
+	}
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve(context.Background()) }()
+	select {
+	case <-srv.Ready():
+	case <-time.After(2 * time.Second):
+		t.Fatal("http listener did not bind in time")
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+		<-serveErr
+	})
+
+	clientConn, err := net.Dial("tcp", srv.Addr().String())
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer func() { _ = clientConn.Close() }()
+
+	connectReq := "CONNECT " + dest.Addr().String() + " HTTP/1.1\r\nHost: " + dest.Addr().String() + "\r\n\r\n"
+	if _, err := clientConn.Write([]byte(connectReq)); err != nil {
+		t.Fatalf("write CONNECT: %v", err)
+	}
+
+	_ = clientConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	br := bufio.NewReader(clientConn)
+	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		t.Fatalf("read CONNECT response: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("CONNECT status = %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Tunnelsmith-Upstream"); got != "direct" {
+		t.Fatalf("X-Tunnelsmith-Upstream = %q, want %q", got, "direct")
+	}
+}
+
+// TestHTTPConnectAdvertisesUpstreamHeaderViaOnProxyConnectResponse exercises
+// the canonical Go client path: the same hook a Phase 11 SDK uses to capture
+// the exit id. Verifies the header lands on connectRes.Header inside the
+// callback, which is the integration contract maintainers code against.
+func TestHTTPConnectAdvertisesUpstreamHeaderViaOnProxyConnectResponse(t *testing.T) {
+	t.Parallel()
+
+	dest := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	}))
+	t.Cleanup(dest.Close)
+
+	_, proxyURL := startHTTPListener(t)
+
+	var capturedUpstream string
+	tr := &http.Transport{
+		Proxy:           http.ProxyURL(proxyURL),
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // test server uses a self-signed cert
+		OnProxyConnectResponse: func(_ context.Context, _ *url.URL, _ *http.Request, connectRes *http.Response) error {
+			capturedUpstream = connectRes.Header.Get("X-Tunnelsmith-Upstream")
+			return nil
+		},
+	}
+	t.Cleanup(tr.CloseIdleConnections)
+	client := &http.Client{Transport: tr, Timeout: 5 * time.Second}
+
+	resp, err := client.Get(dest.URL)
+	if err != nil {
+		t.Fatalf("client.Get: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	if capturedUpstream != "direct" {
+		t.Fatalf("OnProxyConnectResponse saw upstream = %q, want %q", capturedUpstream, "direct")
+	}
+}
+
 // TestHTTPConnectShutdownDrains opens a CONNECT tunnel that the destination
 // holds open, calls Shutdown with a short timeout, and confirms the
 // listener forces the tunnel closed within the timeout instead of hanging.

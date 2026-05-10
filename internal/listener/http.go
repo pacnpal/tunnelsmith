@@ -403,7 +403,7 @@ func (h *HTTPServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 		h.logger.Warn("connect hijack failed", "host", host, "err", err)
 		return
 	}
-	if _, err := clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
+	if _, err := clientConn.Write(buildConnectResponse(upID)); err != nil {
 		_ = clientConn.Close()
 		_ = upConn.Close()
 		h.logger.Warn("connect write 200 failed", "host", host, "err", err)
@@ -1055,4 +1055,38 @@ func (h *HTTPServer) snapshotTunnels() []*tunnel {
 		out = append(out, t)
 	}
 	return out
+}
+
+// buildConnectResponse formats the CONNECT 200 response. When upID is a
+// safe header value, the response advertises X-Tunnelsmith-Upstream so
+// cooperating clients can capture the exit id via
+// http.Transport.OnProxyConnectResponse and feed it back to the Phase 11
+// control endpoint. When upID contains bytes that would corrupt the
+// response stream, the header is omitted; the tunnel still works, the
+// reporting integration just degrades to no-op for that one request.
+// Upstream ids come from config and from [[upstream_pool]] expansion,
+// which already produce printable ASCII; the validation here is defense
+// in depth for raw-byte header writes.
+func buildConnectResponse(upID string) []byte {
+	if !validHeaderFieldValue(upID) {
+		return []byte("HTTP/1.1 200 Connection Established\r\n\r\n")
+	}
+	return []byte("HTTP/1.1 200 Connection Established\r\nX-Tunnelsmith-Upstream: " + upID + "\r\n\r\n")
+}
+
+// validHeaderFieldValue reports whether v is safe to embed in a raw HTTP
+// header value. Rejects empty strings and any byte outside printable
+// ASCII (0x20..0x7E). Tighter than RFC 7230 token rules but fine for the
+// upstream-id space, which is alphanumeric in practice.
+func validHeaderFieldValue(v string) bool {
+	if v == "" {
+		return false
+	}
+	for i := 0; i < len(v); i++ {
+		b := v[i]
+		if b < 0x20 || b > 0x7E {
+			return false
+		}
+	}
+	return true
 }

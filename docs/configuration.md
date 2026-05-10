@@ -71,6 +71,16 @@ Web UI. Renders the scoreboard, the upstream pool, and the active force pins, pl
 
 When set, `bind` must parse via `net.SplitHostPort` with a port in `1-65535`. The UI port is **unauthenticated**: there is no login, no token, no rate limit. The four mutating endpoints (`/api/forget`, `/api/force`, `/api/force/clear`, `/api/reset`) accept any caller that can reach the port. Bind it to a loopback address (`127.0.0.1:9091`) or to a private subnet that only your trusted clients can reach. See [ui.md](ui.md) for the endpoint reference and the security stance.
 
+## `[control]`
+
+Phase 11 cooperative-reporting endpoint. Apps that integrate via [`docs/cooperative-reporting.md`](cooperative-reporting.md) POST per-request outcomes here so Tunnelsmith's scoreboard learns from HTTPS traffic the proxy cannot inspect on its own.
+
+| key    | type   | default | notes |
+|--------|--------|---------|-------|
+| `bind` | string | `:9092` | host:port for the control HTTP listener; empty disables it entirely |
+
+When set, `bind` must parse via `net.SplitHostPort` with a port in `1-65535`. Like `[ui]`, the control port is **unauthenticated**: there is no login, no token, no rate limit. `POST /v1/report` mutates scoreboard state every time it is called. Bind it to a loopback address or to the private subnet your trusted apps reach Tunnelsmith over. See [`docs/cooperative-reporting.md`](cooperative-reporting.md) for the wire protocol, outcome vocabulary, and the trust boundary.
+
 ## `[[upstream]]`
 
 The config must define at least one upstream, either directly via `[[upstream]]` or by expansion via `[[upstream_pool]]`. Lower priority wins ties; scores from the Phase 4 scoreboard dominate priority once they exist. Every upstream needs a unique `id`.

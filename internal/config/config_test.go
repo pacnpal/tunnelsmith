@@ -107,6 +107,9 @@ kind = "direct"
 	if cfg.UI.Bind != ":9091" {
 		t.Errorf("UI.Bind default = %q, want :9091", cfg.UI.Bind)
 	}
+	if cfg.Control.Bind != ":9092" {
+		t.Errorf("Control.Bind default = %q, want :9092", cfg.Control.Bind)
+	}
 	if cfg.Failure.TimeoutMS != 8000 {
 		t.Errorf("Failure.TimeoutMS default = %d, want 8000", cfg.Failure.TimeoutMS)
 	}
@@ -623,6 +626,17 @@ id = "d"
 kind = "direct"
 `,
 			contains: "ui.bind",
+		},
+		{
+			name: "control.bind rejects malformed addr",
+			toml: `
+[control]
+bind = "not-a-host-port"
+[[upstream]]
+id = "d"
+kind = "direct"
+`,
+			contains: "control.bind",
 		},
 		{
 			name: "upstream_pool missing provider",

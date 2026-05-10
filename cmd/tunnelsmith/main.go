@@ -21,6 +21,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/pacnpal/tunnelsmith/internal/config"
+	"github.com/pacnpal/tunnelsmith/internal/control"
 	"github.com/pacnpal/tunnelsmith/internal/failure"
 	"github.com/pacnpal/tunnelsmith/internal/listener"
 	"github.com/pacnpal/tunnelsmith/internal/metrics"
@@ -212,6 +213,10 @@ func run(args []string, stdout, stderr *os.File) error {
 	if cfg.UI.Bind != "" {
 		uiSrv = ui.NewServer(cfg.UI.Bind, sb, logger)
 	}
+	var controlSrv *control.Server
+	if cfg.Control.Bind != "" {
+		controlSrv = control.NewServer(cfg.Control.Bind, sb, metricsRegistry, logger)
+	}
 
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error { return httpSrv.Serve(gctx) })
@@ -221,6 +226,9 @@ func run(args []string, stdout, stderr *os.File) error {
 	}
 	if uiSrv != nil {
 		g.Go(func() error { return uiSrv.Serve(gctx) })
+	}
+	if controlSrv != nil {
+		g.Go(func() error { return controlSrv.Serve(gctx) })
 	}
 	if cfg.Cache.PersistPath != "" {
 		persistLoop := scoreboard.NewPersistenceLoop(sb, scoreboard.PersistenceConfig{
@@ -289,6 +297,11 @@ func run(args []string, stdout, stderr *os.File) error {
 	if uiSrv != nil {
 		if err := uiSrv.Shutdown(shutdownCtx); err != nil {
 			logger.Warn("ui shutdown error", "err", err)
+		}
+	}
+	if controlSrv != nil {
+		if err := controlSrv.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("control shutdown error", "err", err)
 		}
 	}
 
