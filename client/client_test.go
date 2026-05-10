@@ -454,7 +454,7 @@ func TestNegativeTimeoutDisablesReportDeadline(t *testing.T) {
 	t.Cleanup(dest.Close)
 	proxyURL, _ := fakeProxy(t, "u1")
 
-	c, _ := client.New(client.Options{
+	c := mustNewClient(t, client.Options{
 		ProxyURL:   proxyURL.String(),
 		ControlURL: control.URL,
 		Timeout:    -1 * time.Second,
