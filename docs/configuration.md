@@ -121,7 +121,7 @@ Failure-detection settings. The signals feed the scoreboard's penalty / cooldown
 
 | key                          | type             | default       | notes |
 |------------------------------|------------------|---------------|-------|
-| `connection_refused`         | bool             | `true`        | parsed and accepted; the runtime always classifies dial-side `ECONNREFUSED` as `KindRefused` and applies the configured policy regardless of this value. The opt-out gate is tracked in [#20](https://github.com/pacnpal/tunnelsmith/issues/20); set the field if you want forward compatibility, but do not rely on `false` to skip refused-connection scoring in v1.0.0 |
+| `connection_refused`         | bool             | `true`        | when `false`, dial-side `ECONNREFUSED` errors are not scored: the upstream's penalty and cooldown are unchanged. Applies to both the HTTP forward path and the CONNECT/SOCKS tunnel path. The failed dial is still logged and counted in metrics; only the scoreboard penalty/cooldown step is skipped. Hot-reload (SIGHUP) picks up a changed value live |
 | `timeout_ms`                 | int (ms)         | `8000`        | per-attempt timeout; must be > 0 |
 | `body_regex`                 | array of strings | `[]`          | deprecated; the parser still accepts the field but the runtime ignores it. Move patterns into `[[rule]].body_regex` instead. A non-empty value at startup triggers a one-line warning |
 | `body_buffer_kb`             | int              | `32`          | per-response cap (in KiB) on the body prefix the listener buffers for `[[rule]].body_regex` matching. Must be >= 0 and <= 1024. Set to `0` to disable body inspection regardless of any `[[rule]].body_regex` entries; SIGHUP applies the new value live |

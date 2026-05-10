@@ -158,7 +158,7 @@ func run(args []string, stdout, stderr *os.File) error {
 	metricsRegistry := metrics.New()
 	metricsRegistry.SetUpstreamPoolSize(pool.Len())
 
-	sb, err := scoreboard.New(pool, scoreboard.FromConfig(cfg.Failure.Scoring, cfg.Failure.Status),
+	sb, err := scoreboard.New(pool, scoreboard.FromConfig(cfg.Failure.Scoring, cfg.Failure.Status, cfg.Failure.ConnectionRefused),
 		scoreboard.WithLogger(logger),
 		scoreboard.WithMetrics(metricsRegistry),
 		scoreboard.WithRules(rules),
@@ -194,6 +194,7 @@ func run(args []string, stdout, stderr *os.File) error {
 		listener.WithHTTPMetrics(metricsRegistry),
 		listener.WithHTTPRules(rules),
 		listener.WithHTTPBodyBufferKB(cfg.Failure.BodyBufferKB),
+		listener.WithHTTPConnectionRefused(cfg.Failure.ConnectionRefused),
 	)
 	if err != nil {
 		return fmt.Errorf("build http listener: %w", err)
@@ -562,8 +563,9 @@ func (r *reloader) reload(ctx context.Context) {
 
 	// Always hot-reload scoring tunings and the status detector. They
 	// are independent of the pool shape.
-	r.sb.Reload(scoreboard.FromConfig(newCfg.Failure.Scoring, newCfg.Failure.Status))
+	r.sb.Reload(scoreboard.FromConfig(newCfg.Failure.Scoring, newCfg.Failure.Status, newCfg.Failure.ConnectionRefused))
 	r.httpSrv.Reload(failure.NewStatusDetector(newCfg.Failure.Status), newCfg.Failure.MaxRetriesPerRequest)
+	r.httpSrv.ReloadConnectionRefused(newCfg.Failure.ConnectionRefused)
 
 	switch {
 	case r.runningHasPool || len(newCfg.UpstreamPools) > 0:

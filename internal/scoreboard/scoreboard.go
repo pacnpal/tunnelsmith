@@ -47,6 +47,21 @@ type Policy struct {
 // Config is the runtime tuning the scoreboard reads at construction. Build
 // it from a config.ScoringConfig via FromConfig, or hand-roll it in tests.
 type Config struct {
+	// ConnectionRefused, when false, disables scoring for true ECONNREFUSED
+	// dial errors: the upstream's penalty and cooldown are unchanged. Dial
+	// failures classified as KindRefused for other reasons (DNS failure,
+	// network unreachable, or any other unclassified error that
+	// ClassifyDialError maps to KindRefused) are still scored regardless of
+	// this field. Logging and metrics are unaffected either way.
+	//
+	// The Go zero value is false (scoring off). Production callers build
+	// Config via FromConfig, passing cfg.Failure.ConnectionRefused as the
+	// connectionRefused argument; that value is defaulted to true by
+	// config.applyDefaults, so refused scoring is on by default in
+	// production. Test helpers that hand-roll Config must set this field
+	// explicitly when they need scoring-on behavior.
+	ConnectionRefused bool
+
 	// KindPolicy maps each failure.Kind the listener can report to its
 	// penalty and cooldown. Missing kinds are treated as zero policy
 	// (no penalty, no cooldown), which is the right thing for kinds that
@@ -89,12 +104,16 @@ type Config struct {
 }
 
 // FromConfig builds a scoreboard Config from the parsed [failure.scoring]
-// section plus the [[failure.status]] entries. Phase 4 fires refused and
-// timeout from the dial path; Phase 5 wires the status-rule kinds; Phase 8
-// fires KindBodyMatch from the listener's response-body inspector. The
-// kind→policy table is complete at construction so a missing kind never
-// records a penalty silently.
-func FromConfig(s config.ScoringConfig, status []config.StatusRule) Config {
+// section plus the [[failure.status]] entries. connectionRefused mirrors the
+// [failure].connection_refused key: false disables scoring for true ECONNREFUSED
+// dial errors (as determined by failure.IsConnectionRefused) while still scoring
+// other dial failures that ClassifyDialError maps to KindRefused via its default
+// branch (DNS failure, network unreachable, etc.).
+// Phase 4 fires refused and timeout from the dial path; Phase 5 wires the
+// status-rule kinds; Phase 8 fires KindBodyMatch from the listener's
+// response-body inspector. The kind→policy table is complete at construction
+// so a missing kind never records a penalty silently.
+func FromConfig(s config.ScoringConfig, status []config.StatusRule, connectionRefused bool) Config {
 	policy := map[failure.Kind]Policy{
 		failure.KindRefused: {
 			Penalty:  s.RefusedPenalty,
@@ -129,7 +148,8 @@ func FromConfig(s config.ScoringConfig, status []config.StatusRule) Config {
 		}
 	}
 	return Config{
-		KindPolicy:     policy,
+		ConnectionRefused: connectionRefused,
+		KindPolicy:        policy,
 		SuccessWeight:  s.SuccessWeight,
 		ScoreCap:       s.ScoreCap,
 		ProbeChance:    s.ProbeChance,
@@ -942,7 +962,16 @@ func (s *Scoreboard) DialFor(ctx context.Context, network, addr string) (net.Con
 		}
 		kind := failure.ClassifyDialError(dialErr)
 		if kind != "" {
-			s.RecordFailure(host, up.ID(), kind, nil)
+			// Only skip scoring for a true ECONNREFUSED when the gate is off.
+			// Unclassified errors (DNS, network unreachable, etc.) that
+			// ClassifyDialError maps to KindRefused by default are always
+			// scored: the gate is specifically for "the remote actively
+			// refused our TCP connection", not "something went wrong dialing".
+			// configSnapshot is only called on the hot branch so lock traffic
+			// stays zero for non-refused and unclassified failures.
+			if kind != failure.KindRefused || !failure.IsConnectionRefused(dialErr) || s.configSnapshot().ConnectionRefused {
+				s.RecordFailure(host, up.ID(), kind, nil)
+			}
 		}
 		s.observeDialFailure(up.ID(), kind, latency)
 		s.logger.Warn("upstream dial",
