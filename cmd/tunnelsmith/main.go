@@ -457,36 +457,55 @@ func newPoolComposer(
 }
 
 // Update is invoked by a poolBlock's refresh callback when a fresh
-// snapshot differs from the last one. It replaces that block's current
-// expansion, rebuilds the merged priority pool from static + every
-// block's latest expansion, and installs the new pool on the
-// scoreboard. Failures (build error in upstream.New, NewPool, or
-// ReplacePool) leave the running pool untouched and increment the
-// pool_hotswap_total{result="error"} counter. Concurrent Updates from
-// different blocks serialize through mu so each swap sees a
-// self-consistent merged view.
+// snapshot differs from the last one. It rebuilds the merged priority
+// pool from static + every block's latest expansion (substituting next
+// for the matching block), installs the new pool on the scoreboard,
+// and only then commits next into the composer's cache. Failures
+// (build error in upstream.New, NewPool, or ReplacePool) leave both
+// the running pool and the composer's cache untouched and increment
+// the pool_hotswap_total{result="error"} counter, so a subsequent
+// Update from a different block does not silently merge in an
+// expansion that was never actually installed.
+//
+// The lock is held for the entire build-and-swap so two concurrent
+// Updates from different blocks serialize end-to-end. Refresh ticks
+// fire on hour-scale schedules; lock granularity is a non-issue here
+// and the simpler ordering is worth more than the contention saved.
 func (c *poolComposer) Update(idPrefix string, next []config.UpstreamConfig) error {
 	c.mu.Lock()
-	found := false
+	defer c.mu.Unlock()
+
+	idx := -1
 	for i := range c.blocks {
 		if c.blocks[i].idPrefix == idPrefix {
-			c.blocks[i].current = append([]config.UpstreamConfig(nil), next...)
-			found = true
+			idx = i
 			break
 		}
 	}
-	if !found {
-		c.mu.Unlock()
-		err := fmt.Errorf("poolComposer: no block registered for id_prefix %q", idPrefix)
+	if idx == -1 {
 		c.registry.ObservePoolHotSwap(metrics.ResultError)
-		return err
+		return fmt.Errorf("poolComposer: no block registered for id_prefix %q", idPrefix)
 	}
-	merged := make([]config.UpstreamConfig, 0, len(c.static)+c.totalExpansionsLocked())
+
+	// Build the merged view substituting next for the matching block
+	// without mutating cached state. If anything below this point fails
+	// the cache stays at the last-installed snapshot.
+	totalLen := len(c.static) + len(next)
+	for i, b := range c.blocks {
+		if i == idx {
+			continue
+		}
+		totalLen += len(b.current)
+	}
+	merged := make([]config.UpstreamConfig, 0, totalLen)
 	merged = append(merged, c.static...)
-	for _, b := range c.blocks {
-		merged = append(merged, b.current...)
+	for i, b := range c.blocks {
+		if i == idx {
+			merged = append(merged, next...)
+		} else {
+			merged = append(merged, b.current...)
+		}
 	}
-	c.mu.Unlock()
 
 	entries := make([]upstream.PoolEntry, 0, len(merged))
 	for _, uc := range merged {
@@ -506,6 +525,11 @@ func (c *poolComposer) Update(idPrefix string, next []config.UpstreamConfig) err
 		c.registry.ObservePoolHotSwap(metrics.ResultError)
 		return fmt.Errorf("scoreboard ReplacePool: %w", err)
 	}
+
+	// Swap succeeded: commit the new expansion to the cache so the next
+	// Update merges from the actually-installed view.
+	c.blocks[idx].current = append([]config.UpstreamConfig(nil), next...)
+
 	// Drop cached HTTP transports so a new pool's Upstream objects
 	// build fresh DialContext closures rather than routing through the
 	// previous Upstream's pinned dialer. swapStaticPool does the same.
@@ -518,16 +542,6 @@ func (c *poolComposer) Update(idPrefix string, next []config.UpstreamConfig) err
 	c.registry.SetUpstreamPoolSize(newPool.Len())
 	c.registry.ObservePoolHotSwap(metrics.ResultSuccess)
 	return nil
-}
-
-// totalExpansionsLocked sums every block's current expansion length.
-// Called under c.mu.
-func (c *poolComposer) totalExpansionsLocked() int {
-	n := 0
-	for _, b := range c.blocks {
-		n += len(b.current)
-	}
-	return n
 }
 
 // poolBlock carries the live state for one [[upstream_pool]] block so a

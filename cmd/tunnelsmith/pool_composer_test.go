@@ -254,6 +254,50 @@ func TestPoolComposerErrorLeavesPoolUntouched(t *testing.T) {
 	}
 }
 
+// TestPoolComposerErrorDoesNotPoisonCacheForOtherBlocks — a failed
+// Update on one block must leave that block's cached expansion at the
+// previously-installed snapshot. Otherwise a subsequent Update on a
+// DIFFERENT block would build its merged view from the failed
+// expansion (the running pool never saw it) and install upstreams
+// that were never validated. Pins the
+// commit-cache-only-on-success contract.
+func TestPoolComposerErrorDoesNotPoisonCacheForOtherBlocks(t *testing.T) {
+	t.Parallel()
+	statics := []config.UpstreamConfig{directUpstream("static-direct", 100)}
+	pbA := &poolBlock{idPrefix: "mvd-a", initial: []config.UpstreamConfig{directUpstream("a-001", 200)}, logger: quietTestLogger()}
+	pbB := &poolBlock{idPrefix: "mvd-b", initial: []config.UpstreamConfig{directUpstream("b-001", 200)}, logger: quietTestLogger()}
+	initialPool := append([]config.UpstreamConfig{}, statics...)
+	initialPool = append(initialPool, pbA.initial...)
+	initialPool = append(initialPool, pbB.initial...)
+	c, sb, _ := composerForTest(t, statics, []*poolBlock{pbA, pbB}, initialPool)
+
+	// First, confirm a healthy update on B installs cleanly.
+	if err := c.Update("mvd-b", []config.UpstreamConfig{directUpstream("b-002", 200)}); err != nil {
+		t.Fatalf("Update b: %v", err)
+	}
+
+	// Failed update on A: malformed entry trips upstream.New.
+	prio := 200
+	bad := config.UpstreamConfig{ID: "broken", Kind: ""}
+	bad.Priority = &prio
+	if err := c.Update("mvd-a", []config.UpstreamConfig{bad}); err == nil {
+		t.Fatalf("Update a (malformed): want error, got nil")
+	}
+
+	// Now update B again with a fresh expansion. The merged view must
+	// include A's *previous* expansion (a-001), not the failed
+	// "broken" entry. If the cache had been poisoned, the next pool
+	// would either include "broken" (and fail to build) or be missing
+	// "a-001".
+	if err := c.Update("mvd-b", []config.UpstreamConfig{directUpstream("b-003", 200)}); err != nil {
+		t.Fatalf("Update b again: %v", err)
+	}
+	want := []string{"a-001", "b-003", "static-direct"}
+	if got := sortedIDs(sb.PoolIDs()); !equalStrings(got, want) {
+		t.Fatalf("after recovery PoolIDs = %v, want %v (failed Update on a must not have committed its cached expansion)", got, want)
+	}
+}
+
 // TestPoolComposerUnknownIDPrefixReturnsError — Update against an
 // id_prefix that was not registered at startup is rejected (caller bug)
 // and counted as an error.
