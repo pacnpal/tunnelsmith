@@ -202,6 +202,7 @@ Tunnelsmith's deployment shape makes this practical. The user controls the apps 
 - The proxy's security stance does not escalate. No private key on disk worth more than the existing config.
 - Coverage is bounded by integration. Maintainers who do nothing get the existing dial-level signals. The integration guide (`docs/integration-guide.md`) makes the cost visible: ≤10 lines for Go, ~30 lines for any other language.
 - The Phase 8 body-regex path keeps working unchanged; cooperative reporting is additive, not a replacement for the plain-HTTP inspector.
+- Reports are not idempotent (see Non-goals). When an app retries a report — for example, after a transient control-endpoint failure — the scoreboard records the same penalty twice, which can compound an upstream's score and produce false-negative health signals that misroute subsequent traffic. Apps that care about this either deduplicate on their side or accept the over-penalty as a cost of the at-least-once delivery model.
 - If a future workload demands coverage of uninstrumented HTTPS clients, MITM can be revisited then with the v2-candidate text from `docs/roadmap.md` (now removed) preserved in this ADR's history.
 
 ### References
@@ -255,7 +256,7 @@ The design space was small. Bearer is the simplest credible primitive: stateless
 
 - Operators who run the control endpoint on loopback or a private subnet can keep doing so unchanged. Empty token set = same wire shape as Phase 11.
 - Operators in multi-tenant or LAN-exposed deployments get a credible auth gate without ceremony. Each app gets its own token; rotation is a SIGHUP away.
-- Token compromise is a real failure mode. Mitigations: short-lived tokens, periodic rotation, and (when Phase 13 lands) TLS to keep tokens off the wire in cleartext.
+- Token compromise is a real failure mode. Without TLS on the control listener, bearer tokens travel in plaintext over the network path between the app and Tunnelsmith and can be captured by any observer on the Docker network, the LAN, or any intermediate hop — see the TLS entry under Non-goals above. Mitigations: bind the listener to loopback or to a network segment the operator already trusts, use short-lived tokens, rotate periodically, and when Phase 13 lands the listener-side TLS, terminate TLS at the listener. Operators evaluating Phase 12 for multi-tenant or LAN-exposed deployments should treat plaintext-token transmission as the primary risk to plan around until that follow-up ships.
 - The wire protocol stays backward-compatible. Existing apps without tokens keep working as long as the operator has not configured tokens server-side. Once tokens are configured, every app must opt in or it gets 401.
 - The metrics reject vocabulary grows by two labels. Operators with alerting on `tunnelsmith_reports_rejected_total` should add a panel for `auth_missing` + `auth_failed` to catch misconfigured clients.
 - The control package gains a small `auth.go` and a `tokenSet` abstraction; the rest of the surface is one new option per existing constructor.

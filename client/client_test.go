@@ -128,6 +128,18 @@ func waitForReports(t *testing.T, rc *recordingControl, want int) []recordedRepo
 	return rc.snapshot()
 }
 
+// mustNewClient builds a client and fails the test immediately if
+// initialization errors, so a misconfigured Options surfaces with the
+// real error instead of panicking on a later c.Get / c.Do.
+func mustNewClient(t *testing.T, opts client.Options) *http.Client {
+	t.Helper()
+	c, err := client.New(opts)
+	if err != nil {
+		t.Fatalf("client.New: %v", err)
+	}
+	return c
+}
+
 func TestNewValidatesOptions(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -246,7 +258,7 @@ func TestAutoReportFiresOn403And451(t *testing.T) {
 			proxyURL, _ := fakeProxy(t, "u")
 			rc, controlSrv := newControl(t)
 
-			c, _ := client.New(client.Options{
+			c := mustNewClient(t, client.Options{
 				ProxyURL:   proxyURL.String(),
 				ControlURL: controlSrv.URL,
 			})
@@ -277,7 +289,7 @@ func TestNoAutoReportOn2xxOr5xx(t *testing.T) {
 			proxyURL, _ := fakeProxy(t, "u")
 			rc, controlSrv := newControl(t)
 
-			c, _ := client.New(client.Options{
+			c := mustNewClient(t, client.Options{
 				ProxyURL:   proxyURL.String(),
 				ControlURL: controlSrv.URL,
 			})
@@ -287,11 +299,17 @@ func TestNoAutoReportOn2xxOr5xx(t *testing.T) {
 			}
 			_ = resp.Body.Close()
 
-			// Allow the goroutine that *would* have fired a report to
-			// have a chance to run.
-			time.Sleep(100 * time.Millisecond)
-			if got := rc.snapshot(); len(got) != 0 {
-				t.Errorf("unexpected auto-report on %d: %+v", status, got)
+			// Poll a bounded window. A misbehaving auto-report fires
+			// asynchronously; checking once at a fixed deadline can
+			// miss a fast-firing report that has already returned.
+			// Polling catches a report whenever it appears within the
+			// window and avoids a single brittle Sleep.
+			deadline := time.Now().Add(300 * time.Millisecond)
+			for time.Now().Before(deadline) {
+				if got := rc.snapshot(); len(got) != 0 {
+					t.Fatalf("unexpected auto-report on %d: %+v", status, got)
+				}
+				time.Sleep(15 * time.Millisecond)
 			}
 		})
 	}
@@ -338,7 +356,7 @@ func TestReportOnSDKResponseWithoutHeaderReturnsErrNoUpstream(t *testing.T) {
 	t.Cleanup(proxySrv.Close)
 
 	rc, controlSrv := newControl(t)
-	c, _ := client.New(client.Options{
+	c := mustNewClient(t, client.Options{
 		ProxyURL:   proxySrv.URL,
 		ControlURL: controlSrv.URL,
 	})
@@ -371,7 +389,7 @@ func TestReportFailureDoesNotPropagateOnAutoReport(t *testing.T) {
 	rc.status = http.StatusInternalServerError
 	rc.mu.Unlock()
 
-	c, _ := client.New(client.Options{
+	c := mustNewClient(t, client.Options{
 		ProxyURL:   proxyURL.String(),
 		ControlURL: controlSrv.URL,
 		Timeout:    500 * time.Millisecond,
@@ -401,7 +419,7 @@ func TestReportRespectsTimeout(t *testing.T) {
 	t.Cleanup(dest.Close)
 	proxyURL, _ := fakeProxy(t, "u1")
 
-	c, _ := client.New(client.Options{
+	c := mustNewClient(t, client.Options{
 		ProxyURL:   proxyURL.String(),
 		ControlURL: hung.URL,
 		Timeout:    150 * time.Millisecond,
@@ -486,7 +504,7 @@ func TestConcurrentReportsDoNotRace(t *testing.T) {
 	t.Cleanup(proxySrv.Close)
 	rc, controlSrv := newControl(t)
 
-	c, _ := client.New(client.Options{
+	c := mustNewClient(t, client.Options{
 		ProxyURL:   proxySrv.URL,
 		ControlURL: controlSrv.URL,
 	})
