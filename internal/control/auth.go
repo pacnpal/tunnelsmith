@@ -2,13 +2,14 @@
 // docs/decisions.md ADR-007 for the rationale and docs/cooperative-
 // reporting.md for the wire-protocol contract.
 //
-// The package exposes a TokenSource interface so the server and the
-// handlers depend on a one-method abstraction that tests can fake;
-// the concrete tokenSet stores the operator-configured tokens behind
-// an atomic.Pointer so Allow stays lock-free on the request path and
-// ReplaceTokens is the only writer (driven by SIGHUP through the
-// reloader). An empty token set short-circuits to "permit everything",
-// preserving Phase 11 behaviour for operators who do not opt in.
+// The package exposes a small TokenSource interface (Allow + Enabled)
+// so the server and the handlers depend on an abstraction that tests
+// can fake; the concrete tokenSet stores the operator-configured tokens
+// (precomputed as []byte to keep the request path allocation-light)
+// behind an atomic.Pointer so Allow stays lock-free and ReplaceTokens
+// is the only writer (driven by SIGHUP through the reloader). An empty
+// token set short-circuits to "permit everything", preserving Phase 11
+// behaviour for operators who do not opt in.
 
 package control
 
@@ -38,12 +39,14 @@ type TokenSource interface {
 	Enabled() bool
 }
 
-// tokenSet is the production TokenSource. The tokens slice is
-// replaceable atomically so SIGHUP rotation does not block in-flight
-// requests; readers grab the pointer once and use that snapshot for
-// the whole comparison loop.
+// tokenSet is the production TokenSource. The stored snapshot holds
+// each token as a precomputed []byte so Allow can call
+// subtle.ConstantTimeCompare without a per-token allocation on the
+// request path; the snapshot is swapped atomically so SIGHUP rotation
+// does not block in-flight requests, and readers grab the pointer once
+// and use that snapshot for the whole comparison loop.
 type tokenSet struct {
-	tokens atomic.Pointer[[]string]
+	tokens atomic.Pointer[[][]byte]
 }
 
 // NewTokenSet builds a TokenSource from a tokens slice. Pass an empty
@@ -62,12 +65,14 @@ func (s *tokenSet) Replace(tokens []string) {
 }
 
 func (s *tokenSet) store(tokens []string) {
-	cp := make([]string, len(tokens))
-	copy(cp, tokens)
+	cp := make([][]byte, len(tokens))
+	for i, t := range tokens {
+		cp[i] = []byte(t)
+	}
 	s.tokens.Store(&cp)
 }
 
-func (s *tokenSet) snapshot() []string {
+func (s *tokenSet) snapshot() [][]byte {
 	p := s.tokens.Load()
 	if p == nil {
 		return nil
@@ -81,7 +86,8 @@ func (s *tokenSet) snapshot() []string {
 // returns 0 on length mismatch (an inherent timing leak of input length
 // vs. stored token length); ADR-007 accepts that for v1 since
 // operator-chosen tokens are usually fixed-length high-entropy
-// strings.
+// strings. Tokens are stored pre-converted to []byte so this hot path
+// allocates exactly once per request (the input → []byte conversion).
 func (s *tokenSet) Allow(input string) bool {
 	tokens := s.snapshot()
 	if len(tokens) == 0 {
@@ -93,7 +99,7 @@ func (s *tokenSet) Allow(input string) bool {
 	in := []byte(input)
 	var ok int
 	for _, t := range tokens {
-		ok |= subtle.ConstantTimeCompare(in, []byte(t))
+		ok |= subtle.ConstantTimeCompare(in, t)
 	}
 	return ok == 1
 }
@@ -160,7 +166,7 @@ func LoadTokensFile(path string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open auth_tokens_file %q: %w", path, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	var (
 		out  []string
 		seen = make(map[string]struct{})

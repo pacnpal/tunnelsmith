@@ -73,8 +73,8 @@ func TestTokenSetReplaceIsAtomic(t *testing.T) {
 		t.Error("post-Replace: Allow(new) = false, want true")
 	}
 	ts.Replace(nil)
-	if !ts.Enabled() == false {
-		// Enabled false means empty: no-auth default restored.
+	if ts.Enabled() {
+		t.Error("post-Replace(nil): Enabled() = true, want false (no-auth default restored)")
 	}
 	if !ts.Allow("anything") {
 		t.Error("post-Replace(nil): empty set should permit anything")
@@ -162,7 +162,7 @@ func TestReportRejectsMissingAuthorization(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", resp.StatusCode)
 	}
@@ -186,7 +186,7 @@ func TestReportRejectsMalformedAuthorization(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", resp.StatusCode)
 	}
@@ -207,7 +207,7 @@ func TestReportRejectsUnknownToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", resp.StatusCode)
 	}
@@ -231,7 +231,7 @@ func TestReportAuthChecksBeforeBodyRead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401 (auth must fail before body read)", resp.StatusCode)
 	}
@@ -254,7 +254,7 @@ func TestReportAcceptsKnownToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("status = %d, want 204", resp.StatusCode)
 	}
@@ -273,7 +273,7 @@ func TestHealthzUngatedByDefault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET healthz: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("healthz status = %d, want 200 (default ungated)", resp.StatusCode)
 	}
@@ -290,7 +290,7 @@ func TestHealthzGatedWhenConfigured(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET healthz: %v", err)
 	}
-	resp1.Body.Close()
+	_ = resp1.Body.Close()
 	if resp1.StatusCode != http.StatusUnauthorized {
 		t.Errorf("healthz status (no auth) = %d, want 401", resp1.StatusCode)
 	}
@@ -302,7 +302,7 @@ func TestHealthzGatedWhenConfigured(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET healthz auth: %v", err)
 	}
-	resp2.Body.Close()
+	_ = resp2.Body.Close()
 	if resp2.StatusCode != http.StatusOK {
 		t.Errorf("healthz status (auth) = %d, want 200", resp2.StatusCode)
 	}

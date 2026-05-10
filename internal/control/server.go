@@ -52,7 +52,7 @@ type Server struct {
 	addr   string
 	logger *slog.Logger
 	srv    *http.Server
-	tokens *tokenSet // nil when ServerOptions.Tokens was empty; auth.go's Allow handles nil
+	tokens *tokenSet // always non-nil; an empty token set encodes the no-auth default
 
 	ready    chan struct{}
 	listener net.Listener
