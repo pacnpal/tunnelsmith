@@ -29,7 +29,7 @@
 //	→ 204 No Content on success.
 //	→ 400 Bad Request on malformed JSON, missing fields, or unknown outcome.
 //	→ 404 Not Found when "upstream" is not in the pool.
-//	→ 503 Service Unavailable when the scoreboard is not ready.
+//	→ 503 Service Unavailable when the scoreboard backend is unavailable.
 //
 // docs/cooperative-reporting.md is the public reference.
 package control

@@ -46,8 +46,8 @@ const (
 	ResultError   = "error"
 )
 
-// Reason labels for reports_rejected_total. Phase 11 uses these from
-// internal/control so the metric stays consistent across packages.
+// Reason labels for reports_rejected_total. internal/control imports
+// these constants so reject labels stay consistent across packages.
 const (
 	ReportRejectBadJSON              = "bad_json"
 	ReportRejectMissingField         = "missing_field"

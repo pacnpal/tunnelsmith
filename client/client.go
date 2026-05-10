@@ -88,11 +88,12 @@ var ErrNoUpstream = errors.New("client: response has no recorded upstream id")
 // upstream id for each request, and emits auto-reports for status codes
 // in {429, 403, 451}. It is the SDK's RoundTripper.
 type reportingTransport struct {
-	base       *http.Transport
-	controlURL string
-	timeout    time.Duration
-	logger     *slog.Logger
-	reporter   *http.Client // dedicated client for control-plane POSTs
+	base            *http.Transport
+	controlURL      string
+	timeout         time.Duration
+	logger          *slog.Logger
+	reporter        *http.Client  // dedicated client for control-plane POSTs
+	autoReportSlots chan struct{} // bounds concurrent async report goroutines
 }
 
 // upstreamBox is the per-request slot OnProxyConnectResponse writes
@@ -100,11 +101,12 @@ type reportingTransport struct {
 // context; resp.Request preserves that context so Report can recover it
 // from the response alone.
 type upstreamBox struct {
-	upstream   atomic.Value // string; "" until populated
-	controlURL string
-	timeout    time.Duration
-	logger     *slog.Logger
-	reporter   *http.Client
+	upstream        atomic.Value // string; "" until populated
+	controlURL      string
+	timeout         time.Duration
+	logger          *slog.Logger
+	reporter        *http.Client
+	autoReportSlots chan struct{}
 }
 
 func (b *upstreamBox) get() string {
@@ -137,7 +139,9 @@ func New(opts Options) (*http.Client, error) {
 	}
 
 	timeout := opts.Timeout
-	if timeout == 0 {
+	if timeout < 0 {
+		timeout = 0
+	} else if timeout == 0 {
 		timeout = 2 * time.Second
 	}
 
@@ -170,9 +174,11 @@ func New(opts Options) (*http.Client, error) {
 		reporter: &http.Client{
 			Timeout: timeout,
 			Transport: &http.Transport{
+				Proxy:               func(*http.Request) (*url.URL, error) { return nil, nil },
 				MaxIdleConnsPerHost: 4,
 			},
 		},
+		autoReportSlots: make(chan struct{}, 64),
 	}
 
 	return &http.Client{Transport: rt}, nil
@@ -186,10 +192,11 @@ func New(opts Options) (*http.Client, error) {
 //  4. Auto-reports 429 / 403 / 451 to the control endpoint.
 func (r *reportingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	box := &upstreamBox{
-		controlURL: r.controlURL,
-		timeout:    r.timeout,
-		logger:     r.logger,
-		reporter:   r.reporter,
+		controlURL:      r.controlURL,
+		timeout:         r.timeout,
+		logger:          r.logger,
+		reporter:        r.reporter,
+		autoReportSlots: r.autoReportSlots,
 	}
 	ctx := context.WithValue(req.Context(), ctxKeyUpstream{}, box)
 	req2 := req.WithContext(ctx)
@@ -284,7 +291,17 @@ type reportPayload struct {
 // a report failure to the caller; failures are logged through Options.Logger
 // when set.
 func postReport(b *upstreamBox, host, upstream, outcome string, httpStatus *int) {
+	select {
+	case b.autoReportSlots <- struct{}{}:
+	default:
+		if b.logger != nil {
+			b.logger.Warn("client: dropping auto-report due to local backpressure",
+				"host", host, "upstream", upstream, "outcome", outcome)
+		}
+		return
+	}
 	go func() {
+		defer func() { <-b.autoReportSlots }()
 		if err := postReportSync(b, host, upstream, outcome, httpStatus); err != nil && b.logger != nil {
 			b.logger.Warn("client: report failed",
 				"host", host, "upstream", upstream, "outcome", outcome, "err", err)
@@ -306,7 +323,11 @@ func postReportSync(b *upstreamBox, host, upstream, outcome string, httpStatus *
 		return fmt.Errorf("marshal report: %w", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), b.timeout)
+	ctx := context.Background()
+	cancel := func() {}
+	if b.timeout > 0 {
+		ctx, cancel = context.WithTimeout(context.Background(), b.timeout)
+	}
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.controlURL+"/v1/report", bytes.NewReader(payload))

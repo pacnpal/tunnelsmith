@@ -11,9 +11,9 @@ These are incremental fixes against the v1 surface and may land in a v1.x point 
 
 ## Planned
 
-Designs that have been locked in but not yet implemented. Each has a master plan in `docs/_planning/` and an ADR in `docs/decisions.md`.
+Designs that have been locked in but not yet implemented. Each has an ADR in `docs/decisions.md`.
 
-- **Phase 12: bearer-token auth on the control endpoint.** Optional bearer tokens for `POST /v1/report` so operators in multi-tenant deployments or LAN-exposed setups can gate reporting. Tokens defined inline or in a hot-reloadable file; constant-time compare; new metrics reject reasons. See [`docs/_planning/phase-12.md`](_planning/phase-12.md) and [ADR-007](decisions.md).
+- **Phase 12: bearer-token auth on the control endpoint.** Optional bearer tokens for `POST /v1/report` so operators in multi-tenant deployments or LAN-exposed setups can gate reporting. Tokens defined inline or in a hot-reloadable file; constant-time compare; new metrics reject reasons. See [ADR-007](decisions.md).
 
 ## v2 candidates
 

@@ -423,6 +423,39 @@ func TestReportRespectsTimeout(t *testing.T) {
 	}
 }
 
+func TestNegativeTimeoutDisablesReportDeadline(t *testing.T) {
+	t.Parallel()
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(150 * time.Millisecond)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(control.Close)
+	dest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	}))
+	t.Cleanup(dest.Close)
+	proxyURL, _ := fakeProxy(t, "u1")
+
+	c, _ := client.New(client.Options{
+		ProxyURL:   proxyURL.String(),
+		ControlURL: control.URL,
+		Timeout:    -1 * time.Second,
+	})
+	resp, err := c.Get(dest.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	start := time.Now()
+	if err := client.Report(resp, "ok"); err != nil {
+		t.Fatalf("Report with disabled timeout failed: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < 100*time.Millisecond {
+		t.Fatalf("Report returned too early with disabled timeout: elapsed=%v", elapsed)
+	}
+}
+
 // TestConcurrentReportsDoNotRace is a smoke test under -race for the
 // per-request upstream box. Each request gets its own box; any
 // inadvertent shared state would surface as a race or as cross-bleed

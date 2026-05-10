@@ -3,6 +3,7 @@ package control
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -117,11 +118,18 @@ func handleReport(w http.ResponseWriter, r *http.Request, backend Backend, m Met
 		rejectReport(w, m, metrics.ReportRejectBadJSON, http.StatusBadRequest, "parse json: "+err.Error())
 		return
 	}
-	// Reject extra JSON content after the object so a sloppy client
-	// that pipelines multiple reports in one body sees a clear 400
-	// instead of silently dropping the second report.
-	if dec.More() {
+	// Reject extra content after the first JSON object. Decode a second
+	// value and require EOF so malformed tails (for example an extra '}')
+	// are also rejected.
+	var trailing any
+	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
 		rejectReport(w, m, metrics.ReportRejectBadJSON, http.StatusBadRequest, "trailing content after json object")
+		return
+	}
+
+	if backend == nil {
+		rejectReport(w, m, metrics.ReportRejectScoreboardNotStarted, http.StatusServiceUnavailable,
+			"scoreboard not ready")
 		return
 	}
 

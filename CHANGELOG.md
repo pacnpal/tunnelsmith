@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Wire-protocol reference at `docs/cooperative-reporting.md` so non-Go apps can implement the integration in ~30 lines.
 - Runnable Go example at `examples/integration/main.go`.
 - Two Prometheus counters for the control plane: `tunnelsmith_reports_received_total{outcome,upstream_id}` and `tunnelsmith_reports_rejected_total{reason}`.
-- Phase 11 master plan at `docs/_planning/phase-11.md`. ADR-006 documents the decision to ship cooperative reporting instead of MITM TLS interception (the v2-candidate item from `docs/roadmap.md`, now resolved).
+- ADR-006 in `docs/decisions.md` documents the decision to ship cooperative reporting instead of MITM TLS interception (the v2-candidate item from `docs/roadmap.md`, now resolved).
 
 ## [1.0.0] - 2026-05-09
 

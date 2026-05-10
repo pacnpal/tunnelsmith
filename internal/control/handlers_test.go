@@ -109,7 +109,7 @@ func TestReportOKRecordsSuccess(t *testing.T) {
 		"outcome": "ok",
 		"http_status": 200
 	}`)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("status = %d, want 204", resp.StatusCode)
 	}
@@ -149,7 +149,7 @@ func TestReportEachOutcomeMapsToExpectedKind(t *testing.T) {
 				"upstream": "u1",
 				"outcome": "`+outcome+`"
 			}`)
-			defer resp.Body.Close()
+			defer func() { _ = resp.Body.Close() }()
 			if resp.StatusCode != http.StatusNoContent {
 				t.Fatalf("status = %d, want 204", resp.StatusCode)
 			}
@@ -173,7 +173,7 @@ func TestReportWrongMethodReturns405(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d, want 405", resp.StatusCode)
 	}
@@ -187,7 +187,7 @@ func TestReportBadJSONReturns400(t *testing.T) {
 	m := &fakeMetrics{}
 	srv := newTestServer(t, &fakeBackend{}, m)
 	resp := postJSON(t, srv, "/v1/report", `{not-json`)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", resp.StatusCode)
 	}
@@ -205,7 +205,7 @@ func TestReportTooLargeReturns413(t *testing.T) {
 	pad := strings.Repeat(" ", 5*1024)
 	body := `{"host":"a","upstream":"u1","outcome":"ok"` + pad + `}`
 	resp := postJSON(t, srv, "/v1/report", body)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status = %d, want 413", resp.StatusCode)
 	}
@@ -249,7 +249,7 @@ func TestReportUnknownOutcomeReturns400(t *testing.T) {
 		"upstream": "u1",
 		"outcome": "tea_pot"
 	}`)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", resp.StatusCode)
 	}
@@ -273,7 +273,7 @@ func TestReportUnknownUpstreamReturns404(t *testing.T) {
 		"upstream": "ghost",
 		"outcome": "ok"
 	}`)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", resp.StatusCode)
 	}
@@ -288,11 +288,39 @@ func TestReportTrailingContentReturns400(t *testing.T) {
 	srv := newTestServer(t, &fakeBackend{poolIDs: []string{"u1"}}, m)
 	resp := postJSON(t, srv, "/v1/report",
 		`{"host":"a","upstream":"u1","outcome":"ok"}{"oops":true}`)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", resp.StatusCode)
 	}
 	if len(m.rejected) != 1 || m.rejected[0] != metrics.ReportRejectBadJSON {
+		t.Errorf("rejected metrics = %v", m.rejected)
+	}
+}
+
+func TestReportMalformedTrailingContentReturns400(t *testing.T) {
+	t.Parallel()
+	m := &fakeMetrics{}
+	srv := newTestServer(t, &fakeBackend{poolIDs: []string{"u1"}}, m)
+	resp := postJSON(t, srv, "/v1/report", `{"host":"a","upstream":"u1","outcome":"ok"}}`)
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	if len(m.rejected) != 1 || m.rejected[0] != metrics.ReportRejectBadJSON {
+		t.Errorf("rejected metrics = %v", m.rejected)
+	}
+}
+
+func TestReportBackendUnavailableReturns503(t *testing.T) {
+	t.Parallel()
+	m := &fakeMetrics{}
+	srv := newTestServer(t, nil, m)
+	resp := postJSON(t, srv, "/v1/report", `{"host":"a","upstream":"u1","outcome":"ok"}`)
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	}
+	if len(m.rejected) != 1 || m.rejected[0] != metrics.ReportRejectScoreboardNotStarted {
 		t.Errorf("rejected metrics = %v", m.rejected)
 	}
 }
@@ -303,7 +331,7 @@ func TestReportRejectsUnknownJSONFields(t *testing.T) {
 	srv := newTestServer(t, &fakeBackend{poolIDs: []string{"u1"}}, m)
 	resp := postJSON(t, srv, "/v1/report",
 		`{"host":"a","upstream":"u1","outcome":"ok","extra":"not-allowed"}`)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", resp.StatusCode)
 	}
@@ -319,7 +347,7 @@ func TestHealthz(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}

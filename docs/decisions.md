@@ -206,9 +206,8 @@ Tunnelsmith's deployment shape makes this practical. The user controls the apps 
 
 ### References
 
-- `docs/_planning/phase-11.md` — implementation plan and success criteria.
 - `docs/cooperative-reporting.md` — the wire-protocol contract maintainers integrate against.
-- `docs/integration-guide.md` — Level 6 walks through the integration.
+- `docs/integration-guide.md` — Level 8 walks through the integration.
 - Go `net/http.Transport.OnProxyConnectResponse` (stable since Go 1.20) — how Go clients read the upstream id from the CONNECT 200 response.
 
 ---
@@ -263,7 +262,7 @@ The design space was small. Bearer is the simplest credible primitive: stateless
 
 ### References
 
-- `docs/_planning/phase-12.md` — implementation plan and success criteria.
 - `docs/cooperative-reporting.md` — wire-protocol contract that grows the optional `Authorization` header.
+- `docs/roadmap.md` — planned follow-up tracking for Phase 12.
 - ADR-006 — the Phase 11 decision this builds on.
 - RFC 6750 — Bearer Token usage in HTTP Authorization headers.
