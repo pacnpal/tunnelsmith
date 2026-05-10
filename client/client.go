@@ -181,12 +181,18 @@ func New(opts Options) (*http.Client, error) {
 		// Reuse a single client (with its own short-lived transport)
 		// for control-plane POSTs so report bursts share a connection.
 		// The control endpoint is local to tunnelsmith and never goes
-		// through the proxy itself.
+		// through the proxy itself. CheckRedirect refuses every redirect
+		// because net/http silently downgrades POST to GET on 301/302/303,
+		// which would let a misconfigured front-end (or trailing-slash
+		// redirect) drop reports without surfacing the misconfiguration.
 		reporter: &http.Client{
 			Timeout: timeout,
 			Transport: &http.Transport{
 				Proxy:               func(*http.Request) (*url.URL, error) { return nil, nil },
 				MaxIdleConnsPerHost: 4,
+			},
+			CheckRedirect: func(req *http.Request, _ []*http.Request) error {
+				return fmt.Errorf("client: control endpoint redirected to %s; reports must hit /v1/report directly", req.URL)
 			},
 		},
 		autoReportSlots: make(chan struct{}, 64),

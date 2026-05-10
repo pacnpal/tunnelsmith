@@ -404,6 +404,42 @@ func TestReportFailureDoesNotPropagateOnAutoReport(t *testing.T) {
 	_ = resp.Body.Close()
 }
 
+// TestReportRefusesRedirect verifies the SDK does not silently follow
+// a redirect from the control endpoint. net/http downgrades POST to
+// GET on 301/302/303, which would let a misconfigured front-end (e.g.
+// a trailing-slash redirector) silently drop reports. The SDK must
+// surface the redirect as a failure instead.
+func TestReportRefusesRedirect(t *testing.T) {
+	t.Parallel()
+	dest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	}))
+	t.Cleanup(dest.Close)
+	proxyURL, _ := fakeProxy(t, "u1")
+
+	// Control server that always responds with a 301 redirect.
+	redir := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", "/elsewhere")
+		w.WriteHeader(http.StatusMovedPermanently)
+	}))
+	t.Cleanup(redir.Close)
+
+	c := mustNewClient(t, client.Options{
+		ProxyURL:   proxyURL.String(),
+		ControlURL: redir.URL,
+		Timeout:    500 * time.Millisecond,
+	})
+	resp, err := c.Get(dest.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if err := client.Report(resp, "ok"); err == nil {
+		t.Fatalf("Report should fail when control endpoint redirects, got nil error")
+	}
+}
+
 func TestReportRespectsTimeout(t *testing.T) {
 	t.Parallel()
 	// Control endpoint that holds the request open longer than the

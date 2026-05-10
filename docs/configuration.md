@@ -81,6 +81,8 @@ Phase 11 cooperative-reporting endpoint. Apps that integrate via [`docs/cooperat
 
 When set, `bind` must parse via `net.SplitHostPort` with a port in `1-65535`. Like `[ui]`, the control port is **unauthenticated**: there is no login, no token, no rate limit. `POST /v1/report` mutates scoreboard state every time it is called. Bind it to a loopback address or to the private subnet your trusted apps reach Tunnelsmith over. See [`docs/cooperative-reporting.md`](cooperative-reporting.md) for the wire protocol, outcome vocabulary, and the trust boundary.
 
+`control.bind` is **restart-only**. SIGHUP hot-reload does not move the listener; the same constraint applies as `[metrics]` and `[ui]`. Restart the binary to change the address.
+
 ## `[[upstream]]`
 
 The config must define at least one upstream, either directly via `[[upstream]]` or by expansion via `[[upstream_pool]]`. Lower priority wins ties; scores from the Phase 4 scoreboard dominate priority once they exist. Every upstream needs a unique `id`.

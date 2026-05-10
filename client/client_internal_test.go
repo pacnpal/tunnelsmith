@@ -13,7 +13,7 @@ func TestHostForReportAddsDefaultHTTPSPort(t *testing.T) {
 	}
 }
 
-func TestHostForReportAddsDefaultHTTPPort(t *testing.T) {
+func TestHostForReportHTTPReturnsHostnameOnly(t *testing.T) {
 	t.Parallel()
 	req := httptest.NewRequest("GET", "http://example.com/path", nil)
 	if got := hostForReport(req); got != "example.com" {

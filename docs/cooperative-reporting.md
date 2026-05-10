@@ -80,7 +80,7 @@ Content-Type: application/json
 
 | field | type | notes |
 |---|---|---|
-| `host` | string | Destination as `host:port` (e.g. `example.com:443`). Must match the host the request was sent to. |
+| `host` | string | Destination key the report applies to. The format must match how the proxy keys this destination on its side: **`host:port`** for HTTPS / CONNECT traffic (e.g. `example.com:443`), **hostname only** for plain-HTTP forward-proxy traffic (e.g. `example.com`). The Go SDK derives this automatically from the request URL; non-Go integrations should mirror that rule so reports land on the right scoreboard entry. Reports get normalized server-side (lowercased, RFC 1123 label check, IP literals canonicalized). |
 | `upstream` | string | Upstream id from `X-Tunnelsmith-Upstream`. Tunnelsmith rejects ids it does not know with `404`. |
 | `outcome` | string | One of the values in the table below. Unknown outcomes return `400`. |
 
@@ -115,6 +115,7 @@ The Go SDK auto-reports `429` → `rate_limited`, `403` → `forbidden`, and `45
 | `404 Not Found` | `upstream` is not in the pool. Common causes: the upstream id was renamed in tunnelsmith's config, or the report points at an old id from before a hot-reload. | Refresh the upstream id from the next response and retry. |
 | `405 Method Not Allowed` | You sent something other than `POST`. | Use `POST`. |
 | `413 Payload Too Large` | Body exceeded 4 KiB. | Trim the payload. Required fields are tiny. |
+| `503 Service Unavailable` | The scoreboard backend is not yet wired into the control listener (startup race or misconfiguration). | Retry after a short backoff; if persistent, check the operator's startup logs. |
 
 ### Trust boundary
 
