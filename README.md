@@ -286,7 +286,21 @@ force     = true   # do not fall back to other upstreams on failure
 
 **`[control]` auth (Phase 12)** — Add `auth_tokens = ["your-token"]` or point `auth_tokens_file` at a one-token-per-line file to gate `POST /v1/report` with bearer-token auth. Hot-reloads on SIGHUP without a restart.
 
-Sending `SIGHUP` applies a subset of config changes in place without a restart: `[failure.scoring]` knobs, `[[failure.status]]` codes, `failure.connection_refused`, `failure.max_retries_per_request`, `failure.body_buffer_kb`, `[[rule]]` blocks, and `[control]` auth tokens. Static `[[upstream]]` changes are also hot-reloaded when no `[[upstream_pool]]` blocks are in play. Listener bind addresses (`[listener]`, `[metrics]`, `[ui]`, `[control].bind`), `[control].gate_healthz`, `cache.persist_path`, and `[[upstream_pool]]` block shapes always require a restart.
+Sending `SIGHUP` applies a subset of config changes in place without a restart:
+
+**Hot-reloadable on SIGHUP:**
+- `[failure.scoring]` knobs (penalties, cooldowns, score cap, probe chance, decay, cascade TTL)
+- `[[failure.status]]` codes and per-code penalty/cooldown
+- `failure.connection_refused`, `failure.max_retries_per_request`, `failure.body_buffer_kb`
+- `[[rule]]` blocks (host routing overrides and body-regex patterns)
+- `[control].auth_tokens` and `[control].auth_tokens_file` (bearer-token rotation)
+- Static `[[upstream]]` list — only when no `[[upstream_pool]]` blocks are in play in either the running or new config
+
+**Require a restart to take effect:**
+- Listener bind addresses: `[listener].http`, `[listener].socks`, `[metrics].bind`, `[ui].bind`, `[control].bind`
+- `[control].gate_healthz`
+- `cache.persist_path` and `cache.persist_interval`
+- `[[upstream_pool]]` block shapes (provider, countries, refresh schedule)
 
 ## Use with Mullvad
 
@@ -348,6 +362,7 @@ if err != nil {
     log.Fatal(err)
 }
 defer resp.Body.Close()
+// Reports are best-effort; errors are safe to ignore (or log via client.Options.Logger).
 _ = client.Report(resp, "ok")
 ```
 
