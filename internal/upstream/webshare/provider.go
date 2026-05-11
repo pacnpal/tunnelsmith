@@ -167,16 +167,17 @@ func buildClient(cfg config.UpstreamPoolConfig, logger *slog.Logger) (*Client, e
 }
 
 func resolveToken(cfg config.UpstreamPoolConfig) (string, error) {
-	// Trim the inline token so a whitespace-padded value never
-	// reaches the Authorization header. ValidateConfig already
-	// rejects empty-after-trim, but this is defence in depth for
+	// Trim both fields so a whitespace-padded value never reaches
+	// the Authorization header or LoadTokenFile (which would error
+	// on a path like "   "). ValidateConfig already rejects
+	// empty-after-trim for both, but this is defence in depth for
 	// callers that bypass Provider.ValidateConfig (tests, future
 	// code paths) and matches the LoadTokenFile contract.
 	if t := strings.TrimSpace(cfg.APIToken); t != "" {
 		return t, nil
 	}
-	if cfg.APITokenFile != "" {
-		return LoadTokenFile(cfg.APITokenFile)
+	if path := strings.TrimSpace(cfg.APITokenFile); path != "" {
+		return LoadTokenFile(path)
 	}
 	return "", ErrTokenMissing
 }

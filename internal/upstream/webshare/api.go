@@ -33,6 +33,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -245,19 +246,24 @@ func (c *Client) ListProxies(ctx context.Context, opts ListProxiesOptions) ([]Pr
 }
 
 // cacheFallbackAllowed reports whether a stale cached list is a safe
-// substitute for the failed live fetch.
+// substitute for the failed live fetch. The policy is conservative:
+// only categories we explicitly recognise as transient are allowed.
+// Anything else fails closed so a schema change, malformed-response
+// bug, or response-size overflow surfaces to the operator instead of
+// being silently masked by yesterday's data.
 //
 //   - Auth (401) / forbidden (403) / rate-limit (429): never fall back.
-//     These represent a vendor-side intentional reject the operator
-//     should see, not paper over with stale data.
+//     Vendor-side intentional rejects the operator should see.
 //   - Other 4xx (e.g. 400 from a bad plan_id): never fall back.
-//     Client-side misconfig is operator-actionable and masking it with
-//     yesterday's cached list keeps the binary serving against a
-//     mistake the operator can fix today.
-//   - 5xx: fall back. Server-side failures are usually transient; a
-//     stale list is better than dropping the running pool.
-//   - Transport errors (DNS, TCP, timeout): fall back for the same
-//     reason — they're transient and unrelated to operator config.
+//     Client-side misconfig is operator-actionable.
+//   - 5xx: fall back. Server-side failures are usually transient and
+//     a stale list keeps the running pool serving.
+//   - Transport errors (DNS, TCP, timeout, mid-stream RST) surfaced
+//     via net.Error: fall back for the same reason.
+//   - Everything else (JSON decode error, URL parse error of the
+//     "next" cursor, "next path must be absolute", "list exceeded N
+//     pages", "response body exceeds N bytes"): fail closed. These
+//     are response-malformation or hard limits, not transient.
 func cacheFallbackAllowed(err error) bool {
 	switch {
 	case errors.Is(err, ErrUnauthorized):
@@ -274,7 +280,13 @@ func cacheFallbackAllowed(err error) bool {
 		// above via the typed sentinels.
 		return statusErr.StatusCode >= 500
 	}
-	return true
+	// Network-class transport errors satisfy net.Error. http.Client
+	// wraps dial / read failures in *url.Error which itself
+	// implements net.Error, so errors.As walks the chain even
+	// after the fmt.Errorf wrap in c.do. Everything else
+	// (decode/parse/limit) falls through to false.
+	var netErr net.Error
+	return errors.As(err, &netErr)
 }
 
 // listProxiesOnline performs the actual paginated walk. Separate so

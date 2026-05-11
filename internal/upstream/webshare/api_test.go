@@ -341,6 +341,38 @@ func TestListProxiesSkipsCacheOnGeneric4xx(t *testing.T) {
 	}
 }
 
+// TestListProxiesSkipsCacheOnDecodeError pins the conservative
+// fallback policy: a malformed JSON response (which usually signals
+// a schema change at Webshare) propagates so the operator notices,
+// instead of being silently masked by a stale cache. Without the
+// guard, a schema break would keep the binary serving from disk
+// indefinitely.
+func TestListProxiesSkipsCacheOnDecodeError(t *testing.T) {
+	srv, _ := newFakeServer(t, map[string]http.HandlerFunc{
+		"/proxy/list/": func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`not valid json at all`))
+		},
+	})
+	cachePath := filepath.Join(t.TempDir(), "cache.json")
+	cached := []Proxy{{ID: "d-stale", ProxyAddress: "1.1.1.1", Port: 1, Valid: true}}
+	if err := (&Cache{Path: cachePath}).Write(cached); err != nil {
+		t.Fatalf("seed cache: %v", err)
+	}
+	c := NewClient()
+	c.BaseURL = srv.URL
+	c.APIToken = "tok"
+	c.HTTPClient = srv.Client()
+	c.Cache = &Cache{Path: cachePath}
+	got, err := c.ListProxies(context.Background(), ListProxiesOptions{})
+	if err == nil {
+		t.Fatalf("expected decode error to propagate, got nil and %+v", got)
+	}
+	if got != nil {
+		t.Fatalf("expected nil list on decode error (no fallback), got %+v", got)
+	}
+}
+
 // TestListProxiesFallsBackOn5xx pins the inverse: a transient 5xx
 // from Webshare still falls back to the cached list so the running
 // pool keeps serving rather than blanking out on a server-side blip.
