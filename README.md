@@ -26,15 +26,11 @@ Each request goes through the scoreboard's `DialFor`. The scoreboard picks the b
 Multi-arch images (`linux/amd64`, `linux/arm64`) are published to GitHub Container Registry on every release:
 
 ```sh
-docker pull ghcr.io/pacnpal/tunnelsmith:latest
-docker run --rm ghcr.io/pacnpal/tunnelsmith:latest --version
-```
-
-Pin to a specific version for production use (image tags omit the leading `v` that git tags carry):
-
-```sh
 docker pull ghcr.io/pacnpal/tunnelsmith:1.1.0
+docker run --rm ghcr.io/pacnpal/tunnelsmith:1.1.0 --version
 ```
+
+Image tags omit the leading `v` that git tags carry (so git tag `v1.1.0` → image tag `1.1.0`). `:latest` is **not** published by the release workflow; always pin to a semver tag.
 
 The image is built from [`Dockerfile`](Dockerfile) using a distroless base (`gcr.io/distroless/static-debian12:nonroot`) and runs as a non-root user. The Dockerfile `EXPOSE`s ports `8080` (HTTP CONNECT), `1080` (SOCKS5), `9090` (metrics), and `9091` (web UI). The control endpoint on `:9092` is enabled by default but not in the `EXPOSE` list; publish it explicitly when you need it (`-p 9092:9092`).
 
@@ -106,7 +102,7 @@ docker run -d \
   -p 8080:8080 \
   -p 1080:1080 \
   -v "$(pwd)/deploy/tunnelsmith.example.toml:/etc/tunnelsmith/config.toml:ro" \
-  ghcr.io/pacnpal/tunnelsmith:latest \
+  ghcr.io/pacnpal/tunnelsmith:1.1.0 \
   --config /etc/tunnelsmith/config.toml
 ```
 
@@ -170,7 +166,7 @@ priority = 20
 ```yaml
 services:
   tunnelsmith:
-    image: ghcr.io/pacnpal/tunnelsmith:latest
+    image: ghcr.io/pacnpal/tunnelsmith:1.1.0
     container_name: tunnelsmith
     restart: unless-stopped
     ports:
