@@ -671,20 +671,11 @@ func (c *Config) Validate() error {
 	seenPoolPrefixes := make(map[string]int, len(c.UpstreamPools))
 	for i, p := range c.UpstreamPools {
 		idx := fmt.Sprintf("upstream_pool[%d]", i)
-		// Provider lookup runs against the registry so a typo
-		// ("mullvads") fails fast with the list of names the binary
-		// was built with. ProviderValidator is package-injected by
-		// SetProviderValidator at init time so the config package can
-		// remain free of upstream/provider imports (and the import
-		// cycle that would create).
-		switch {
-		case p.Provider == "":
-			errs = append(errs, fmt.Errorf("%s: provider is required", idx))
-		case providerValidator != nil:
-			if err := providerValidator(p); err != nil {
-				errs = append(errs, fmt.Errorf("%s (id_prefix=%q): %w", idx, p.IDPrefix, err))
-			}
-		}
+		// Generic checks first so a malformed id_prefix / refresh /
+		// path field is caught here, before any provider-specific
+		// validator runs against it. Provider validators trust that
+		// these basic invariants already hold; they only check their
+		// own fields (token shape, country codes, etc.).
 		if p.IDPrefix == "" {
 			errs = append(errs, fmt.Errorf("%s: id_prefix is required", idx))
 		} else if !idPrefixRe.MatchString(p.IDPrefix) {
@@ -720,6 +711,20 @@ func (c *Config) Validate() error {
 		}
 		if p.APITokenFile != "" && !filepath.IsAbs(p.APITokenFile) {
 			errs = append(errs, fmt.Errorf("%s (id_prefix=%q): api_token_file %q must be an absolute path", idx, p.IDPrefix, p.APITokenFile))
+		}
+		// Provider-specific validation last. Provider lookup runs
+		// against the registry so a typo ("mullvads") fails fast with
+		// the list of names the binary was built with. ProviderValidator
+		// is package-injected by SetProviderValidator at init time so
+		// the config package can remain free of upstream/provider
+		// imports (and the import cycle that would create).
+		switch {
+		case p.Provider == "":
+			errs = append(errs, fmt.Errorf("%s: provider is required", idx))
+		case providerValidator != nil:
+			if err := providerValidator(p); err != nil {
+				errs = append(errs, fmt.Errorf("%s (id_prefix=%q): %w", idx, p.IDPrefix, err))
+			}
 		}
 	}
 

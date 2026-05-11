@@ -17,8 +17,9 @@ import (
 
 // ProviderAPIBinding ties one [[upstream_pool]] block's id_prefix to
 // the vendor API it exposes (when the provider has one). cmd/tunnelsmith
-// builds one binding per pool block at startup and hands the slice to
-// NewServerWithProviders so the control endpoint can dispatch
+// builds one binding per pool block at startup, wraps the slice in a
+// ProviderRegistry, and hands it to control.NewServer through
+// ServerOptions.Providers so the control endpoint can dispatch
 // POST /v1/providers/{id_prefix}/refresh through the right adapter.
 type ProviderAPIBinding struct {
 	// IDPrefix is the [[upstream_pool]].id_prefix the operator wrote
