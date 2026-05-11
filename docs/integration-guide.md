@@ -183,7 +183,7 @@ A runnable example lives at [`examples/integration/main.go`](../examples/integra
 
 **If the operator has Phase 12 auth on**, attach a bearer credential to every `POST /v1/report`. With the Go SDK, set `client.Options.Token`; it is added as `Authorization: Bearer <token>` to every report POST. For non-Go apps the wire change is one header. The operator-side knobs (`[control].auth_tokens`, `[control].auth_tokens_file`, SIGHUP rotation, the `401` + `WWW-Authenticate` response, and the `auth_missing` / `auth_failed` metric labels) are documented in [`docs/cooperative-reporting.md`](cooperative-reporting.md#auth-phase-12) and [`docs/configuration.md`](configuration.md#control). The SDK does not retry 401, since it always indicates a configuration mismatch rather than a transient fault.
 
-**If the operator has Phase 14 TLS on (v1.2.0+)**, the control listener terminates HTTPS on the same port via `[control].tls_cert_file` + `[control].tls_key_file`. Set `ControlURL: "https://<host>:9092"` in `client.Options` — the embedded `*http.Client` uses the system trust store, so no extra code is needed for a publicly trusted cert. For an internally issued cert, set `client.Options.HTTPClient` to a `*http.Client` whose `Transport.TLSClientConfig.RootCAs` includes your CA. Empty defaults preserve the Phase 11/12 plaintext wire shape byte-for-byte; the SDK auto-detects the scheme from `ControlURL` and does not need a separate "TLS on/off" flag. For non-Go apps, the only change is the `http://` → `https://` flip in the URL you POST to.
+**If the operator has Phase 14 TLS on (v1.2.0+)**, the control listener terminates HTTPS on the same port via `[control].tls_cert_file` + `[control].tls_key_file` (both absolute paths *inside* the Tunnelsmith container — mount them with `-v /host/certs:/etc/tunnelsmith/tls:ro`). Set `ControlURL: "https://tunnelsmith:9092"` in `client.Options` — the embedded `*http.Client` uses the system trust store, so no extra code is needed for a publicly trusted cert. For an internally issued cert, mount your CA bundle into the *app* container (e.g. `-v ./ca.crt:/etc/ssl/certs/ts-ca.crt:ro`) and either rely on the distro's CA refresh hook or set `client.Options.HTTPClient` to a `*http.Client` whose `Transport.TLSClientConfig.RootCAs` includes the bundle. Empty defaults preserve the Phase 11/12 plaintext wire shape byte-for-byte; the SDK auto-detects the scheme from `ControlURL` and does not need a separate "TLS on/off" flag. For non-Go apps, the only change is the `http://` → `https://` flip in the URL you POST to (plus the same CA-mount step on internal certs).
 
 ## Provider-specific notes: Webshare (v1.2.0+)
 
@@ -191,7 +191,30 @@ When the operator picks `provider = "webshare"` for an `[[upstream_pool]]` block
 
 **Per-proxy auth is invisible to your app.** Webshare hands every proxy in your plan a unique HTTP-Basic or SOCKS5 user/pass pair. Tunnelsmith threads those credentials into the upstream handshake automatically from the operator's API token — your app never sees them and never sets them. Do **not** document a Webshare-specific "set proxy auth" instruction in your README; the env-var pattern from Level 1 is the only thing your users need.
 
-**On-demand IP rotation is operator-side, not app-side.** If your app hits a destination that consistently bans a Webshare exit, the operator (or a sidecar script) can `POST http://tunnelsmith:9092/v1/providers/<id_prefix>/refresh` to trigger Webshare's `/proxy/list/refresh/` and pull a fresh set of IPs without restarting Tunnelsmith. The route is bearer-gated when the operator has Phase 12 auth on (same `auth_tokens` set as `POST /v1/report`). Your app should not call this on its own — it spends an operator's vendor-side rotation budget. If you want users to wire automated rotation into your container's failure path, document the route and let them opt in. The route shape, status codes, and 429 / 502 handling are in [`docs/control-api.md`](control-api.md#post-v1providersid_prefixrefresh).
+**On-demand IP rotation is operator-side, not app-side.** If your app hits a destination that consistently bans a Webshare exit, the operator (or a sidecar container on the same Docker network) can `POST http://tunnelsmith:9092/v1/providers/<id_prefix>/refresh` to trigger Webshare's `/proxy/list/refresh/` and pull a fresh set of IPs without restarting the Tunnelsmith container. The simplest pattern is a one-shot `curlimages/curl` container fired from cron or your orchestrator; no app code change is needed. The route is bearer-gated when the operator has Phase 12 auth on (same `auth_tokens` set as `POST /v1/report`):
+
+```yaml
+# docker-compose.yml — rotation as a separate, restartable container
+services:
+  tunnelsmith:
+    image: ghcr.io/pacnpal/tunnelsmith:1.2.0
+    # ...as in the README's Use with Webshare example
+
+  ts-rotate:
+    image: curlimages/curl:latest
+    profiles: ["manual"]    # `docker compose run ts-rotate` to fire on demand
+    environment:
+      TUNNELSMITH_CONTROL_TOKEN: ${TUNNELSMITH_CONTROL_TOKEN}
+    command:
+      - -fsS
+      - -X
+      - POST
+      - -H
+      - "Authorization: Bearer ${TUNNELSMITH_CONTROL_TOKEN}"
+      - http://tunnelsmith:9092/v1/providers/ws/refresh
+```
+
+Your app should not call this on its own — it spends an operator's vendor-side rotation budget. If you want users to wire automated rotation into your container's failure path, document the route and let them opt in. The route shape, status codes, and 429 / 502 handling are in [`docs/control-api.md`](control-api.md#post-v1providersid_prefixrefresh).
 
 **Webshare upstream ids land in the response header.** Tunnelsmith stamps every plain-HTTP response with `X-Tunnelsmith-Upstream: <id_prefix>-<proxy_id>` (e.g. `ws-1234567`). The Level 5 hint above already covers reading this header; on Webshare specifically, the `<proxy_id>` tail is the same id you see in the Webshare dashboard, so a "this request rotated through proxy X" surface in your UI is one click away from the vendor view. For HTTPS responses the SDK captures the same id automatically via the `X-Tunnelsmith-Upstream` header set on the CONNECT response (Phase 11).
 
