@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -149,10 +150,11 @@ func TestServeTLSAcceptsHTTPSClient(t *testing.T) {
 // listener doesn't tunnel a plain HTTP request through to the
 // scoreboard. The Go standard library detects the malformed handshake
 // and replies with HTTP 400 plus a "Client sent an HTTP request to
-// an HTTPS server" body — which is a *better* failure mode than a
-// silent TCP reset because the operator gets a self-describing error
-// in their client. Assert the status + body so a future change that
-// downgrades to plain-HTTP acceptance fails the test.
+// an HTTPS server" body — a better failure mode than a silent TCP
+// reset because the operator gets a self-describing error in their
+// client. We assert that exact contract: a transport-level error
+// here would be a regression to silent rejection, which the test
+// should surface, not accept.
 func TestServeTLSRejectsPlaintextClient(t *testing.T) {
 	certPath, keyPath, _ := writeSelfSignedCert(t, t.TempDir())
 	srv, _ := startServerWithOpts(t, ServerOptions{
@@ -164,9 +166,7 @@ func TestServeTLSRejectsPlaintextClient(t *testing.T) {
 	client := &http.Client{Timeout: 2 * time.Second}
 	resp, err := client.Get("http://" + addr + "/healthz")
 	if err != nil {
-		// A TCP reset / EOF / handshake error is also acceptable —
-		// just means a plaintext client got rejected.
-		return
+		t.Fatalf("plaintext request to TLS listener: expected stdlib 400 reply, got transport error: %v", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusBadRequest {
@@ -247,12 +247,8 @@ func errorMentionsMissingCert(err error) bool {
 
 func containsAny(s string, subs []string) bool {
 	for _, sub := range subs {
-		if len(sub) > 0 && (len(s) >= len(sub)) {
-			for i := 0; i+len(sub) <= len(s); i++ {
-				if s[i:i+len(sub)] == sub {
-					return true
-				}
-			}
+		if sub != "" && strings.Contains(s, sub) {
+			return true
 		}
 	}
 	return false
