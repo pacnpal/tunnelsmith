@@ -174,6 +174,11 @@ services:
       - "1080:1080"   # SOCKS5
       - "9090:9090"   # Prometheus metrics
       - "9091:9091"   # Web UI (bind to a private interface in production)
+      # WARNING: the control endpoint accepts unauthenticated POST /v1/report by
+      # default (empty auth_tokens set = permit all).  Do NOT publish 9092 to
+      # untrusted networks without setting [control].auth_tokens or
+      # auth_tokens_file in your config.  Remove the line below if you don't
+      # need external cooperative-reporting.
       - "9092:9092"   # Cooperative-reporting control endpoint
     volumes:
       - ./config.toml:/etc/tunnelsmith/config.toml:ro
@@ -286,12 +291,12 @@ force     = true   # do not fall back to other upstreams on failure
 
 **`[[rule]]`** — Optional per-host routing overrides. `prefer` lists upstreams to try first (in order). `force = true` prevents fallback to other upstreams. `body_regex` fires body-match detection on plain-HTTP responses so geo-block soft-failures served as `200 OK` still penalize the right upstream.
 
-**`[control]` auth (Phase 12)** — Add `auth_tokens = ["your-token"]` or point `auth_tokens_file` at a one-token-per-line file to gate `POST /v1/report` with bearer-token auth. Hot-reloads on SIGHUP without a restart.
+**`[control]` auth (Phase 12)** — Add `auth_tokens = ["your-token"]` or point `auth_tokens_file` at a one-token-per-line file (must be an **absolute path**) to gate `POST /v1/report` with bearer-token auth. Hot-reloads on SIGHUP without a restart.
 
 Sending `SIGHUP` applies a subset of config changes in place without a restart:
 
 **Hot-reloadable on SIGHUP:**
-- `[failure.scoring]` knobs: penalties, cooldowns, score cap, probe chance, `decay_step`, cascade TTL
+- All `[failure.scoring]` knobs (penalties, cooldowns, score cap, probe chance, `decay_step`, cascade TTL, `debounce_window`, `prune_after`, body-match knobs) — **except `decay_interval`**, which requires restart (see below)
 - `[[failure.status]]` codes and per-code penalty/cooldown
 - `failure.connection_refused`, `failure.body_buffer_kb`
 - `failure.max_retries_per_request` — hot-reloads for the HTTP forward-proxy path; when `[[upstream_pool]]` is in play the pool is not rebuilt on SIGHUP, so CONNECT/SOCKS retry behavior requires a restart
@@ -303,7 +308,7 @@ Sending `SIGHUP` applies a subset of config changes in place without a restart:
 - Listener bind addresses: `[listener].http`, `[listener].socks`, `[metrics].bind`, `[ui].bind`, `[control].bind`
 - `[control].gate_healthz`
 - `cache.persist_path` and `cache.persist_interval`
-- `[[upstream_pool]]` block shapes (provider, countries, refresh schedule)
+- `[[upstream_pool]]` blocks — the entire block configuration (provider, countries, refresh schedule, `id_prefix`, `priority`, `include_inactive`, `cache_path`, etc.) is restart-frozen; the pool is constructed once at boot and not rebuilt on SIGHUP
 - `failure.scoring.decay_interval` — the decay ticker is started once at boot; changing this field requires a restart to retune the goroutine's interval
 
 ## Use with Mullvad
