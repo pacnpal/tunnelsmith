@@ -61,6 +61,15 @@ type Server struct {
 	srv    *http.Server
 	tokens *tokenSet // always non-nil; an empty token set encodes the no-auth default
 
+	// tlsCertFile / tlsKeyFile are non-empty when the operator
+	// configured [control].tls_cert_file + tls_key_file. config.Validate
+	// already enforces both-or-neither, so the in-process invariant is
+	// "either both empty (plaintext) or both set (TLS)". Captured at
+	// construction so Serve can pick http.Server.ServeTLS over Serve
+	// without re-reading config.
+	tlsCertFile string
+	tlsKeyFile  string
+
 	ready    chan struct{}
 	listener net.Listener
 	bindErr  error
@@ -81,6 +90,12 @@ type ServerOptions struct {
 	// disables the routes entirely (Phase 11/12 wire shape stays
 	// byte-for-byte identical for operators not using the feature).
 	Providers *ProviderRegistry
+	// TLSCertFile and TLSKeyFile, when both non-empty, switch the
+	// listener to HTTPS via http.Server.ServeTLS. Both empty keeps
+	// plaintext. config.Validate enforces the both-or-neither
+	// invariant so Server doesn't have to re-check.
+	TLSCertFile string
+	TLSKeyFile  string
 }
 
 // NewServer builds a control HTTP server that serves on addr. backend is
@@ -100,9 +115,11 @@ func NewServer(addr string, backend Backend, metrics MetricsSink, opts ServerOpt
 		mountProvidersHandlers(mux, opts.Providers, tokens, logger)
 	}
 	return &Server{
-		addr:   addr,
-		logger: logger,
-		tokens: tokens,
+		addr:        addr,
+		logger:      logger,
+		tokens:      tokens,
+		tlsCertFile: opts.TLSCertFile,
+		tlsKeyFile:  opts.TLSKeyFile,
 		srv: &http.Server{
 			Addr:              addr,
 			Handler:           mux,
@@ -146,7 +163,12 @@ func (s *Server) Addr() net.Addr {
 	return s.listener.Addr()
 }
 
-// Serve binds the listener and blocks until Shutdown is called.
+// Serve binds the listener and blocks until Shutdown is called. When
+// TLSCertFile and TLSKeyFile were set in ServerOptions the listener
+// terminates TLS via http.Server.ServeTLS using the configured PEM
+// files; otherwise plain HTTP. config.Validate has already enforced
+// the both-or-neither invariant on the cert/key pair, so the
+// TLSEnabled() check below is reliable.
 func (s *Server) Serve(_ context.Context) error {
 	l, err := net.Listen("tcp", s.addr)
 	if err != nil {
@@ -156,11 +178,27 @@ func (s *Server) Serve(_ context.Context) error {
 	}
 	s.listener = l
 	close(s.ready)
-	s.logger.Info("listening", "addr", l.Addr().String())
-	if err := s.srv.Serve(l); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return fmt.Errorf("control serve: %w", err)
+	s.logger.Info("listening",
+		"addr", l.Addr().String(),
+		"tls", s.TLSEnabled(),
+	)
+	var serveErr error
+	if s.TLSEnabled() {
+		serveErr = s.srv.ServeTLS(l, s.tlsCertFile, s.tlsKeyFile)
+	} else {
+		serveErr = s.srv.Serve(l)
+	}
+	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+		return fmt.Errorf("control serve: %w", serveErr)
 	}
 	return nil
+}
+
+// TLSEnabled reports whether this server is configured to terminate
+// TLS. Used by Serve to pick ServeTLS vs Serve and by callers that
+// want to log or expose the listener's transport mode.
+func (s *Server) TLSEnabled() bool {
+	return s != nil && s.tlsCertFile != "" && s.tlsKeyFile != ""
 }
 
 // Shutdown stops the control server.

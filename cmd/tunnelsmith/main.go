@@ -242,7 +242,15 @@ func run(args []string, stdout, stderr *os.File) error {
 			Tokens:      initialTokens,
 			GateHealthz: cfg.Control.GateHealthz,
 			Providers:   buildProviderRegistry(poolBlocks),
+			TLSCertFile: cfg.Control.TLSCertFile,
+			TLSKeyFile:  cfg.Control.TLSKeyFile,
 		}, logger)
+		if cfg.Control.TLSCertFile != "" {
+			logger.Info("control TLS enabled at startup",
+				"cert_file", cfg.Control.TLSCertFile,
+				"key_file", cfg.Control.TLSKeyFile,
+			)
+		}
 	}
 
 	g, gctx := errgroup.WithContext(ctx)

@@ -93,6 +93,31 @@ host_glob = "*.itch.io"
 prefer    = ["direct", "mullvad-se-got"]
 `
 
+// TestControlTLSPairAccepted pins the happy path for the 1.2 TLS
+// opt-in: both cert and key set, both absolute, parses without error
+// and the values surface on ControlConfig. Pair-mismatch and
+// relative-path cases are covered in TestValidationFailures below.
+func TestControlTLSPairAccepted(t *testing.T) {
+	toml := `
+[control]
+tls_cert_file = "/etc/tunnelsmith/cert.pem"
+tls_key_file  = "/etc/tunnelsmith/key.pem"
+[[upstream]]
+id = "d"
+kind = "direct"
+`
+	cfg, err := Parse([]byte(toml), "tls.toml")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.Control.TLSCertFile != "/etc/tunnelsmith/cert.pem" {
+		t.Fatalf("TLSCertFile = %q", cfg.Control.TLSCertFile)
+	}
+	if cfg.Control.TLSKeyFile != "/etc/tunnelsmith/key.pem" {
+		t.Fatalf("TLSKeyFile = %q", cfg.Control.TLSKeyFile)
+	}
+}
+
 func TestParseValidConfig(t *testing.T) {
 	cfg, err := Parse([]byte(validConfig), "valid.toml")
 	if err != nil {
@@ -871,6 +896,52 @@ id = "d"
 kind = "direct"
 `,
 			contains: "must be an absolute path",
+		},
+		{
+			name: "control TLS cert without key",
+			toml: `
+[control]
+tls_cert_file = "/etc/tunnelsmith/cert.pem"
+[[upstream]]
+id = "d"
+kind = "direct"
+`,
+			contains: "tls_key_file is empty",
+		},
+		{
+			name: "control TLS key without cert",
+			toml: `
+[control]
+tls_key_file = "/etc/tunnelsmith/key.pem"
+[[upstream]]
+id = "d"
+kind = "direct"
+`,
+			contains: "tls_cert_file is empty",
+		},
+		{
+			name: "control tls_cert_file rejects relative path",
+			toml: `
+[control]
+tls_cert_file = "cert.pem"
+tls_key_file  = "/etc/tunnelsmith/key.pem"
+[[upstream]]
+id = "d"
+kind = "direct"
+`,
+			contains: "tls_cert_file must be an absolute path",
+		},
+		{
+			name: "control tls_key_file rejects relative path",
+			toml: `
+[control]
+tls_cert_file = "/etc/tunnelsmith/cert.pem"
+tls_key_file  = "key.pem"
+[[upstream]]
+id = "d"
+kind = "direct"
+`,
+			contains: "tls_key_file must be an absolute path",
 		},
 	}
 

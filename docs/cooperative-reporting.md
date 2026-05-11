@@ -14,7 +14,7 @@ You decide what counts as "the request worked" or "this exit is broken for this 
 
 ## What this is not
 
-- Not authentication by default. Phase 11 ships with no credential check; the security boundary is the network (bind to loopback or a private subnet). Phase 12 adds **opt-in** bearer-token auth on top — see the Auth section below. Even with tokens on, the network is still part of the trust story (tokens travel in plaintext until Phase 13 ships TLS on the control listener).
+- Not authentication by default. Phase 11 ships with no credential check; the security boundary is the network (bind to loopback or a private subnet). Phase 12 adds **opt-in** bearer-token auth on top, and 1.2+ adds **opt-in TLS termination** on the same listener (`[control].tls_cert_file` + `tls_key_file`) so the combined deployment closes the plaintext-token risk — see the Auth section below and [ADR-009](decisions.md#adr-009-tls-on-the-control-listener-12).
 - Not idempotent. If your app retries a report, the scoreboard gets penalized twice. Deduplicate on your side if you care.
 - Not sufficient for uninstrumented clients. Browsers, closed-source SDKs, OS update channels, and anything else you cannot modify do not benefit. ADR-006 lists this explicitly as a non-goal.
 
@@ -124,7 +124,9 @@ The control listener supports two modes:
 - **No auth (default).** `auth_tokens` empty and `auth_tokens_file` unset. Any client that can reach the listener can submit reports. Bind to loopback or a private subnet (`control.bind` in the config).
 - **Bearer-token auth (Phase 12, opt-in).** `auth_tokens` and/or `auth_tokens_file` non-empty. Every `POST /v1/report` must carry `Authorization: Bearer <token>`. See the Auth section below.
 
-Even with bearer-token auth on, **tokens travel in plaintext on the control listener** — TLS termination on the listener itself is a Phase 13 candidate. Until then, treat the network path between your apps and Tunnelsmith as semi-trusted: bind to loopback or to a private subnet, use short-lived tokens, and rotate via SIGHUP. If you need TLS today, front the control listener with a reverse proxy that terminates TLS.
+**TLS termination on the control listener (1.2+, opt-in).** Setting `[control].tls_cert_file` + `[control].tls_key_file` (both-or-neither) switches `Serve` to `http.Server.ServeTLS`, so cooperative-report POSTs hit `https://…/v1/report` instead of plain HTTP. Combined with `auth_tokens`, the plaintext-token risk Phase 12 still carried is closed at the transport layer. Both empty preserves the Phase 11/12 wire shape exactly. Cert rotation is restart-only in v1; see [ADR-009](decisions.md#adr-009-tls-on-the-control-listener-12).
+
+When TLS is not configured on Tunnelsmith itself but is still required end-to-end, front the control listener with a reverse proxy that terminates TLS — the in-binary option is the simpler choice for most deployments now.
 
 ### Auth (Phase 12)
 

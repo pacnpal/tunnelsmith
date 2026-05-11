@@ -16,6 +16,10 @@ Provider routes share the bearer-token gate that protects `POST /v1/report`. Con
 
 Auth checks for provider routes do **not** tick `tunnelsmith_reports_rejected_total`, since the counter is scoped to cooperative reports.
 
+## TLS (1.2+)
+
+Setting `[control].tls_cert_file` + `[control].tls_key_file` (both-or-neither) terminates HTTPS on the same port — every route documented below is served over TLS instead of plain HTTP, and the curl examples below should be rewritten with `https://` plus a `--cacert` (or system trust). Both empty preserves the pre-1.2 plaintext wire shape. See [`docs/configuration.md`](configuration.md) and [ADR-009](decisions.md#adr-009-tls-on-the-control-listener-12) for the design + rotation policy (restart-only in v1).
+
 ## `GET /v1/providers`
 
 Returns the registered `[[upstream_pool]]` bindings.
