@@ -39,6 +39,31 @@ func newFakeServer(t *testing.T, handlers map[string]http.HandlerFunc) (*httptes
 	return srv, &receivedTokens
 }
 
+// TestProxyHostPort pins the IPv6-bracketing contract. Without
+// net.JoinHostPort an IPv6 address would emit ambiguous output
+// like "2001:db8::1:8080" that net.SplitHostPort cannot recover.
+func TestProxyHostPort(t *testing.T) {
+	cases := []struct {
+		name string
+		addr string
+		port int
+		want string
+	}{
+		{"ipv4", "1.2.3.4", 8080, "1.2.3.4:8080"},
+		{"hostname", "proxy.example.com", 80, "proxy.example.com:80"},
+		{"ipv6", "2001:db8::1", 8080, "[2001:db8::1]:8080"},
+		{"ipv6 loopback", "::1", 1080, "[::1]:1080"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := Proxy{ProxyAddress: tc.addr, Port: tc.port}.HostPort()
+			if got != tc.want {
+				t.Fatalf("HostPort = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestProfileSendsTokenHeader(t *testing.T) {
 	srv, received := newFakeServer(t, map[string]http.HandlerFunc{
 		"/profile/": func(w http.ResponseWriter, r *http.Request) {

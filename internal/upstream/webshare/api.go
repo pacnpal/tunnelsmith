@@ -118,10 +118,15 @@ type Proxy struct {
 	CreatedAt        time.Time `json:"created_at,omitempty"`
 }
 
-// HostPort returns the proxy's "host:port" form. Centralised so a
-// future migration to a different address field has one update site.
+// HostPort returns the proxy's "host:port" form. Uses net.JoinHostPort
+// so an IPv6 literal address gets the required "[…]:port" brackets
+// — naive concatenation would produce ambiguous output like
+// "2001:db8::1:8080" that net.SplitHostPort (used by the dialer)
+// would parse incorrectly. Webshare's API returns IPv4 in practice
+// today, but defensive coding here avoids a silent breakage if
+// that ever changes.
 func (p Proxy) HostPort() string {
-	return p.ProxyAddress + ":" + strconv.Itoa(p.Port)
+	return net.JoinHostPort(p.ProxyAddress, strconv.Itoa(p.Port))
 }
 
 // Profile mirrors GET /api/v2/profile/ — the minimum subset that proves
