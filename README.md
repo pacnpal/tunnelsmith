@@ -7,7 +7,7 @@
 
 A per-destination egress router for HTTP and SOCKS5. Picks the right exit for each URL based on what is actually working.
 
-> **Status: pre-alpha.** The repository scaffold is in place. Functionality lands phase by phase. Do not deploy this yet.
+> **Status: v1.1.0.** v1.0.0 shipped the per-host scoreboard, Mullvad pool integration, web UI, metrics, and Phase 11 cooperative outcome reporting. v1.1.0 adds Phase 11.1 (hot-swap of the running `[[upstream_pool]]` on Mullvad relay churn) and Phase 12 (opt-in bearer-token auth on the cooperative-reporting endpoint). See [`CHANGELOG.md`](CHANGELOG.md) for the full release notes.
 
 ## What it does
 
@@ -55,7 +55,7 @@ Setup is a one-time keypair generation (counts against Mullvad's 5-device cap) p
 
 If you build a container that benefits from outbound proxying (`*arr` apps, scrapers, downloaders, RSS pollers, federated services), [`docs/integration-guide.md`](docs/integration-guide.md) is a layered checklist for shipping Tunnelsmith support, from "document the standard env-var pattern" to "ship an official compose snippet". The lowest level is no code changes.
 
-For HTTPS coverage of the per-host scoreboard, the optional Phase 11 cooperative reporting protocol lets your app submit per-request outcomes back to Tunnelsmith. Three lines of Go via the [`client`](client) package, or any HTTP client in any language using the wire protocol at [`docs/cooperative-reporting.md`](docs/cooperative-reporting.md).
+For HTTPS coverage of the per-host scoreboard, the optional Phase 11 cooperative reporting protocol lets your app submit per-request outcomes back to Tunnelsmith. Three lines of Go via the [`client`](client) package, or any HTTP client in any language using the wire protocol at [`docs/cooperative-reporting.md`](docs/cooperative-reporting.md). Operators in multi-tenant or LAN-exposed deployments can opt into Phase 12 bearer-token auth on `/v1/report` via `[control].auth_tokens` / `[control].auth_tokens_file`; the empty default keeps the Phase 11 wire shape byte-for-byte.
 
 ## Documentation
 
@@ -66,7 +66,8 @@ For HTTPS coverage of the per-host scoreboard, the optional Phase 11 cooperative
 - [`docs/ui.md`](docs/ui.md): the web UI, the four action endpoints, and the security stance (Phase 9)
 - [`docs/request-lifecycle.md`](docs/request-lifecycle.md): end-to-end trace of a single request
 - [`docs/integration-guide.md`](docs/integration-guide.md): for container maintainers adding Tunnelsmith support
-- [`docs/cooperative-reporting.md`](docs/cooperative-reporting.md): wire protocol for app-driven outcome reporting (Phase 11)
+- [`docs/cooperative-reporting.md`](docs/cooperative-reporting.md): wire protocol for app-driven outcome reporting and the Phase 12 bearer-token auth section
+- [`docs/roadmap.md`](docs/roadmap.md): what's deliberately out of scope for v1 and what's tracked for v2
 - [`docs/decisions.md`](docs/decisions.md): architecture decision records
 
 ## Metrics and persistence
