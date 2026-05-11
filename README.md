@@ -26,11 +26,11 @@ Each request goes through the scoreboard's `DialFor`. The scoreboard picks the b
 Multi-arch images (`linux/amd64`, `linux/arm64`) are published to GitHub Container Registry on every release:
 
 ```sh
-docker pull ghcr.io/pacnpal/tunnelsmith:1.1.0
-docker run --rm ghcr.io/pacnpal/tunnelsmith:1.1.0 --version
+docker pull ghcr.io/pacnpal/tunnelsmith:1.2.0
+docker run --rm ghcr.io/pacnpal/tunnelsmith:1.2.0 --version
 ```
 
-Image tags omit the leading `v` that git tags carry (so git tag `v1.1.0` → image tag `1.1.0`). `:latest` is **not** published by the release workflow; always pin to a semver tag. Replace `1.1.0` with the desired version from the [releases page](https://github.com/pacnpal/tunnelsmith/releases).
+Image tags omit the leading `v` that git tags carry (so git tag `v1.2.0` → image tag `1.2.0`). The release workflow publishes `:1.2.0`, `:1.2`, `:1`, and `:latest` on every release cut from the default branch; the `:latest` digest is verified to match the version tag before the GitHub release is created (per [ADR-005](docs/decisions.md)). **Pin to a semver tag in production** — `:latest` moves on every release. Replace `1.2.0` with the desired version from the [releases page](https://github.com/pacnpal/tunnelsmith/releases).
 
 The image is built from [`Dockerfile`](Dockerfile) using a distroless base (`gcr.io/distroless/static-debian12:nonroot`) and runs as a non-root user. The Dockerfile `EXPOSE`s ports `8080` (HTTP CONNECT), `1080` (SOCKS5), `9090` (metrics), and `9091` (web UI). The control endpoint on `:9092` is enabled by default but not in the `EXPOSE` list; publish it explicitly when you need it (`-p 9092:9092`).
 
@@ -102,7 +102,7 @@ docker run -d \
   -p 8080:8080 \
   -p 1080:1080 \
   -v "$(pwd)/deploy/tunnelsmith.example.toml:/etc/tunnelsmith/config.toml:ro" \
-  ghcr.io/pacnpal/tunnelsmith:1.1.0 \
+  ghcr.io/pacnpal/tunnelsmith:1.2.0 \
   --config /etc/tunnelsmith/config.toml
 ```
 
@@ -166,7 +166,7 @@ priority = 20
 ```yaml
 services:
   tunnelsmith:
-    image: ghcr.io/pacnpal/tunnelsmith:1.1.0
+    image: ghcr.io/pacnpal/tunnelsmith:1.2.0
     container_name: tunnelsmith
     restart: unless-stopped
     ports:
@@ -174,12 +174,15 @@ services:
       - "1080:1080"   # SOCKS5
       - "9090:9090"   # Prometheus metrics
       - "9091:9091"   # Web UI (bind to a private interface in production)
-      # WARNING: the control endpoint accepts unauthenticated POST /v1/report by
-      # default (empty auth_tokens set = permit all).  Do NOT publish 9092 to
-      # untrusted networks without setting [control].auth_tokens or
-      # auth_tokens_file in your config.  Remove the line below if you don't
-      # need external cooperative reporting.
-      - "9092:9092"   # Cooperative-reporting control endpoint
+      # WARNING: the control endpoint accepts unauthenticated POST /v1/report
+      # (and the v1.2.0 /v1/providers + /v1/providers/{id_prefix}/refresh
+      # routes) by default — empty auth_tokens set = permit all.  Do NOT
+      # publish 9092 to untrusted networks without setting [control].auth_tokens
+      # (or auth_tokens_file) in your config; for end-to-end encryption of the
+      # bearer tokens, also set [control].tls_cert_file and tls_key_file
+      # (v1.2.0+, Phase 14).  Remove the line below if you don't need external
+      # cooperative reporting or vendor-API refresh.
+      - "9092:9092"   # Cooperative-reporting + provider control endpoint
     volumes:
       - ./config.toml:/etc/tunnelsmith/config.toml:ro
       - tunnelsmith-data:/data/tunnelsmith
@@ -291,7 +294,9 @@ force     = true   # do not fall back to other upstreams on failure
 
 **`[[rule]]`** — Optional per-host routing overrides. `prefer` lists upstreams to try first (in order). `force = true` prevents fallback to other upstreams. `body_regex` fires body-match detection on plain-HTTP responses so geo-block soft-failures served as `200 OK` still penalize the right upstream.
 
-**`[control]` auth (Phase 12)** — Add `auth_tokens = ["your-token"]` or point `auth_tokens_file` at a one-token-per-line file (must be an **absolute path**) to gate `POST /v1/report` with bearer-token auth. Hot-reloads on SIGHUP without a restart.
+**`[control]` auth (Phase 12)** — Add `auth_tokens = ["your-token"]` or point `auth_tokens_file` at a one-token-per-line file (must be an **absolute path**) to gate `POST /v1/report` (and the v1.2.0 `/v1/providers` family) with bearer-token auth. Hot-reloads on SIGHUP without a restart.
+
+**`[control]` TLS (Phase 14, v1.2.0+)** — Set `tls_cert_file` and `tls_key_file` (both-or-neither; both **absolute paths**) to terminate HTTPS on the same control port via `http.Server.ServeTLS` with `MinVersion: TLS 1.2` pinned on the underlying `tls.Config`. Pair with Phase 12 bearer-token auth to close the plaintext-token risk ADR-007 named in its Non-goals. Restart-only — cert rotation requires restart in v1.2. Both empty preserves the Phase 11/12 plaintext wire shape byte-for-byte. See [`docs/control-api.md`](docs/control-api.md) for the curl example and [ADR-009](docs/decisions.md).
 
 Sending `SIGHUP` applies a subset of config changes in place without a restart:
 
@@ -307,6 +312,7 @@ Sending `SIGHUP` applies a subset of config changes in place without a restart:
 **Require a restart to take effect:**
 - Listener bind addresses: `[listener].http`, `[listener].socks`, `[metrics].bind`, `[ui].bind`, `[control].bind`
 - `[control].gate_healthz`
+- `[control].tls_cert_file` and `[control].tls_key_file` — the keypair is pre-loaded by `Serve` before `net.Listen`; SIGHUP does not re-read the cert files (cert rotation is restart-only in v1.2)
 - `cache.persist_path` and `cache.persist_interval`
 - `[[upstream_pool]]` blocks — the entire block configuration (provider, countries, refresh schedule, `id_prefix`, `priority`, `include_inactive`, `cache_path`, etc.) is captured at boot; SIGHUP will not apply edits to these fields (the block shape is restart-frozen). The refresh ticker continues to hot-swap pool expansions at runtime (e.g., relay churn), but that is independent of SIGHUP.
 - `failure.scoring.decay_interval` — the decay ticker is started once at boot; changing this field requires a restart to retune the goroutine's interval
@@ -362,6 +368,70 @@ curl --socks5-hostname localhost:1080 https://am.i.mullvad.net/json | jq .
 
 See [`docs/deployment.md`](docs/deployment.md) for the full walkthrough including troubleshooting.
 
+## Use with Webshare
+
+The Webshare provider expands a single `[[upstream_pool]]` block into one upstream per proxy in your Webshare plan, threading the per-proxy username and password into the HTTP CONNECT (or SOCKS5) handshake automatically. No tunnel container is needed — Webshare is reached directly over the public internet, so Tunnelsmith runs as a standalone container. The provider's `POST /v1/providers/{id_prefix}/refresh` route triggers Webshare's `/proxy/list/refresh/` API on demand, so operators can rotate IPs from a control script without touching the binary. New in v1.2.0.
+
+### Quick setup
+
+**1. Get a Webshare API token** from your Webshare dashboard → **API** → create or copy your token.
+
+**2. Drop the token onto the host** so Tunnelsmith can mount it read-only:
+
+```sh
+sudo install -m 0600 -o root -g root /dev/stdin /etc/tunnelsmith/webshare.token <<'EOF'
+your-api-token-here
+EOF
+```
+
+**3. Add an `[[upstream_pool]]` block** to your Tunnelsmith config:
+
+```toml
+[[upstream_pool]]
+provider       = "webshare"
+id_prefix      = "ws"
+priority       = 110
+api_token_file = "/etc/tunnelsmith/webshare.token"
+country_codes  = ["US", "GB", "DE"]   # ISO 3166-1 alpha-2; not display names
+refresh        = "1h"
+cache_path     = "/data/tunnelsmith/webshare-cache.json"
+```
+
+`api_token_file` is preferred over inline `api_token` (which is cleartext in `--print-config`). `cache_path` lets the binary keep serving from the last-known-good proxy list when Webshare's API is briefly unreachable.
+
+**4. Run Tunnelsmith** with the new mount:
+
+```sh
+docker run -d \
+  --name tunnelsmith \
+  -p 8080:8080 -p 1080:1080 -p 9092:9092 \
+  -v "$(pwd)/config.toml:/etc/tunnelsmith/config.toml:ro" \
+  -v /etc/tunnelsmith/webshare.token:/etc/tunnelsmith/webshare.token:ro \
+  -v tunnelsmith-data:/data/tunnelsmith \
+  ghcr.io/pacnpal/tunnelsmith:1.2.0 \
+  --config /etc/tunnelsmith/config.toml
+```
+
+**5. Verify the pool expanded.** The startup log should include:
+
+```json
+{"msg":"upstream_pool expanded","id_prefix":"ws","provider":"webshare","upstreams":42,"has_api":true}
+```
+
+`has_api: true` means the control endpoint can rotate IPs on demand:
+
+```sh
+export TUNNELSMITH_CONTROL_TOKEN="your-bearer-token"
+curl -X POST \
+  -H "Authorization: Bearer ${TUNNELSMITH_CONTROL_TOKEN}" \
+  http://localhost:9092/v1/providers/ws/refresh
+# {"id_prefix":"ws","provider":"webshare","status":"accepted"}
+```
+
+The new list lands on the next refresh tick (or sooner if a tick is in flight).
+
+A single config can mix Mullvad and Webshare blocks; the scoreboard learns per-host which exit works best across all of them. See [`docs/deployment.md#use-with-webshare`](docs/deployment.md) for the full walkthrough including `mode = "backbone"` for residential plans, `kind = "socks5"`, and rate-limit handling.
+
 ## For container maintainers
 
 If you build a container that benefits from outbound proxying (`*arr` apps, scrapers, downloaders, RSS pollers, federated services), [`docs/integration-guide.md`](docs/integration-guide.md) is a layered checklist for shipping Tunnelsmith support, from "document the standard env-var pattern" to "ship an official compose snippet". The lowest level is no code changes.
@@ -386,7 +456,7 @@ defer resp.Body.Close()
 _ = client.Report(resp, "ok")
 ```
 
-Operators in multi-tenant or LAN-exposed deployments can opt into Phase 12 bearer-token auth on `/v1/report` via `[control].auth_tokens` / `[control].auth_tokens_file`; the empty default keeps the Phase 11 wire shape byte-for-byte.
+Operators in multi-tenant or LAN-exposed deployments can opt into Phase 12 bearer-token auth on `/v1/report` via `[control].auth_tokens` / `[control].auth_tokens_file`, optionally paired with Phase 14 in-binary TLS termination via `[control].tls_cert_file` / `[control].tls_key_file` so tokens travel encrypted on the same port (set `ControlURL: "https://…"` in `client.Options` and the embedded `*http.Client` uses the system trust store). Empty defaults keep the Phase 11/12 plaintext wire shape byte-for-byte.
 
 ## Documentation
 
