@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"github.com/pacnpal/tunnelsmith/internal/config"
 	"github.com/pacnpal/tunnelsmith/internal/upstream/provider"
@@ -45,8 +46,13 @@ func (p *Provider) Name() string { return ProviderName }
 //     fixes the obvious typo at startup instead of getting an empty
 //     list at runtime.
 func (p *Provider) ValidateConfig(cfg config.UpstreamPoolConfig) error {
-	hasInline := cfg.APIToken != ""
-	hasFile := cfg.APITokenFile != ""
+	// Trim before the presence check so a whitespace-only api_token
+	// (e.g. "   " — easy to land via accidental copy/paste from a
+	// dashboard) fails at config-load instead of as a generic 401
+	// from the vendor at first request. This matches the
+	// LoadTokenFile contract, which already rejects empty-after-trim.
+	hasInline := strings.TrimSpace(cfg.APIToken) != ""
+	hasFile := strings.TrimSpace(cfg.APITokenFile) != ""
 	if !hasInline && !hasFile {
 		return errors.New("webshare: one of api_token or api_token_file is required")
 	}
@@ -156,14 +162,18 @@ func buildClient(cfg config.UpstreamPoolConfig, logger *slog.Logger) (*Client, e
 }
 
 func resolveToken(cfg config.UpstreamPoolConfig) (string, error) {
-	switch {
-	case cfg.APIToken != "":
-		return cfg.APIToken, nil
-	case cfg.APITokenFile != "":
-		return LoadTokenFile(cfg.APITokenFile)
-	default:
-		return "", ErrTokenMissing
+	// Trim the inline token so a whitespace-padded value never
+	// reaches the Authorization header. ValidateConfig already
+	// rejects empty-after-trim, but this is defence in depth for
+	// callers that bypass Provider.ValidateConfig (tests, future
+	// code paths) and matches the LoadTokenFile contract.
+	if t := strings.TrimSpace(cfg.APIToken); t != "" {
+		return t, nil
 	}
+	if cfg.APITokenFile != "" {
+		return LoadTokenFile(cfg.APITokenFile)
+	}
+	return "", ErrTokenMissing
 }
 
 // apiAdapter is the provider.API implementation. Holds the planID at

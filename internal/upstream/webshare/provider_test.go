@@ -38,6 +38,17 @@ func TestProviderValidateConfig(t *testing.T) {
 			t.Fatalf("ValidateConfig: got %v, want token error", err)
 		}
 	})
+	t.Run("whitespace-only inline token rejected", func(t *testing.T) {
+		// "   " passes a naive != "" check; the TrimSpace guard
+		// in ValidateConfig is what makes this fail fast at
+		// config-load instead of as a 401 from the vendor.
+		err := p.ValidateConfig(config.UpstreamPoolConfig{
+			IDPrefix: "ws", APIToken: "   ",
+		})
+		if err == nil || !strings.Contains(err.Error(), "api_token") {
+			t.Fatalf("ValidateConfig: got %v, want token error", err)
+		}
+	})
 	t.Run("both token and file", func(t *testing.T) {
 		err := p.ValidateConfig(config.UpstreamPoolConfig{
 			IDPrefix: "ws", APIToken: "x", APITokenFile: "/abs/y",
