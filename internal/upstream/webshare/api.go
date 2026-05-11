@@ -304,13 +304,26 @@ func (c *Client) listProxiesOnline(ctx context.Context, opts ListProxiesOptions)
 		if err != nil {
 			return nil, fmt.Errorf("webshare: parse next %q: %w", resp.Next, err)
 		}
-		// Strip /api/v2 prefix if present so the rebuilt URL matches
-		// the BaseURL+path convention used by c.do.
-		nextPath := next.Path
-		if i := strings.Index(nextPath, "/api/v2"); i >= 0 {
-			nextPath = nextPath[i+len("/api/v2"):]
+		// Strip the documented "/api/v2/" prefix so the rebuilt URL
+		// matches the BaseURL+path convention used by c.do.
+		//
+		// Reject any path that doesn't start with the prefix —
+		// in production Webshare's "next" cursor is always rooted
+		// under /api/v2/. A substring search like
+		// strings.Index(nextPath, "/api/v2") would also fire on
+		// "/api/v2evil/..." and strip the leading characters away,
+		// leaving "evil/..." which c.do would then prepend the
+		// BaseURL to. That gives a hostile or malformed "next" the
+		// ability to silently rewrite the request URL away from
+		// /api/v2. Anchoring on "/api/v2/" and refusing anything
+		// else closes that footgun.
+		const apiPrefix = "/api/v2/"
+		if !strings.HasPrefix(next.Path, apiPrefix) {
+			return nil, fmt.Errorf("webshare: next path %q must be absolute and under %q", next.Path, apiPrefix)
 		}
-		path = nextPath
+		// Keep one leading slash so c.do's `BaseURL+path`
+		// concatenation forms a clean URL.
+		path = "/" + next.Path[len(apiPrefix):]
 		if next.RawQuery != "" {
 			path += "?" + next.RawQuery
 		}

@@ -449,6 +449,34 @@ func mustEncode(t *testing.T, v any) []byte {
 	return b
 }
 
+// TestListProxiesRejectsMalformedNextPath locks the anchoring fix that
+// prevents a "next" URL like /api/v2evil/... from silently rewriting
+// the request URL when the /api/v2 prefix is stripped. The well-formed
+// /api/v2/ prefix strips cleanly; anything else is rejected.
+func TestListProxiesRejectsMalformedNextPath(t *testing.T) {
+	page := mustEncode(t, map[string]any{
+		"count":   1,
+		"next":    "https://attacker.example.com/api/v2evil/leak",
+		"results": []Proxy{{ID: "d-1", ProxyAddress: "1.1.1.1", Port: 1, Valid: true}},
+	})
+	srv, _ := newFakeServer(t, map[string]http.HandlerFunc{
+		"/proxy/list/": func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write(page)
+		},
+	})
+	c := NewClient()
+	c.BaseURL = srv.URL
+	c.APIToken = "tok"
+	c.HTTPClient = srv.Client()
+	_, err := c.ListProxies(context.Background(), ListProxiesOptions{})
+	if err == nil {
+		t.Fatal("expected error on /api/v2evil/... next path; got nil")
+	}
+	if !strings.Contains(err.Error(), "next path") {
+		t.Fatalf("err = %v, want one mentioning 'next path'", err)
+	}
+}
+
 // TestListProxiesCapsPages confirms the maxResponsePages guard fires if
 // a misbehaving server keeps handing back a "next" cursor forever. We
 // patch maxResponsePages-style behaviour by serving an unbounded loop
@@ -458,12 +486,14 @@ func TestListProxiesCapsPages(t *testing.T) {
 	srv, _ := newFakeServer(t, map[string]http.HandlerFunc{
 		"/proxy/list/": func(w http.ResponseWriter, r *http.Request) {
 			hits++
-			// Encode a payload that keeps pointing at itself; the
-			// query string is irrelevant since the client follows
-			// next verbatim.
+			// Encode a payload that keeps pointing at itself.
+			// The "next" path must be under /api/v2/ to satisfy
+			// the strict prefix check the client enforces;
+			// otherwise the loop terminates with a "next path"
+			// error before the page-cap guard fires.
 			body := paginatedResponse(
 				[]Proxy{{ID: fmt.Sprintf("d-%d", hits), ProxyAddress: "1.1.1.1", Port: hits + 8000, Valid: true}},
-				r.URL.String()+"&"+strconv.Itoa(hits),
+				"https://server/api/v2/proxy/list/?page="+strconv.Itoa(hits+1),
 			)
 			_, _ = w.Write(mustEncode(t, body))
 		},

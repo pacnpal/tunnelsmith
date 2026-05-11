@@ -10,13 +10,17 @@ import (
 	"time"
 )
 
-// TestMain installs a test-only ProviderValidator that mirrors the
-// rules the in-tree mullvad and webshare providers enforce in
-// production via internal/upstream/providers. The config package can't
-// import internal/upstream/providers without a cycle (providers imports
-// config to set the hook), so the test recreates the minimum set of
-// rules the test cases below assert against. Keeping this here lets
-// config tests run as a leaf node of the dependency tree.
+// TestMain installs a test-only ProviderValidator. It is NOT a faithful
+// mirror of the production validators (mullvad.Provider.ValidateConfig
+// and webshare.Provider.ValidateConfig) — those enforce more rules than
+// the cases in this file cover (Webshare's mode/kind/country-code
+// shape, exclusive-or between api_token and api_token_file, etc.).
+// This validator only encodes the small subset of rules the config
+// tests below assert against, so each test sees a deterministic error
+// string without the config package importing internal/upstream/providers
+// (which would form an import cycle through config.SetProviderValidator).
+// The exhaustive provider-level rules are tested in each provider's
+// own package.
 func TestMain(m *testing.M) {
 	SetProviderValidator(func(cfg UpstreamPoolConfig) error {
 		switch cfg.Provider {
