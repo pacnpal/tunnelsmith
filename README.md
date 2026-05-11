@@ -367,7 +367,7 @@ For a complete stack with a browser app container, use [`deploy/docker-compose.m
 Bring it up:
 
 ```sh
-docker compose -f deploy/docker-compose.mullvad.playwright.yml up --build --abort-on-container-exit
+docker compose -f deploy/docker-compose.mullvad.playwright.yml up --abort-on-container-exit
 ```
 
 The browser container prints the JSON response from `https://am.i.mullvad.net/json`, which verifies the request went through Mullvad via Tunnelsmith.

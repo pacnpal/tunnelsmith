@@ -34,8 +34,8 @@ services:
       DOT: "off"
       HEALTH_VPN_DURATION_INITIAL: "30s"
     ports:
-      - "8080:8080"
-      - "1080:1080"
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:1080:1080"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-qO-", "--tries=1", "--timeout=5", "https://am.i.mullvad.net/connected"]
@@ -71,8 +71,31 @@ services:
       - -lc
       - |
         node -e '
+        const net = require("net");
         const { chromium } = require("playwright");
+        const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+        async function waitForProxyReady(host, port, attempts, delayMs) {
+          for (let i = 1; i <= attempts; i++) {
+            const ready = await new Promise((resolve) => {
+              const socket = net.connect({ host, port }, () => {
+                socket.end();
+                resolve(true);
+              });
+              socket.on("error", () => resolve(false));
+              socket.setTimeout(1000, () => {
+                socket.destroy();
+                resolve(false);
+              });
+            });
+            if (ready) {
+              return;
+            }
+            await sleep(delayMs);
+          }
+          throw new Error(`timed out waiting for proxy on ${host}:${port}`);
+        }
         (async () => {
+          await waitForProxyReady("localhost", 8080, 30, 1000);
           const browser = await chromium.launch({
             headless: true,
             proxy: { server: "http://localhost:8080" },
