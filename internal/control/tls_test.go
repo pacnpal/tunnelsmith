@@ -173,7 +173,13 @@ func TestServeTLSRejectsPlaintextClient(t *testing.T) {
 		t.Fatalf("plaintext request to TLS listener: status = %d, want 400", resp.StatusCode)
 	}
 	body, _ := io.ReadAll(resp.Body)
-	if !containsAny(string(body), []string{"HTTP request", "HTTPS server"}) {
+	// Require BOTH protocol names in the body so a regression to a
+	// generic body (e.g. "bad request") fails the test. The stdlib
+	// message is "Client sent an HTTP request to an HTTPS server",
+	// which mentions both — assert that substance, not just one of
+	// the two tokens.
+	msg := string(body)
+	if !strings.Contains(msg, "HTTP request") || !strings.Contains(msg, "HTTPS server") {
 		t.Fatalf("plaintext request to TLS listener: body = %q, want HTTPS-mismatch message", body)
 	}
 	if resp.TLS != nil {
@@ -258,7 +264,11 @@ func TestServeTLSBadCertFails(t *testing.T) {
 	}, quietControlLogger())
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(context.Background()) }()
-	<-srv.Ready()
+	// No <-srv.Ready() wait: this test expects Serve to fail before
+	// the listener binds, so the only synchronization point we need
+	// is serveErr (with its own timeout below). A future regression
+	// that returned from Serve without closing s.ready would
+	// otherwise hang the test until global timeout.
 	t.Cleanup(func() {
 		shutCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
