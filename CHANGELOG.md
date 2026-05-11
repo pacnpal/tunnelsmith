@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-05-11
+
+Two additive features on top of v1.1.0: pluggable `[[upstream_pool]]` providers (Phase 13) — a small registry behind `cmd/tunnelsmith` so adding a vendor is a new package plus one blank import — landing alongside a first-class Webshare adapter (HTTP-with-Basic-auth or SOCKS5, paginated proxy list, disk-backed last-known-good cache), and opt-in TLS on the control listener (Phase 14) closing the plaintext-token risk ADR-007 named in its Non-goals. Both ship with the Phase 11/12 wire shape byte-for-byte preserved when the new opt-ins are left at defaults.
+
 ### Added
 
 - **Opt-in TLS on the control listener.** New `[control].tls_cert_file` + `[control].tls_key_file` keys (both-or-neither; absolute paths; restart-only) switch the control listener to HTTPS via `http.Server.ServeTLS`. Combined with Phase 12 bearer-token auth, the plaintext-token risk ADR-007 named in its Non-goals is closed at the transport layer. Both empty preserves the Phase 11/12 wire shape byte-for-byte. See [ADR-009](docs/decisions.md#adr-009-tls-on-the-control-listener-12).
