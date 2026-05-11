@@ -77,6 +77,25 @@ var ErrForbidden = errors.New("webshare: forbidden")
 // package.
 var ErrRateLimited = errors.New("webshare: rate limited")
 
+// HTTPStatusError is returned by Client.do for any response whose
+// status code wasn't in the recognised set (2xx success, 204 success,
+// 401/403/429 mapped to their typed sentinels). The wrapped
+// StatusCode lets ListProxies' cache-fallback policy distinguish a
+// 5xx (transient — fall back to disk so the running pool keeps
+// serving) from a 4xx (client/config error — propagate so the
+// operator sees the misconfig instead of stale data masking it).
+type HTTPStatusError struct {
+	Method     string
+	Path       string
+	StatusCode int
+	Body       string // truncated preview of the response body
+}
+
+func (e *HTTPStatusError) Error() string {
+	return fmt.Sprintf("webshare: %s %s: unexpected status %d: %s",
+		e.Method, e.Path, e.StatusCode, e.Body)
+}
+
 // Proxy is a single entry in Webshare's proxy list. Field names track
 // the JSON shape so the json package handles decoding without custom
 // hooks. Comments here document which fields the expander actually
@@ -223,9 +242,19 @@ func (c *Client) ListProxies(ctx context.Context, opts ListProxiesOptions) ([]Pr
 }
 
 // cacheFallbackAllowed reports whether a stale cached list is a safe
-// substitute for the failed live fetch. Returns false for auth and
-// rate-limit errors because those represent a vendor-side intentional
-// reject that the operator should see, not paper over.
+// substitute for the failed live fetch.
+//
+//   - Auth (401) / forbidden (403) / rate-limit (429): never fall back.
+//     These represent a vendor-side intentional reject the operator
+//     should see, not paper over with stale data.
+//   - Other 4xx (e.g. 400 from a bad plan_id): never fall back.
+//     Client-side misconfig is operator-actionable and masking it with
+//     yesterday's cached list keeps the binary serving against a
+//     mistake the operator can fix today.
+//   - 5xx: fall back. Server-side failures are usually transient; a
+//     stale list is better than dropping the running pool.
+//   - Transport errors (DNS, TCP, timeout): fall back for the same
+//     reason — they're transient and unrelated to operator config.
 func cacheFallbackAllowed(err error) bool {
 	switch {
 	case errors.Is(err, ErrUnauthorized):
@@ -234,9 +263,15 @@ func cacheFallbackAllowed(err error) bool {
 		return false
 	case errors.Is(err, ErrRateLimited):
 		return false
-	default:
-		return true
 	}
+	var statusErr *HTTPStatusError
+	if errors.As(err, &statusErr) {
+		// Any 4xx is operator-actionable; only 5xx counts as
+		// transient. The 401/403/429 cases were already caught
+		// above via the typed sentinels.
+		return statusErr.StatusCode >= 500
+	}
+	return true
 }
 
 // listProxiesOnline performs the actual paginated walk. Separate so
@@ -390,8 +425,12 @@ func (c *Client) do(ctx context.Context, method, path string, body io.Reader, _ 
 	case http.StatusTooManyRequests:
 		return nil, ErrRateLimited
 	default:
-		return nil, fmt.Errorf("webshare: %s %s: unexpected status %d: %s",
-			method, path, resp.StatusCode, snippet(data))
+		return nil, &HTTPStatusError{
+			Method:     method,
+			Path:       path,
+			StatusCode: resp.StatusCode,
+			Body:       snippet(data),
+		}
 	}
 }
 

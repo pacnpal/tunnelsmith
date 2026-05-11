@@ -212,6 +212,49 @@ func TestProviderRefreshRejectsGET(t *testing.T) {
 	}
 }
 
+// TestProviderRoutesMethodChecksPrecedeAuth locks the documented
+// behaviour: wrong-method and malformed-path requests return 405/404
+// even when auth tokens are configured, matching the /v1/report
+// convention. Auth gates resource access, not request shape.
+func TestProviderRoutesMethodChecksPrecedeAuth(t *testing.T) {
+	srv := newProviderTestServer(t, []ProviderAPIBinding{
+		{IDPrefix: "ws", Provider: "webshare", API: &fakeAPI{}},
+	}, []string{"secret"})
+
+	// Wrong method on /v1/providers without Authorization: must
+	// surface as 405, not 401.
+	resp, err := http.Post(srv.URL+"/v1/providers", "", strings.NewReader(""))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("wrong-method on /v1/providers: status = %d, want 405 (got %d, suggests auth gate fired first)", resp.StatusCode, resp.StatusCode)
+	}
+
+	// Malformed path under /v1/providers/ without Authorization:
+	// must surface as 404, not 401.
+	resp, err = http.Post(srv.URL+"/v1/providers/", "", nil)
+	if err != nil {
+		t.Fatalf("POST malformed: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("malformed path: status = %d, want 404", resp.StatusCode)
+	}
+
+	// Wrong method on a valid refresh path without Authorization:
+	// must surface as 405, not 401.
+	resp, err = http.Get(srv.URL + "/v1/providers/ws/refresh")
+	if err != nil {
+		t.Fatalf("GET refresh: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("wrong-method on refresh: status = %d, want 405", resp.StatusCode)
+	}
+}
+
 func TestProvidersListRejectsPOST(t *testing.T) {
 	srv := newProviderTestServer(t, []ProviderAPIBinding{}, nil)
 	resp, err := http.Post(srv.URL+"/v1/providers", "", strings.NewReader(""))

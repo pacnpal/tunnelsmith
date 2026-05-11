@@ -9,7 +9,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -20,27 +19,19 @@ import (
 // the Authorization header so a regression that drops the token would
 // fail loudly.
 //
-// Dispatch is longest-prefix-wins so a test that registers both
-// "/proxy/list/" and "/proxy/list/refresh/" gets deterministic
-// behaviour (Go's map iteration is randomised; a plain for-range over
-// the map would flake).
+// Dispatch matches r.URL.Path exactly. The query string lives in
+// r.URL.RawQuery so paginated /proxy/list/?page=N still routes to the
+// registered "/proxy/list/" handler. Exact match means a test that
+// accidentally sends to "/proxy/list/refresh/extra" gets 404 instead
+// of silently dispatching to the closest prefix.
 func newFakeServer(t *testing.T, handlers map[string]http.HandlerFunc) (*httptest.Server, *[]string) {
 	t.Helper()
-	prefixes := make([]string, 0, len(handlers))
-	for p := range handlers {
-		prefixes = append(prefixes, p)
-	}
-	sort.Slice(prefixes, func(i, j int) bool {
-		return len(prefixes[i]) > len(prefixes[j])
-	})
 	var receivedTokens []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		receivedTokens = append(receivedTokens, r.Header.Get("Authorization"))
-		for _, prefix := range prefixes {
-			if strings.HasPrefix(r.URL.Path, prefix) {
-				handlers[prefix](w, r)
-				return
-			}
+		if h, ok := handlers[r.URL.Path]; ok {
+			h(w, r)
+			return
 		}
 		http.NotFound(w, r)
 	}))
@@ -313,6 +304,68 @@ func TestListProxiesSkipsCacheOnAuthFailure(t *testing.T) {
 				t.Fatalf("expected nil list on auth/rate-limit, got %+v", got)
 			}
 		})
+	}
+}
+
+// TestListProxiesSkipsCacheOnGeneric4xx pins the policy that an
+// unexpected 4xx (e.g. 400 Bad Request from a malformed plan_id)
+// propagates instead of being silently masked by stale cached data.
+// Operator misconfig is fixable; stale data hides it.
+func TestListProxiesSkipsCacheOnGeneric4xx(t *testing.T) {
+	srv, _ := newFakeServer(t, map[string]http.HandlerFunc{
+		"/proxy/list/": func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"detail": "invalid plan_id"}`))
+		},
+	})
+	cachePath := filepath.Join(t.TempDir(), "cache.json")
+	cached := []Proxy{{ID: "d-99", ProxyAddress: "9.9.9.9", Port: 1, Valid: true}}
+	if err := (&Cache{Path: cachePath}).Write(cached); err != nil {
+		t.Fatalf("seed cache: %v", err)
+	}
+	c := NewClient()
+	c.BaseURL = srv.URL
+	c.APIToken = "tok"
+	c.HTTPClient = srv.Client()
+	c.Cache = &Cache{Path: cachePath}
+	got, err := c.ListProxies(context.Background(), ListProxiesOptions{})
+	if err == nil {
+		t.Fatalf("expected error from 400, got nil and %+v", got)
+	}
+	var statusErr *HTTPStatusError
+	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusBadRequest {
+		t.Fatalf("err = %v, want HTTPStatusError with StatusCode=400", err)
+	}
+	if got != nil {
+		t.Fatalf("expected nil list on 4xx, got %+v", got)
+	}
+}
+
+// TestListProxiesFallsBackOn5xx pins the inverse: a transient 5xx
+// from Webshare still falls back to the cached list so the running
+// pool keeps serving rather than blanking out on a server-side blip.
+func TestListProxiesFallsBackOn5xx(t *testing.T) {
+	srv, _ := newFakeServer(t, map[string]http.HandlerFunc{
+		"/proxy/list/": func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusBadGateway)
+		},
+	})
+	cachePath := filepath.Join(t.TempDir(), "cache.json")
+	cached := []Proxy{{ID: "d-77", ProxyAddress: "7.7.7.7", Port: 1, Valid: true}}
+	if err := (&Cache{Path: cachePath}).Write(cached); err != nil {
+		t.Fatalf("seed cache: %v", err)
+	}
+	c := NewClient()
+	c.BaseURL = srv.URL
+	c.APIToken = "tok"
+	c.HTTPClient = srv.Client()
+	c.Cache = &Cache{Path: cachePath}
+	got, err := c.ListProxies(context.Background(), ListProxiesOptions{})
+	if err != nil {
+		t.Fatalf("ListProxies: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "d-77" {
+		t.Fatalf("expected cached list on 5xx, got %+v", got)
 	}
 }
 

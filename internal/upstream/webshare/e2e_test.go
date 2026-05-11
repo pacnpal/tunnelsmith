@@ -167,6 +167,19 @@ func TestEndToEnd_WebshareDirectMode(t *testing.T) {
 		shutCtx, shutCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer shutCancel()
 		_ = httpSrv.Shutdown(shutCtx)
+		// Drain the Serve goroutine and surface anything that
+		// isn't the expected clean shutdown. HTTPServer.Serve
+		// returns nil on a successful Shutdown; any non-nil
+		// value is a real bug (bind failure, mid-flight error)
+		// the test should report rather than leak.
+		select {
+		case err := <-serveErr:
+			if err != nil {
+				t.Errorf("HTTPServer.Serve returned unexpected error: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Error("HTTPServer.Serve did not return after Shutdown")
+		}
 	})
 	<-httpSrv.Ready()
 

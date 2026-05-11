@@ -120,16 +120,13 @@ func mountProvidersHandlers(mux *http.ServeMux, registry *ProviderRegistry, toke
 		logger = slog.Default()
 	}
 	mux.HandleFunc("/v1/providers", func(w http.ResponseWriter, r *http.Request) {
-		if !runProviderAuth(w, r, tokens) {
-			return
-		}
-		handleProvidersList(w, r, registry)
+		handleProvidersList(w, r, registry, tokens)
 	})
 	mux.HandleFunc("/v1/providers/", func(w http.ResponseWriter, r *http.Request) {
-		if !runProviderAuth(w, r, tokens) {
-			return
-		}
-		// Path shape: /v1/providers/{id_prefix}/refresh
+		// Path shape validation runs before the auth gate so a
+		// malformed path returns 404 rather than 401 even when auth
+		// is enabled. This matches the /v1/report convention: shape
+		// errors are public truth, auth gates resource access.
 		tail := strings.TrimPrefix(r.URL.Path, "/v1/providers/")
 		parts := strings.Split(tail, "/")
 		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
@@ -139,7 +136,7 @@ func mountProvidersHandlers(mux *http.ServeMux, registry *ProviderRegistry, toke
 		idPrefix, action := parts[0], parts[1]
 		switch action {
 		case "refresh":
-			handleProviderRefresh(w, r, registry, idPrefix, logger)
+			handleProviderRefresh(w, r, registry, idPrefix, tokens, logger)
 		default:
 			http.Error(w, fmt.Sprintf("unknown provider action %q (supported: refresh)", action), http.StatusNotFound)
 		}
@@ -161,10 +158,16 @@ func runProviderAuth(w http.ResponseWriter, r *http.Request, tokens TokenSource)
 	return checkAuth(w, r, snap, nil)
 }
 
-func handleProvidersList(w http.ResponseWriter, r *http.Request, registry *ProviderRegistry) {
+func handleProvidersList(w http.ResponseWriter, r *http.Request, registry *ProviderRegistry, tokens TokenSource) {
+	// Method check before auth so a wrong-method request returns 405
+	// (the documented behaviour) even when auth is enabled. Matches
+	// the /v1/report handler's ordering.
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", http.MethodGet)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !runProviderAuth(w, r, tokens) {
 		return
 	}
 	bindings := registry.List()
@@ -185,10 +188,15 @@ func handleProvidersList(w http.ResponseWriter, r *http.Request, registry *Provi
 // must not pin a goroutine indefinitely.
 const providerRefreshTimeout = 30 * time.Second
 
-func handleProviderRefresh(w http.ResponseWriter, r *http.Request, registry *ProviderRegistry, idPrefix string, logger *slog.Logger) {
+func handleProviderRefresh(w http.ResponseWriter, r *http.Request, registry *ProviderRegistry, idPrefix string, tokens TokenSource, logger *slog.Logger) {
+	// Method check before auth so a wrong-method request returns 405
+	// even when auth is enabled. Matches /v1/report ordering.
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !runProviderAuth(w, r, tokens) {
 		return
 	}
 	binding, ok := registry.Lookup(idPrefix)

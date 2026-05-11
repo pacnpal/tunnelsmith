@@ -181,9 +181,11 @@ docker run -d \
     -v $(pwd)/config.toml:/etc/tunnelsmith/config.toml:ro \
     -v /etc/tunnelsmith/webshare.token:/etc/tunnelsmith/webshare.token:ro \
     -v tunnelsmith-data:/data/tunnelsmith \
-    ghcr.io/pacnpal/tunnelsmith:latest \
+    ghcr.io/pacnpal/tunnelsmith:1.1.0 \
     --config /etc/tunnelsmith/config.toml
 ```
+
+> Pin to a semver tag (or a `sha256:` digest for full reproducibility). `:latest` is intentionally not published by the release workflow — see [README](../README.md#container-image). Replace `1.1.0` with the desired version from the [releases page](https://github.com/pacnpal/tunnelsmith/releases).
 
 **5. Confirm the pool expanded.** The startup log should include a line like:
 
