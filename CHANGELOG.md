@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Pluggable `[[upstream_pool]]` providers.** New `internal/upstream/provider` package introduces three small interfaces (`Provider`, `Expander`, `API`) plus a registry. Each provider package's `init()` registers itself; `cmd/tunnelsmith` no longer references any concrete provider type. Adding a new provider is one new package plus one blank import line in `internal/upstream/providers`. See ADR-008 in `docs/decisions.md` and the adapter-author guide at `docs/providers.md`.
+- **Webshare `[[upstream_pool]]` provider.** `provider = "webshare"` expands an operator's Webshare plan into one HTTP-with-Basic-auth (default) or SOCKS5 upstream per active proxy. Configured via `api_token` (inline) or `api_token_file` (absolute path), with optional `mode = "direct" | "backbone"`, `kind = "http" | "socks5"`, `plan_id`, and ISO-coded `country_codes`. Paginated `GET /api/v2/proxy/list/` fetch follows the `next` cursor with a hard cap of 500 pages; invalid proxies (`valid = false`) are dropped from the expansion. Disk cache via `cache_path` falls back to the last-known-good list when the API is unreachable.
+- **Provider control API.** Two new control-listener routes share the existing bearer-token gate:
+  - `GET /v1/providers` lists every registered `[[upstream_pool]]` binding plus whether its provider exposes a vendor API.
+  - `POST /v1/providers/{id_prefix}/refresh` forwards through `provider.API.RefreshProxyList`. For Webshare this triggers `POST /api/v2/proxy/list/refresh/`; for Mullvad (no vendor API) it returns 501 Not Implemented. Vendor errors map to HTTP status by category: rate-limit → `429` (via `provider.ErrAPIRateLimited`), timeout → `504`, anything else → `502`. The JSON response body carries a short sanitised category (`"vendor rate limited"`, `"upstream timeout"`, `"refresh failed"`); the full vendor error chain stays in the operator log only.
+- **Per-upstream auth.** `[[upstream]]` (and pool-expanded upstreams) now accept `username` / `password`. HTTP CONNECT sends `Proxy-Authorization: Basic` per RFC 7617; SOCKS5 offers the SOCKS5 user/password auth method. Empty username keeps the old open-auth dial path byte-for-byte for Mullvad deployments.
+- **End-to-end test.** `internal/upstream/webshare/e2e_test.go` drives a full CONNECT through the production listener stack against a fake Webshare API + an auth-required upstream HTTP-CONNECT proxy + a destination, proving the credentials flow from the API response to the upstream dialer.
+- **Docs.** New `docs/providers.md` (provider abstraction reference + fork+PR adapter guide), new `docs/control-api.md` (provider routes), Webshare section in `docs/deployment.md`, Webshare config keys in `docs/configuration.md`, updated supported-providers section in `README.md`, and ADR-008 in `docs/decisions.md`.
+
+### Changed
+
+- `internal/config`: `UpstreamPoolConfig` gains `CountryCodes`, `APIToken`, `APITokenFile`, `PlanID`, `Mode`, `Kind`. The hard-coded `provider` enum is replaced by a registry-backed validator (`config.SetProviderValidator`). The old `countries` field remains for Mullvad; Webshare uses `country_codes` (ISO 3166-1 alpha-2). `UpstreamConfig` gains `Username` / `Password`.
+- `cmd/tunnelsmith`: pool expansion now dispatches through `provider.Default().Lookup`. The previous `expandMullvadPool` helper is gone; `expandPool` is the single generic path.
+- `internal/control/Server` gains a `Providers *ProviderRegistry` option (default nil, which preserves the Phase 11/12 wire shape byte-for-byte).
+
 ## [1.1.0] - 2026-05-11
 
 Two additive features on top of v1.0.0: cooperative-report hot-swap of the running `[[upstream_pool]]` (Phase 11.1) so Mullvad relay churn no longer needs a binary restart, and opt-in bearer-token auth on the cooperative-reporting control endpoint (Phase 12) so operators in multi-tenant or LAN-exposed deployments can gate `POST /v1/report`. Both ship with the Phase 11 wire shape byte-for-byte preserved when the new opt-ins are left at defaults.

@@ -2,12 +2,54 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+// TestMain installs a test-only ProviderValidator. It is NOT a faithful
+// mirror of the production validators (mullvad.Provider.ValidateConfig
+// and webshare.Provider.ValidateConfig) — those enforce more rules than
+// the cases in this file cover (Webshare's mode/kind/country-code
+// shape, exclusive-or between api_token and api_token_file, etc.).
+// This validator only encodes the small subset of rules the config
+// tests below assert against, so each test sees a deterministic error
+// string without the config package importing internal/upstream/providers
+// (which would form an import cycle through config.SetProviderValidator).
+// The exhaustive provider-level rules are tested in each provider's
+// own package.
+func TestMain(m *testing.M) {
+	SetProviderValidator(func(cfg UpstreamPoolConfig) error {
+		switch cfg.Provider {
+		case "mullvad":
+			if len(cfg.Countries) == 0 {
+				return fmt.Errorf("mullvad: countries must list at least one country")
+			}
+			for i, c := range cfg.Countries {
+				if strings.TrimSpace(c) == "" {
+					return fmt.Errorf("mullvad: countries[%d] is empty or whitespace", i)
+				}
+			}
+			return nil
+		case "webshare":
+			hasInline := strings.TrimSpace(cfg.APIToken) != ""
+			hasFile := strings.TrimSpace(cfg.APITokenFile) != ""
+			if !hasInline && !hasFile {
+				return fmt.Errorf("webshare: one of api_token or api_token_file is required")
+			}
+			if hasInline && hasFile {
+				return fmt.Errorf("webshare: set only one of api_token or api_token_file")
+			}
+			return nil
+		default:
+			return fmt.Errorf("provider %q is not supported", cfg.Provider)
+		}
+	})
+	os.Exit(m.Run())
+}
 
 const validConfig = `
 [listener]
@@ -665,6 +707,38 @@ provider  = "mullvad"
 countries = ["Sweden"]
 `,
 			contains: "id_prefix is required",
+		},
+		{
+			name: "upstream_pool id_prefix with slash",
+			toml: `
+[[upstream_pool]]
+provider  = "mullvad"
+id_prefix = "mvd/foo"
+countries = ["Sweden"]
+`,
+			// Slash would break /v1/providers/{id_prefix}/refresh
+			// routing and split the prefix across path segments.
+			contains: "id_prefix",
+		},
+		{
+			name: "upstream_pool id_prefix with whitespace",
+			toml: `
+[[upstream_pool]]
+provider  = "mullvad"
+id_prefix = "mvd prefix"
+countries = ["Sweden"]
+`,
+			contains: "id_prefix",
+		},
+		{
+			name: "upstream_pool id_prefix with shell metacharacter",
+			toml: `
+[[upstream_pool]]
+provider  = "mullvad"
+id_prefix = "mvd$evil"
+countries = ["Sweden"]
+`,
+			contains: "id_prefix",
 		},
 		{
 			name: "upstream_pool empty countries",

@@ -104,25 +104,46 @@ The config must define at least one upstream, either directly via `[[upstream]]`
 | `kind`     | string enum | none    | one of `direct`, `http`, `socks5` |
 | `addr`     | string      | none    | required for `http` / `socks5` (`host:port`); must be empty for `direct` |
 | `priority` | int         | `100`   | tiebreaker only; lower wins |
+| `username` | string      | `""`    | optional proxy-auth username for `http` / `socks5`. For `http`, the dialer sends `Proxy-Authorization: Basic base64(user:pass)` per RFC 7617 on every CONNECT. For `socks5`, the SOCKS5 user/password auth method is offered to the proxy. Ignored for `kind = "direct"` |
+| `password` | string      | `""`    | optional proxy-auth password; pairs with `username`. Empty username means no auth |
 
 Validation:
 - IDs must be unique across the file (including those produced by `[[upstream_pool]]` expansion).
 - `kind = "direct"` must not set `addr`.
 - `kind = "http"` and `kind = "socks5"` require `addr` to parse as `host:port` with a non-empty host and a port in `1-65535`.
+- `username` / `password` are emitted by the Webshare expander automatically; an operator hand-writing an `[[upstream]]` may also set them to authenticate against any auth-required HTTP CONNECT or SOCKS5 proxy.
+
+> **Credential note.** `username` and `password` are stored in the TOML file in plaintext and re-printed verbatim by `tunnelsmith --print-config`. Treat the config file as a secret: keep it out of version control, restrict its mode to `0o600`, and prefer mounting it from a secret store (Docker secrets, Kubernetes `Secret`, etc.) rather than baking credentials into a committed file. For the Webshare provider the recommended pattern is `api_token_file` (which the expander reads once at startup) — see [`[[upstream_pool]]`](#upstream_pool) below.
 
 ## `[[upstream_pool]]`
 
-`[[upstream_pool]]` expands at startup into one or more synthetic `[[upstream]]` entries. Phase 6 only knows how to expand `provider = "mullvad"`, which fans the configured countries out into one socks5 upstream per active Mullvad WireGuard relay. The hostname transformation is documented in [ADR-004](decisions.md#adr-004-mullvad-socks5-hostname-pattern-is-per-server-multihop-not-the-form-in-the-original-plan); operators only name countries.
+`[[upstream_pool]]` expands at startup into one or more synthetic `[[upstream]]` entries through a registered provider. Tunnelsmith ships with two providers out of the box:
+
+- `provider = "mullvad"` — fans the configured countries out into one socks5 upstream per active Mullvad WireGuard relay (see [ADR-004](decisions.md#adr-004-mullvad-socks5-hostname-pattern-is-per-server-multihop-not-the-form-in-the-original-plan)).
+- `provider = "webshare"` — fans the operator's Webshare proxy plan out into one HTTP-with-Basic-auth (or SOCKS5) upstream per active proxy (see [`docs/providers.md`](providers.md#webshare)).
+
+Both providers share a common set of generic keys and add their own provider-specific keys on top. Adding a third provider is a single-package change documented in [`docs/providers.md`](providers.md#adding-a-new-provider).
+
+### Generic keys
+
+These apply to every provider; provider-specific keys are documented in the per-provider sections below.
 
 | key                | type             | default | notes |
 |--------------------|------------------|---------|-------|
-| `provider`         | string enum      | none    | required; only `"mullvad"` is implemented |
+| `provider`         | string           | none    | required; must match a registered provider (e.g. `"mullvad"`, `"webshare"`). Unknown values are rejected at config-load with the list of registered providers in the error |
 | `id_prefix`        | string           | none    | required; prepended to every generated upstream id (e.g. `mvd` -> `mvd-se-sto-wg-001`); must be unique across pool blocks |
 | `priority`         | int              | `200`   | applied to every expanded upstream; default puts pool entries below user-defined `[[upstream]]` (default 100) |
+| `refresh`          | duration         | `12h`   | background list-refresh interval; `0s` disables refresh, any positive value below `1m` is rejected to avoid hammering vendor APIs |
+| `cache_path`       | string           | `""`    | absolute path for a disk fallback used when the vendor's list endpoint is unreachable |
+
+### `provider = "mullvad"`
+
+Mullvad-specific keys:
+
+| key                | type             | default | notes |
+|--------------------|------------------|---------|-------|
 | `countries`        | array of strings | none    | required, non-empty; case-insensitive match against the Mullvad relay-list `country` field (`Sweden`, `USA`, ...) |
 | `include_inactive` | bool             | `false` | `true` admits relays Mullvad has flagged inactive (rare; mostly for debugging) |
-| `refresh`          | duration         | `12h`   | background relay-list refresh interval |
-| `cache_path`       | string           | `""`    | absolute path for a disk fallback used when the relay-list API is unreachable |
 
 Example:
 
@@ -134,9 +155,43 @@ priority  = 100
 countries = ["Sweden", "Netherlands", "Switzerland"]
 ```
 
+### `provider = "webshare"`
+
+Webshare-specific keys. Exactly one of `api_token` / `api_token_file` is required; the other Webshare fields default to sensible values.
+
+| key               | type             | default    | notes |
+|-------------------|------------------|------------|-------|
+| `api_token`       | string           | `""`       | Webshare API token; one of `api_token` / `api_token_file` is required. Inline tokens are visible in `--print-config`; prefer `api_token_file` for production |
+| `api_token_file`  | string           | `""`       | absolute path to a one-token file; the file's contents are trimmed of surrounding whitespace |
+| `mode`            | string           | `"direct"` | Webshare list mode: `direct` (per-proxy IP:port returned by the API) or `backbone` (rotating IPs behind `p.webshare.io`). Must be `backbone` if your plan's `pool_filter` is `residential` |
+| `kind`            | string           | `"http"`   | upstream kind to materialise as: `http` (sends `Proxy-Authorization: Basic` per RFC 7617) or `socks5` (uses SOCKS5 user/pass auth) |
+| `plan_id`         | string           | `""`       | optional Webshare plan id; empty uses the account's default plan |
+| `country_codes`   | array of strings | `[]`       | ISO 3166-1 alpha-2 codes (`"US"`, `"DE"`); empty = no filter. Note: this is **`country_codes`**, not `countries` — Webshare's API filters by ISO code, not display name |
+
+Example:
+
+```toml
+[[upstream_pool]]
+provider       = "webshare"
+id_prefix      = "ws"
+priority       = 110
+api_token_file = "/etc/tunnelsmith/webshare.token"
+mode           = "direct"
+kind           = "http"
+country_codes  = ["US", "GB", "DE"]
+refresh        = "1h"
+cache_path     = "/data/tunnelsmith/webshare-cache.json"
+```
+
 A config that uses only `[[upstream_pool]]` and no `[[upstream]]` is valid; a config with neither is rejected.
 
-The pool expansion runs at startup to seed the priority pool, and a per-block refresh goroutine keeps polling the relay list at the configured interval. As of Phase 11.1, the refresh tick **hot-swaps the running priority pool** on every successful diff: a new `*upstream.Pool` is built from the merged `(static [[upstream]]) ∪ (every block's latest expansion)` slice and installed via `Scoreboard.ReplacePool`. Cached HTTP transports are dropped during the swap so the new pool's `Upstream` objects use freshly-pinned `DialContext` closures. Force pins to upstream ids that disappear in the new expansion are evicted automatically. Per-(host, upstream) entries for removed ids stay in the scoreboard's table but become unreachable through `Pick`; they age out via score decay. The diff is logged at `INFO` (counts plus a small sample) and at `DEBUG` (full id lists), and `tunnelsmith_pool_hotswap_total{result}` counts every swap. SIGHUP still does not touch the pool when `[[upstream_pool]]` is configured — pool-shape changes are owned end-to-end by the refresh ticker, and changes to `[[upstream]]` (static entries) under a pool deployment still require a binary restart. `refresh = "0s"` is allowed and disables periodic refresh entirely; any positive value below 1m is rejected so a typo cannot hammer Mullvad's public relay-list API.
+### Shared expansion behavior
+
+The pool expansion runs at startup to seed the priority pool, and a per-block refresh goroutine keeps polling the vendor's list endpoint at the configured interval. As of Phase 11.1, the refresh tick **hot-swaps the running priority pool** on every successful diff: a new `*upstream.Pool` is built from the merged `(static [[upstream]]) ∪ (every block's latest expansion)` slice and installed via `Scoreboard.ReplacePool`. Cached HTTP transports are dropped during the swap so the new pool's `Upstream` objects use freshly-pinned `DialContext` closures. Force pins to upstream ids that disappear in the new expansion are evicted automatically. Per-(host, upstream) entries for removed ids stay in the scoreboard's table but become unreachable through `Pick`; they age out via score decay. The diff is logged at `INFO` (counts plus a small sample) and at `DEBUG` (full id lists), and `tunnelsmith_pool_hotswap_total{result}` counts every swap. SIGHUP still does not touch the pool when `[[upstream_pool]]` is configured — pool-shape changes are owned end-to-end by the refresh ticker, and changes to `[[upstream]]` (static entries) under a pool deployment still require a binary restart. `refresh = "0s"` is allowed and disables periodic refresh entirely; any positive value below `1m` is rejected so a typo cannot hammer the vendor's API.
+
+### Provider-API control
+
+Webshare additionally exposes a vendor API surface through Tunnelsmith's control endpoint (`POST /v1/providers/{id_prefix}/refresh` triggers an on-demand list rotation). See [`docs/control-api.md`](control-api.md) for the full route reference. Mullvad has no vendor API and returns 501 Not Implemented for the refresh route.
 
 ## `[failure]`
 

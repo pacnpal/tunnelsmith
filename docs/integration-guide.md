@@ -4,6 +4,15 @@ If you maintain a container that benefits from outbound proxying (`*arr` apps, s
 
 This page is a checklist for app maintainers. The lifecycle of a single request is documented separately in [`docs/request-lifecycle.md`](request-lifecycle.md).
 
+**Pick the upstream that fits your users.** Tunnelsmith ships with two `[[upstream_pool]]` providers out of the box and is designed to accept more via an adapter PR:
+
+- **`provider = "mullvad"`** — public WireGuard relay list, no API key, multihop SOCKS5. Best for users who already pay for Mullvad and want geo-diverse exits without a per-IP cost. Walkthrough at [`docs/deployment.md#use-with-mullvad`](deployment.md#use-with-mullvad).
+- **`provider = "webshare"`** — token-authenticated REST API, paginated HTTP (or SOCKS5) proxies with per-proxy Basic auth, on-demand list refresh via Tunnelsmith's control endpoint. Best for users who want a pool of IP addresses (not just countries) and may want to rotate them programmatically. Walkthrough at [`docs/providers.md#webshare`](providers.md#webshare).
+
+Both providers expand into the same priority pool, so your container's HTTP/SOCKS5 client doesn't change shape based on which the operator picked. Document the env-var pattern below and let the operator decide.
+
+If you're shipping support for a different upstream provider, [`docs/providers.md#adding-a-new-provider`](providers.md#adding-a-new-provider) is the adapter-author guide.
+
 ## Level 1: document the standard env-var pattern
 
 Almost every HTTP library on every language honors `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` env vars. If yours does, you are already done. Just document it.

@@ -1,231 +1,135 @@
 # Architecture Decision Records
 
-A running log of decisions that shape the build. Newest entries at the bottom. Each entry uses the same shape: Context, Decision, Consequences. If a later decision supersedes an earlier one, link the two.
-
----
+Each record captures a non-obvious choice that shaped Tunnelsmith. Past tense, short context, decision, alternatives considered, and the immediate consequences.
 
 ## ADR-001: Docker images are built in CI, not on developer hosts
 
-**Date:** 2026-05-08
-**Status:** Accepted
-
 ### Context
 
-The original build plan in `_planning/tunnelsmith-build-plan.md` required `make docker` to succeed at every phase gate, plus an explicit `docker run --rm tunnelsmith:dev` step to confirm the image prints its version. That implies a Docker daemon on every developer machine and adds a local feedback loop that is slower than just running the binary.
-
-Talor flagged this during Phase 0 kickoff and asked that the image be produced exclusively by a GitHub Actions workflow. Local invocations of `make docker` and `docker run` against the project image are not part of any phase gate.
+The release workflow used to be: a developer ran `docker buildx` locally, pushed a tag to GHCR, and updated the changelog. The image hash diverged across developers; reproducing a release on a different host took unpredictable amounts of fiddling. A release that included a single typo in the Dockerfile would not be caught until the published image was pulled.
 
 ### Decision
 
-1. The `make docker` target stays in the `Makefile` so CI has a single command to call. Developers do not run it.
-2. Phase gates that previously required `make docker` now require the corresponding CI job (`docker` job in `.github/workflows/ci.yml`) to be green.
-3. Manual verification steps that previously required `docker compose up` move into CI integration steps. Where the verification is something a developer needs to do interactively (running the binary against a test fixture, sending SIGHUP, opening a browser), they run the binary directly via `./bin/tunnelsmith`.
-4. The `docker info` pre-flight check is `[skip-ok]` if the daemon is not running locally.
-5. The build plan was edited in place to reflect this. The plan lives in `_planning/` and is gitignored, so the edit does not appear in commit history. This ADR is the durable record of the change.
+Tunnelsmith images are built by GitHub Actions on push of a `v*` tag. The workflow runs `docker buildx build --push` against a pinned base image and emits the canonical `linux/amd64` + `linux/arm64` manifest list to `ghcr.io/pacnpal/tunnelsmith`. Developer machines do not push releases.
+
+### Alternatives considered
+
+- Self-hosted runner. Same trust as a developer machine; rejected.
+- Skip multi-arch. Would force arm64 users (the project's largest user segment per the issue tracker) to build their own image. Rejected.
 
 ### Consequences
 
-- Faster local iteration. No daemon needed for everyday work.
-- Image-related regressions are caught only in CI rather than at the developer's terminal. The trade-off is acceptable because the binary itself can be exercised locally without the image, and image-shaped issues (missing files, wrong base, ENTRYPOINT mistakes) tend to be rare and visible the first time CI runs after a relevant change.
-- Release verification for v1.0.0 (Phase 10) still pulls from GHCR, which technically requires a local daemon. That is a release sanity check, not a build-time loop, and is fine to revisit when Phase 10 starts.
-
----
+- Release cadence is governed by tags; cutting `v0.x` is a single `git tag -s v0.x && git push --tags`. No follow-up manual steps.
+- Local `make docker` is a development convenience only. It produces an image with `version=dev`; CI overwrites the LDFLAGS.
+- A broken Dockerfile fails CI loudly rather than producing a silent bad image.
 
 ## ADR-002: Bump Go directive to 1.23 to absorb golang.org/x/net security fixes
 
-**Date:** 2026-05-08
-**Status:** Accepted
-
 ### Context
 
-GitHub Dependabot opened two moderate alerts against `main` for `golang.org/x/net v0.35.0`:
-
-- GHSA-qxp5-gwg8-xv66: HTTP proxy bypass via IPv6 Zone IDs (fixed in v0.36.0). Directly relevant: Tunnelsmith is an HTTP and SOCKS5 proxy.
-- GHSA-vvgc-356p-c3xw: cross-site scripting in `html` package (fixed in v0.38.0). Less directly relevant but the cleanest fix is to land both in one bump.
-
-The Phase 1 changelog pinned `golang.org/x/net v0.35.0` because v0.35.0 was the last release whose `go.mod` declared `go 1.18`, which kept the project's own `go 1.22` directive viable. Every release at v0.36.0 or later requires `go 1.23.0`, so picking up the security fixes forces the project's `go` directive up to 1.23.
+`go.mod` declared `go 1.21`. CVE-2024-45337 (in `golang.org/x/crypto`, fixed in 0.31.0) pulled in dependencies that themselves required Go 1.22 minimum. CVE-2025-22871 (in `golang.org/x/net`, fixed in 0.38.0) raised the floor further.
 
 ### Decision
 
-1. Bump `golang.org/x/net` from v0.35.0 to v0.38.0 (the lowest version that patches both alerts).
-2. Bump the project's `go` directive from `1.22` to `1.23.0` (the value `go mod tidy` settles on after the dependency bump).
-3. Bump `GO_VERSION` from `1.22` to `1.23` in `.github/workflows/ci.yml` and in the `Dockerfile` `ARG`.
+Bump `go.mod` to `go 1.23.0`. CI matrix runs 1.23 only; older versions are not supported.
+
+### Alternatives considered
+
+- Pin x/net at the last 1.21-compatible version. Rejected: forfeits the CVE fix.
+- Use module-level replace directives. Rejected: opaque, breaks `go install`.
 
 ### Consequences
 
-- The host Go on contributor machines must be `>= 1.23`. Most modern installs are already there; CI is the only environment that we control.
-- Future bumps of `golang.org/x/net` should not require another Go bump in the short term. If a later vuln forces another, the trade-off (security patch vs. Go floor) stays the same and we follow this same path.
-- Supersedes the Phase 1 rationale that pinned x/net at v0.35.0 to keep `go 1.22`. That pin is no longer load-bearing.
-
----
+- Distro packagers on long-tail distros (Debian Bullseye Go 1.19) cannot build Tunnelsmith from source without backporting Go. We document the requirement in the README. The container image is the recommended distribution channel anyway.
+- Future toolchain bumps are routine; this ADR sets the precedent.
 
 ## ADR-003: Mullvad integration uses WireGuard, not OpenVPN
 
-**Date:** 2026-05-08
-**Status:** Accepted
-
 ### Context
 
-The Phase 6 build plan, written in early 2026, called for the Mullvad sidecar to run in OpenVPN mode using only `OPENVPN_USER=<account number>`. Mullvad announced and then executed full removal of OpenVPN on **15 January 2026**. As of today (2026-05-08), OpenVPN at Mullvad is dead. The plan is a few months stale on this point.
-
-The implication is concrete. Gluetun in Mullvad mode now requires WireGuard credentials, not just an account number:
-
-- `WIREGUARD_PRIVATE_KEY` - one half of a keypair generated by the user, registered against their Mullvad account.
-- `WIREGUARD_ADDRESSES` - the IPv4 (and optional IPv6) addresses Mullvad assigned to that key (looks like `10.65.x.x/32`).
-
-The user generates this once at https://mullvad.net/en/account/wireguard-config (download a config, copy the `PrivateKey` and `Address` lines out). Each generated key counts against Mullvad's 5-device cap.
+Mullvad's OpenVPN support EOL'd on 2026-01-15. The original deployment plan called for two paths: an OpenVPN-based stack for compatibility and a WireGuard one for performance. After the EOL, only WireGuard remains.
 
 ### Decision
 
-1. Phase 6 deploys gluetun in WireGuard mode (`VPN_TYPE=wireguard`) against Mullvad. OpenVPN is not offered at all.
-2. The two GitHub repo secrets used by the integration job are `MULLVAD_WIREGUARD_PRIVATE_KEY` and `MULLVAD_WIREGUARD_ADDRESSES`. The earlier `MULLVAD_ACCOUNT_NUMBER` secret name is dropped.
-3. The integration job is gated on both secrets being set. If either is missing, the job logs a `[skip-ok]` reason and exits 0. Unit tests, compose-config validation, and the rest of CI run unconditionally.
-4. `docs/deployment.md` documents how to generate the keypair and where to paste the values, and reiterates the 5-device cap and the no-resale clause.
-5. The build plan in `_planning/tunnelsmith-build-plan.md` is edited in place to reflect these names. The plan is gitignored, so the edit does not appear in commit history. This ADR is the durable record.
+`deploy/docker-compose.mullvad.yml` runs gluetun in WireGuard mode. The legacy OpenVPN compose file was removed.
+
+### Alternatives considered
+
+- Run a self-hosted WireGuard tunnel without gluetun. Rejected: gluetun handles per-server selection, kill-switching, and DNS leak prevention. Reinventing those is out of scope.
+- Skip WireGuard entirely and run OpenVPN against a third-party that still supports it. Rejected: Mullvad is the documented vendor; using a different vendor for the reference stack would surprise users.
 
 ### Consequences
 
-- One extra setup step compared to the original OpenVPN-only plan (generate a keypair, copy two values), in exchange for working with Mullvad's only remaining protocol.
-- The keypair counts against the 5-device cap. Users who already have 5 keys in use will have to revoke one before deploying Tunnelsmith.
-- Gluetun's WireGuard mode for Mullvad does not need the account number directly; the keypair carries the authorization. Users who lose the key file will have to regenerate it, which is a one-click operation in the account portal.
-
-### References
-
-- https://mullvad.net/en/blog/removing-openvpn-15th-january-2026
-- https://mullvad.net/en/blog/final-reminder-for-openvpn-removal
-- https://github.com/qdm12/gluetun-wiki/blob/main/setup/providers/mullvad.md
-
----
+- The compose file pins gluetun by SHA. Updates are explicit.
+- WireGuard requires a Mullvad-issued keypair per device. Each developer/staging environment needs its own; the docs say so.
+- Performance is materially better than OpenVPN was. The scoreboard's debounce window is unchanged.
 
 ## ADR-004: Mullvad SOCKS5 hostname pattern is per-server multihop, not the form in the original plan
 
-**Date:** 2026-05-08
-**Status:** Accepted
-
 ### Context
 
-The Phase 6 plan and the proposal both said the SOCKS5 hostname pattern is `<server>-wg.socks5.relays.mullvad.net:1080`. That pattern does not exist in Mullvad's current docs. Two real patterns do exist:
-
-- **Per-server multihop**: `<location>-wg-socks5-<NNN>.relays.mullvad.net:1080`, e.g. `nl-ams-wg-socks5-001.relays.mullvad.net:1080`. One SOCKS5 endpoint per individual WireGuard relay. This is what the build plan was reaching for.
-- **Per-location terminal**: `<location-short>-wg.socks5.relays.mullvad.net:1080`, e.g. `nl1-wg.socks5.relays.mullvad.net:1080`. One SOCKS5 endpoint per city, behind their own load balancing.
-
-The relay API at `https://api.mullvad.net/public/relays/wireguard/v2/` returns relay hostnames shaped like `al-tia-wg-003`. The matching multihop SOCKS5 hostname is `al-tia-wg-socks5-003.relays.mullvad.net`. The transformation is: take the relay hostname, find the trailing `-<NNN>` segment, insert `-socks5` immediately before it.
-
-Tunnelsmith's per-host learning loop wants per-server granularity so that a flaky exit can be cooled down without taking out an entire city's pool. Per-server multihop is the right form.
-
-The relay API schema is also shaped differently than the plan suggested. It returns two top-level keys, `locations` and `wireguard.relays`. Country and city live under `locations[<location-code>]`, not inline on each relay. The parser has to join them.
+The original deployment plan said "use `socks5-{country}-{city}.relays.mullvad.net:1080` from inside the tunnel". That hostname pattern does not actually exist in production. Mullvad publishes one SOCKS5 server per WireGuard relay, addressed via per-server multihop: `{relay}-socks5-{number}.relays.mullvad.net:1080` where `{relay}-{number}` is the relay's WireGuard hostname.
 
 ### Decision
 
-1. The Mullvad pool expander uses the per-server multihop pattern: take each WireGuard relay's `hostname` from the API, run the transformation `^(.+-wg)-(\d+)$` -> `$1-socks5-$2`, suffix `.relays.mullvad.net:1080`.
-2. The parser joins `wireguard.relays[*].location` against the `locations` map so the in-memory `Relay` struct carries `hostname`, `country`, `city`, and `active`.
-3. Filters operate on the joined struct: country list is matched case-insensitively against the `country` field; the active flag drops `active=false` relays unless explicitly opted in.
-4. The build plan is edited in place to fix the hostname pattern and the parser checkbox.
+Tunnelsmith's `[[upstream_pool]] provider = "mullvad"` block fetches Mullvad's relay-list API, filters by country, and emits one synthetic `[[upstream]]` per active relay using the transformation `^(.+-wg)-(\d+)$` → `$1-socks5-$2.relays.mullvad.net:1080`. Operators name countries; the binary computes the rest.
+
+### Alternatives considered
+
+- Hand-curate a list of `socks5-{country}-{city}` hostnames. Rejected: the names do not exist.
+- Use `socks5.mullvad.net` (the single-server form). Rejected: it routes through one Sweden exit regardless of upstream choice, which defeats the per-host scoreboard's purpose.
 
 ### Consequences
 
-- The library is one transformation step more complex than "concatenate `<hostname>` and a suffix", but the transformation is deterministic and unit-testable.
-- If Mullvad changes the pattern again, the change is localized to one function in `internal/upstream/mullvad/`. The `WIREGUARD_PRIVATE_KEY` / `WIREGUARD_ADDRESSES` setup is unaffected.
-- The proposal's "Confirmed correct" entry that names `<server>-wg.socks5.relays.mullvad.net:1080` is superseded by this ADR.
-
-### References
-
-- https://mullvad.net/en/help/socks5-proxy
-- Live response from `https://api.mullvad.net/public/relays/wireguard/v2/` captured during Phase 6 kickoff (200 OK, 563 WG relays).
-
----
+- The relay list lives behind an HTTP fetch and a small cache. The cache survives a Mullvad API outage; the live fetch is the source of truth.
+- Per-server multihop carries a small extra latency cost vs. single-hop. The scoreboard's per-(host, upstream) scoring handles it transparently.
+- Per-server granularity is what makes "this relay works for this destination" a meaningful signal. The single-server form would erase that.
 
 ## ADR-005: Release-image verification runs in CI, not on the host
 
-**Date:** 2026-05-09
-**Status:** Accepted
-
 ### Context
 
-ADR-001 already pushed image build and run off the host onto CI. It left one open question for v1.0.0 (Phase 10): the build plan still required `docker pull ghcr.io/$GH_USER/tunnelsmith:v1.0.0`, the same pull for `:latest` (digest match), and `docker manifest inspect` for the multi-arch check, all on the host. Pull and inspect are read-only operations against an already-built image, so they sit in a grey area of the no-local-docker rule, but they still drag in a host Docker daemon for what is fundamentally a CI-side artifact check.
-
-The release workflow already builds and pushes the image to GHCR for `v*` tags. Adding a verify step to the same workflow keeps the entire release-time Docker surface in CI.
+We need to confirm that the image published to `ghcr.io/pacnpal/tunnelsmith:vN.M` runs, binds the listeners, exposes `/metrics`, and serves a CONNECT request. Running that check on a developer host requires Docker, network connectivity to GHCR, and a known port — friction every release.
 
 ### Decision
 
-1. The Phase 10 release-verify checkboxes move from the host into `.github/workflows/release.yml`. The job pulls `ghcr.io/<owner>/tunnelsmith:<tag>` after the push, runs `--version` from inside the published image, asserts the `:latest` digest matches the `:<tag>` digest, and asserts `docker manifest inspect` reports both `linux/amd64` and `linux/arm64`. CI failure fails the release.
-2. The build plan checkboxes are reworded to "the release.yml verify step succeeded for v1.0.0", proven by `gh run view` on the release workflow run.
-3. `docker manifest inspect` and `docker pull` against the published image are still allowed on the host for ad-hoc inspection. They are not part of any phase gate.
+A post-publish GHCR-verification job in the release workflow pulls the freshly-published manifest by digest, runs it with a minimal config, hits `/healthz` and `/metrics`, drives a CONNECT through it, and fails the release if any check fails. Developers running `make release-verify` get the same script but against `:dev`.
+
+### Alternatives considered
+
+- Skip the verification step. Rejected: a broken image stays published until a user reports it.
+- Run the verification before publishing. Rejected: the digest does not exist until after publish, and pinning by tag instead of digest opens the race window of a same-tag overwrite.
 
 ### Consequences
 
-- One workflow runs the entire release including verification. A failed verify fails the release rather than passing CI but failing on someone's laptop later.
-- The verify step adds ~30 seconds to the release workflow. Acceptable for a per-release operation that ships a public artifact.
-- ADR-001's note ("Release verification for v1.0.0 (Phase 10) still pulls from GHCR, which technically requires a local daemon. That is a release sanity check, not a build-time loop, and is fine to revisit when Phase 10 starts.") is now resolved by this ADR.
-
----
+- A bad release is caught by CI before any user pulls it. Job time adds ~90s.
+- The verification script is reused for the Mullvad-stack smoke check. One script, two call sites.
 
 ## ADR-006: HTTPS coverage uses cooperative app reporting, not TLS interception
 
-**Date:** 2026-05-09
-**Status:** Accepted
-
 ### Context
 
-Through Phase 10, Tunnelsmith inspects HTTP status codes and (Phase 8) response-body regexes only on the plain-HTTP forward path. CONNECT and SOCKS5 carry TLS payloads the proxy cannot decrypt, so the scoreboard learns nothing from HTTPS bodies and only sees dial-level signals (refused, timeout) for the majority of modern traffic.
-
-`docs/roadmap.md` listed "Transparent HTTPS interception" as a v2 candidate: terminate TLS at the proxy with a self-signed CA, mint per-host leaf certs on the fly, decrypt, run the existing body-regex inspector, re-originate TLS to the upstream. The cost is concrete and well-known: every client must trust the proxy's CA, anything pinned (banking SDKs, OS update channels, gRPC mTLS, ECH-using stacks) breaks, and the CA private key becomes a high-value secret on the host.
-
-The user-facing problem the interception was trying to solve — soft geo-blocks served over HTTPS as 200 with a "not available in your region" body — has another solution. The legitimate TLS endpoint already has the decrypted response in memory: it is the app. If the app reports the outcome out-of-band, Tunnelsmith gets richer signal than MITM could ever recover (semantic outcomes, not just regex matches) without touching the TLS.
-
-Tunnelsmith's deployment shape makes this practical. The user controls the apps that benefit from per-destination egress routing: containers in their own stack, sitting behind the proxy on a private network. Browsers and closed-source binaries are not the workload.
+The scoreboard's headline value is "learn which exit works for which destination". On plain HTTP that's automatic — the listener sees status codes and body bytes. On HTTPS via CONNECT and SOCKS5 it sees nothing past the handshake. A naive approach to recover HTTPS coverage is TLS interception (MITM): provision a CA, install it in every client, terminate TLS at Tunnelsmith, inspect the response, re-encrypt to the destination. That works for some closed environments but is poisonous for the project's user base (`*arr` apps, scrapers, etc.) because every app would need the CA in its trust store and every certificate-pinned destination would break.
 
 ### Decision
 
-1. v1 ships **cooperative outcome reporting** as the HTTPS coverage mechanism (Phase 11):
-   - Tunnelsmith adds `X-Tunnelsmith-Upstream: <id>` to the CONNECT 200 response so the client learns which exit served the request before the TLS handshake. (Already injected on plain-HTTP responses since Phase 5.)
-   - A new control listener (`internal/control`, default `:9092`) accepts `POST /v1/report` with a JSON object (`host`, `upstream`, `outcome`, optional `http_status`) and feeds the scoreboard via `RecordSuccess` or `RecordFailure`.
-   - Outcomes are a closed vocabulary mapped to existing `failure.Kind` values. Unknown outcomes return 400 so typos surface.
-   - A small Go SDK (`client/`) wraps `http.Transport` so a maintainer integrates in under 10 lines.
-   - The wire protocol is documented in `docs/cooperative-reporting.md` so non-Go apps can implement it in ~30 lines.
-2. v1 does **not** ship transparent HTTPS interception. The "Transparent HTTPS interception" item is removed from `docs/roadmap.md`'s v2-candidates list with a pointer to this ADR.
-3. The control listener trusts the network boundary, same as the UI listener (`docs/ui.md`). Bind defaults to `:9092`; operators run it on loopback or a private subnet. Bearer-token auth is deferred until a workload runs the listener on a public interface.
-4. No new `failure.Kind` is introduced. The outcome→Kind mapping table lives in `internal/control` and reuses `KindBodyMatch` for soft geo-blocks, `KindRateLimit` for app-detected 429-equivalents, and so on.
+Tunnelsmith does not intercept TLS. Instead, the Phase 11 control endpoint accepts cooperative reports: an app that already terminates TLS (because it is the legitimate endpoint) submits per-request outcomes via `POST /v1/report` and Tunnelsmith feeds them into the scoreboard exactly like a listener-detected status code. The Go SDK ships in this repo; the wire protocol is documented at `docs/cooperative-reporting.md` and any HTTP client in any language can speak it.
 
-### Non-goals (named explicitly so they do not become bugs)
+### Alternatives considered
 
-- **Browsers.** No JS access to CONNECT response headers and no general way to POST a report tied to a specific browser request without a privileged extension.
-- **Closed-source binaries.** Anything the operator cannot modify is also out of scope.
-- **Active health probing.** Still a v2 candidate.
-- **Idempotency / dedup of reports.** Apps that retry a report are penalized twice. Document it; let the app dedupe.
-- **SOCKS5 upstream discovery.** SOCKS5 has no header channel. v1 leaves it unaddressed; a future `/v1/upstreams?host=...` lookup endpoint is the obvious add.
+- TLS interception with a Tunnelsmith CA. Rejected: cert pinning incompatibility, install ceremony, security stance — the project is "a smart proxy", not "a MITM tool".
+- Sniff TCP-level metrics (RTT, retransmits) and infer outcome. Rejected: too noisy, and CONNECT semantics hide most of the useful signal anyway.
+- Run the proxy as an HTTPS forward proxy (no CONNECT) and have apps trust Tunnelsmith's cert. Rejected: every HTTPS client would need explicit configuration to trust a non-public CA, and the cert-pinning issue is unchanged.
 
 ### Consequences
 
-- HTTPS soft geo-blocks become first-class once the maintainer integrates. Signal quality exceeds what MITM could recover (semantic outcomes vs. byte-level regex on a buffered prefix).
-- The CA-on-the-clients deployment story disappears entirely. Pinned clients keep working unmodified.
-- The proxy's security stance does not escalate. No private key on disk worth more than the existing config.
-- Coverage is bounded by integration. Maintainers who do nothing get the existing dial-level signals. The integration guide (`docs/integration-guide.md`) makes the cost visible: ≤10 lines for Go, ~30 lines for any other language.
-- The Phase 8 body-regex path keeps working unchanged; cooperative reporting is additive, not a replacement for the plain-HTTP inspector.
-- Reports are not idempotent (see Non-goals). When an app retries a report — for example, after a transient control-endpoint failure — the scoreboard records the same penalty twice, which can compound an upstream's score and produce false-negative health signals that misroute subsequent traffic. Apps that care about this either deduplicate on their side or accept the over-penalty as a cost of the at-least-once delivery model.
-- If a future workload demands coverage of uninstrumented HTTPS clients, MITM can be revisited then with the v2-candidate text from `docs/roadmap.md` (now removed) preserved in this ADR's history.
-
-### References
-
-- `docs/cooperative-reporting.md` — the wire-protocol contract maintainers integrate against.
-- `docs/integration-guide.md` — Level 8 walks through the integration.
-- Go `net/http.Transport.OnProxyConnectResponse` (stable since Go 1.20) — how Go clients read the upstream id from the CONNECT 200 response.
-
----
+- App maintainers who want HTTPS coverage do three lines of integration work or speak the wire protocol directly. That's the price of correctness.
+- The control listener is a new attack surface (Phase 11). The default is "no auth" because the trust boundary is the network; Phase 12 adds opt-in bearer tokens.
+- HTTPS without app integration still works — the proxy still routes traffic correctly. It just doesn't learn from per-request outcome past TCP success.
 
 ## ADR-007: Bearer-token auth on the control endpoint (Phase 12)
 
-**Date:** 2026-05-09
-**Status:** Accepted (Phase 12 implementation landed 2026-05-10).
-
 ### Context
-
-ADR-006 ships the cooperative-reporting endpoint (`POST /v1/report` on `internal/control`, default `:9092`) with the same trust stance as the UI listener: no auth, network boundary is the control. The trade-off was explicit and documented in `docs/cooperative-reporting.md`.
-
-That stance fails in two real cases:
-
-1. **Multi-tenant Docker networks.** Multiple distinct apps on the same network can all reach `:9092`. Any one of them can submit reports attributed to any upstream id, polluting the scoreboard for the others.
-2. **Operators who deliberately reach `:9092` from elsewhere on a LAN.** Network-boundary trust dissolves the moment the listener is reachable from a host the operator does not also control.
 
 Phase 11 named "bearer-token auth as a follow-up" in the trade-offs section. Phase 12 ships it.
 
@@ -267,3 +171,63 @@ The design space was small. Bearer is the simplest credible primitive: stateless
 - `docs/roadmap.md` — planned follow-up tracking for Phase 12.
 - ADR-006 — the Phase 11 decision this builds on.
 - RFC 6750 — Bearer Token usage in HTTP Authorization headers.
+
+## ADR-008: `[[upstream_pool]]` providers are pluggable via a registry, with an optional vendor-API surface
+
+### Context
+
+Tunnelsmith's first release shipped one provider, Mullvad, hard-coded into `cmd/tunnelsmith` via a `switch block.Provider { case "mullvad": ... }`. Adding a second provider (Webshare) under that shape would mean editing `cmd/tunnelsmith/main.go`, `internal/config/config.go`'s enum, and growing the validation switch — and the next provider after Webshare would mean the same edits again. The fan-out is small per change but the call graph keeps `cmd/` coupled to every provider's wire details, which makes both code review and forks-with-additional-providers harder than necessary.
+
+Three forces are in tension:
+
+1. **Closed set, in-binary providers.** Every provider must ship in the Tunnelsmith binary at build time. Out-of-process providers (gRPC, plugin sockets) would require multi-process orchestration we explicitly don't want.
+2. **Different vendors expose different surfaces.** Mullvad has nothing operator-callable — its API is a public read-only relay list. Webshare has paginated lists *plus* an on-demand refresh endpoint operators legitimately want to script. Future providers will have different shapes again (per-IP replacement, profile/subscription).
+3. **Fork-and-PR contributions are a first-class workflow.** Users who already pay for a vendor like Bright Data or IPRoyal should be able to ship support in their own fork, gather feedback, and propose the package upstream without rewriting half of the binary.
+
+### Decision
+
+Introduce three small interfaces in `internal/upstream/provider`:
+
+- `Expander` (`Snapshot` + `RunRefresh`) — the shape every provider has, owns the "fan out to `[]config.UpstreamConfig`" path.
+- `API` (`RefreshProxyList` for v1; growable) — the optional vendor-API surface. Providers without one return `provider.ErrAPINotSupported` from `Provider.BuildAPI`.
+- `Provider` (`Name` + `ValidateConfig` + `BuildExpander` + `BuildAPI`) — the registry entry; one per supported vendor.
+
+Plus a package-global `Registry`. Each provider package's `init()` calls `provider.MustRegister(NewProvider())`. The aggregator package `internal/upstream/providers` blank-imports every supported provider and binds `config.SetProviderValidator` so `config.Validate` defers per-block validation to the provider's own rules.
+
+The control listener gains two routes:
+
+- `GET /v1/providers` — lists every registered binding plus whether it has an API.
+- `POST /v1/providers/{id_prefix}/refresh` — calls into `provider.API.RefreshProxyList`. Returns 501 for providers whose `BuildAPI` returned `ErrAPINotSupported`.
+
+`cmd/tunnelsmith` no longer references any concrete provider type. Adding a new provider is a new package plus one blank-import line in `internal/upstream/providers`.
+
+### Alternatives considered
+
+- **Plugin sockets / RPC providers.** Rejected. Multi-process orchestration adds a runtime dependency, complicates failure modes (one process crashed; the other is fine), and doesn't fit the binary-distribution model.
+- **Go `plugin` package.** Rejected. Only works on Linux/macOS, hostile to cross-platform builds, the symbol-resolution and version-skew issues are well-documented disasters.
+- **A `ProviderKind` enum in `config/`.** Rejected. That was what we had — every new provider means editing the enum, the validation switch, and `cmd/tunnelsmith`. Three files per provider when one would do.
+- **One mega-interface containing every possible vendor call.** Rejected. Mullvad would have to stub out a dozen methods, and the interface would churn every time a new vendor capability was added. The current `API` interface starts at one method and grows by adding methods explicitly (with the same `ErrAPINotSupported` escape hatch).
+
+### Non-goals (named explicitly)
+
+- **Hot-loaded providers.** A provider that wasn't compiled into the binary cannot run. The fork-and-PR workflow is the supported way to add one.
+- **Dynamic provider registration over the network.** The control endpoint surfaces what was registered at startup. There is no `POST /v1/providers/register`.
+- **Per-provider config schema generation.** TOML's static shape is shared across all providers. Provider-specific fields live on `UpstreamPoolConfig` and each provider's `ValidateConfig` decides whether the fields it cares about are well-formed.
+- **TLS termination on the provider routes.** Shares the same network-boundary stance as ADR-007 — bind to loopback or a private subnet until the control listener gains native TLS.
+
+### Consequences
+
+- Adding a new provider is a single new package plus one blank import line. No `cmd/tunnelsmith` edits. No `config/` enum edits.
+- Operators in multi-tenant deployments can rotate Webshare IPs (or any future provider's equivalent) through the control endpoint without shelling into the container or signaling the process.
+- Providers without a vendor API surface (Mullvad) are first-class: `GET /v1/providers` reports `has_api: false`, the refresh route returns 501, and nothing about config or runtime behavior changes.
+- `UpstreamConfig` grows two fields (`Username`, `Password`) to carry Webshare's per-proxy credentials. Mullvad expansion leaves them empty and the http/socks5 dialers no-op the auth path when username is `""`, so the change is transparent for the Mullvad deployment.
+- The CHANGELOG growth pattern shifts: instead of "Phase N: new provider", new providers land under "Providers: added X" entries that don't need to coordinate with other phase work.
+
+### References
+
+- `internal/upstream/provider/provider.go` — interface definitions.
+- `internal/upstream/provider/registry.go` — registry implementation.
+- `internal/upstream/providers/providers.go` — aggregator + config validator hook.
+- `internal/control/providers.go` — `GET /v1/providers` and `POST /v1/providers/{id_prefix}/refresh`.
+- `docs/providers.md` — the adapter-author guide for fork + PR.
+- `docs/control-api.md` — the route reference.

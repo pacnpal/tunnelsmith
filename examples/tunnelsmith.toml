@@ -121,6 +121,54 @@ kind     = "http"
 addr     = "gluetun-proton-nl:8888"
 priority = 30
 
+# Per-upstream auth (username/password) authenticates against the
+# upstream proxy. For kind = "http" the dialer sends
+# Proxy-Authorization: Basic base64(user:pass) per RFC 7617 on every
+# CONNECT. For kind = "socks5" the SOCKS5 user/password auth method is
+# offered. The Webshare expander populates these automatically; an
+# operator can also set them on a hand-written [[upstream]].
+# [[upstream]]
+# id       = "auth-required-proxy"
+# kind     = "http"
+# addr     = "proxy.example.com:8888"
+# username = "alice"
+# password = "secret"
+
+# --------------------------------------------------------------------
+# [[upstream_pool]] blocks expand at startup into one or more
+# synthetic [[upstream]] entries through a registered provider. Two
+# providers ship in-tree: "mullvad" (public WireGuard relay list) and
+# "webshare" (token-authenticated REST API). Adding a third is a
+# fork+PR away — see docs/providers.md.
+# --------------------------------------------------------------------
+
+# Mullvad: fans the configured display-name countries out into one
+# SOCKS5 upstream per active WireGuard relay. Runs inside a gluetun
+# WireGuard tunnel.
+# [[upstream_pool]]
+# provider   = "mullvad"
+# id_prefix  = "mvd"
+# priority   = 200
+# countries  = ["Sweden", "Netherlands", "Switzerland"]
+# refresh    = "12h"
+# cache_path = "/data/tunnelsmith/mullvad-cache.json"
+
+# Webshare: paginated proxy list, per-proxy Basic auth, optional
+# on-demand IP rotation through the control endpoint (see
+# docs/control-api.md). Country filter uses ISO 3166-1 alpha-2 codes
+# (this is country_codes, not countries — Mullvad's display names
+# would not match Webshare's API).
+# [[upstream_pool]]
+# provider       = "webshare"
+# id_prefix      = "ws"
+# priority       = 110
+# api_token_file = "/etc/tunnelsmith/webshare.token"
+# mode           = "direct"   # or "backbone" for plan.pool_filter = "residential"
+# kind           = "http"     # or "socks5"
+# country_codes  = ["US", "GB", "DE"]
+# refresh        = "1h"
+# cache_path     = "/data/tunnelsmith/webshare-cache.json"
+
 # --------------------------------------------------------------------
 # Failure detection. Phase 4 starts using these to penalize upstreams.
 # --------------------------------------------------------------------

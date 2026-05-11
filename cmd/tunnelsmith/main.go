@@ -30,7 +30,8 @@ import (
 	"github.com/pacnpal/tunnelsmith/internal/scoreboard"
 	"github.com/pacnpal/tunnelsmith/internal/ui"
 	"github.com/pacnpal/tunnelsmith/internal/upstream"
-	"github.com/pacnpal/tunnelsmith/internal/upstream/mullvad"
+	"github.com/pacnpal/tunnelsmith/internal/upstream/provider"
+	_ "github.com/pacnpal/tunnelsmith/internal/upstream/providers" // wires every supported [[upstream_pool]] provider into the registry and installs config.SetProviderValidator
 )
 
 var (
@@ -240,6 +241,7 @@ func run(args []string, stdout, stderr *os.File) error {
 		controlSrv = control.NewServer(cfg.Control.Bind, sb, metricsRegistry, control.ServerOptions{
 			Tokens:      initialTokens,
 			GateHealthz: cfg.Control.GateHealthz,
+			Providers:   buildProviderRegistry(poolBlocks),
 		}, logger)
 	}
 
@@ -633,25 +635,31 @@ func (c *poolComposer) Update(idPrefix string, next []config.UpstreamConfig) (bo
 
 // poolBlock carries the live state for one [[upstream_pool]] block so a
 // poolComposer can drive its refresh ticker and hot-swap the running
-// priority pool when the expansion changes. The expander instance is
-// kept for its RunRefresh loop; the initial expansion seeds the diff
-// comparison and is also returned to the caller for the startup pool.
+// priority pool when the expansion changes. The expander is kept for
+// its RunRefresh loop; the initial expansion seeds the diff comparison
+// and is also returned to the caller for the startup pool. The api
+// pointer is non-nil only when the provider exposed one (Mullvad has
+// no vendor API, so its api is nil).
 type poolBlock struct {
 	idPrefix string
-	exp      *mullvad.Expander
+	provider string
+	exp      provider.Expander
+	api      provider.API // nil when the provider returned ErrAPINotSupported
 	initial  []config.UpstreamConfig
 	logger   *slog.Logger
 }
 
 // expandUpstreamPools turns each [[upstream_pool]] block into a slice of
-// synthetic upstream entries by calling the relevant provider's expander.
-// Only "mullvad" is implemented for Phase 6.
+// synthetic upstream entries by calling the configured provider's
+// expander. The provider is resolved through the registry built by
+// internal/upstream/providers's init() functions; an unknown provider
+// is rejected here even though config.Validate already covers the case.
 //
 // Returns the resolved initial upstream list (used once at startup to
 // build the priority pool) and a parallel slice of *poolBlock values
-// the caller wires into a poolComposer to drive refresh-tick hot-swaps
-// (Phase 11.1). Order in both return values matches the declaration
-// order of [[upstream_pool]] in the config.
+// the caller wires into a poolComposer to drive refresh-tick hot-swaps.
+// Order in both return values matches the declaration order of
+// [[upstream_pool]] in the config.
 //
 // Failures during the initial expansion are fatal at startup so the
 // operator notices a broken upstream_pool before traffic is sent.
@@ -659,43 +667,60 @@ func expandUpstreamPools(ctx context.Context, blocks []config.UpstreamPoolConfig
 	var out []config.UpstreamConfig
 	var poolBlocks []*poolBlock
 	for i, block := range blocks {
-		switch block.Provider {
-		case config.UpstreamPoolMullvad:
-			pb, err := expandMullvadPool(ctx, block, logger)
-			if err != nil {
-				return nil, nil, fmt.Errorf("upstream_pool[%d] (id_prefix=%q): %w", i, block.IDPrefix, err)
-			}
-			logger.Info("upstream_pool expanded",
-				"id_prefix", block.IDPrefix,
-				"provider", block.Provider,
-				"countries", block.Countries,
-				"upstreams", len(pb.initial),
-			)
-			out = append(out, pb.initial...)
-			poolBlocks = append(poolBlocks, pb)
-		default:
-			return nil, nil, fmt.Errorf("upstream_pool[%d]: provider %q is not implemented", i, block.Provider)
+		pb, err := expandPool(ctx, block, logger)
+		if err != nil {
+			return nil, nil, fmt.Errorf("upstream_pool[%d] (id_prefix=%q): %w", i, block.IDPrefix, err)
 		}
+		logger.Info("upstream_pool expanded",
+			"id_prefix", block.IDPrefix,
+			"provider", block.Provider,
+			"upstreams", len(pb.initial),
+			"has_api", pb.api != nil,
+		)
+		out = append(out, pb.initial...)
+		poolBlocks = append(poolBlocks, pb)
 	}
 	return out, poolBlocks, nil
 }
 
-func expandMullvadPool(ctx context.Context, block config.UpstreamPoolConfig, logger *slog.Logger) (*poolBlock, error) {
-	expLogger := logger.With("component", "mullvad-expander", "id_prefix", block.IDPrefix)
-	client := mullvad.NewClient()
-	client.Logger = expLogger
-	if block.CachePath != "" {
-		client.Cache = &mullvad.Cache{Path: block.CachePath}
+// buildProviderRegistry turns the startup poolBlocks into the binding
+// slice the control listener serves under /v1/providers. Blocks whose
+// provider has no API still appear (with HasAPI=false) so an operator
+// running GET /v1/providers can confirm the block is wired even though
+// refresh would return 501.
+//
+// Returns nil when there are no [[upstream_pool]] blocks at all. The
+// control listener leaves /v1/providers and /v1/providers/{x}/refresh
+// unmounted in that case, preserving the original wire shape (404 on
+// those paths) for deployments that don't use the feature.
+func buildProviderRegistry(blocks []*poolBlock) *control.ProviderRegistry {
+	if len(blocks) == 0 {
+		return nil
 	}
-	exp, err := mullvad.NewExpander(mullvad.ExpanderConfig{
-		IDPrefix:        block.IDPrefix,
-		Priority:        block.PriorityValue(),
-		Countries:       block.Countries,
-		IncludeInactive: block.IncludeInactive,
-		Refresh:         block.RefreshDuration(),
-	}, client, expLogger)
+	bindings := make([]control.ProviderAPIBinding, 0, len(blocks))
+	for _, b := range blocks {
+		bindings = append(bindings, control.ProviderAPIBinding{
+			IDPrefix: b.idPrefix,
+			Provider: b.provider,
+			API:      b.api,
+		})
+	}
+	return control.NewProviderRegistry(bindings)
+}
+
+func expandPool(ctx context.Context, block config.UpstreamPoolConfig, logger *slog.Logger) (*poolBlock, error) {
+	prov, ok := provider.Default().Lookup(string(block.Provider))
+	if !ok {
+		return nil, fmt.Errorf("provider %q is not registered (built-in providers: %v)", block.Provider, provider.Default().Names())
+	}
+	expLogger := logger.With("provider", block.Provider, "id_prefix", block.IDPrefix)
+	exp, err := prov.BuildExpander(block, expLogger)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("build expander: %w", err)
+	}
+	api, apiErr := prov.BuildAPI(block, expLogger)
+	if apiErr != nil && !errors.Is(apiErr, provider.ErrAPINotSupported) {
+		return nil, fmt.Errorf("build api: %w", apiErr)
 	}
 	initial, err := exp.Snapshot(ctx)
 	if err != nil {
@@ -703,7 +728,9 @@ func expandMullvadPool(ctx context.Context, block config.UpstreamPoolConfig, log
 	}
 	return &poolBlock{
 		idPrefix: block.IDPrefix,
+		provider: string(block.Provider),
 		exp:      exp,
+		api:      api,
 		initial:  initial,
 		logger:   expLogger,
 	}, nil
