@@ -150,6 +150,50 @@ deploy/
 
 Users who want VPN routing get a known-good baseline they can adapt.
 
+Use these composition rules so your example is copy/paste-safe:
+
+1. **Keep the app service unchanged except proxy wiring.** Your "with-tunnelsmith" variant should only change network/proxy settings and add the Tunnelsmith stack.
+2. **Ship both topologies and label them clearly.**
+   - Docker DNS topology (`HTTP_PROXY=http://tunnelsmith:8080`) when app and tunnelsmith are separate services on the same bridge network.
+   - Shared netns topology (`network_mode: "service:tunnelsmith"` + `HTTP_PROXY=http://localhost:8080`) when all app traffic must traverse the VPN namespace.
+3. **Document where app ports live.** In shared netns mode, app `ports:` belong on the shared service (`tunnelsmith` or VPN parent), not the app service.
+4. **Pin image tags in docs.** Prefer semver tags in published examples so users get reproducible behavior.
+5. **Include a one-command verification step.** Example: call `https://am.i.mullvad.net/json` and show expected `"mullvad_exit_ip": true`.
+
+Example "with-tunnelsmith" compose variant maintainers can adapt:
+
+```yaml
+services:
+  gluetun:
+    image: qmcgaw/gluetun:v3.41.1
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      VPN_SERVICE_PROVIDER: mullvad
+      VPN_TYPE: wireguard
+      WIREGUARD_PRIVATE_KEY: ${MULLVAD_WIREGUARD_PRIVATE_KEY}
+      WIREGUARD_ADDRESSES: ${MULLVAD_WIREGUARD_ADDRESSES}
+    ports:
+      - "8080:8080" # tunnelsmith proxy
+      - "7878:7878" # app UI port (shared netns => publish here)
+
+  tunnelsmith:
+    image: ghcr.io/pacnpal/tunnelsmith:1.1.0
+    network_mode: "service:gluetun"
+    volumes:
+      - ./tunnelsmith.mullvad.toml:/etc/tunnelsmith/config.toml:ro
+    command: ["--config=/etc/tunnelsmith/config.toml"]
+
+  myapp:
+    image: example/myapp:1.2.3
+    network_mode: "service:gluetun"
+    environment:
+      HTTP_PROXY: "http://localhost:8080"
+      HTTPS_PROXY: "http://localhost:8080"
+      NO_PROXY: "localhost,127.0.0.1,*.internal"
+```
+
 ## Level 8: report HTTPS outcomes back to Tunnelsmith (Phase 11)
 
 Tunnelsmith cannot inspect HTTPS responses; the proxy carries TLS bytes blindly. Your app *can* see those responses — it terminates the TLS, so the cleartext is right there. The cooperative reporting protocol lets your app submit per-request outcomes back to Tunnelsmith so the scoreboard learns from HTTPS the same way it does from plain HTTP. This is the difference between "Tunnelsmith only sees dial failures on HTTPS" and "Tunnelsmith fully understands which exits are working for which destinations".
@@ -235,3 +279,16 @@ myapp:
 - Set `NO_PROXY` to include a known-internal hostname; verify that traffic skips Tunnelsmith (check Tunnelsmith logs for absence).
 - Configure a fake destination that returns 429 with `Retry-After: 5`; verify your app gets either a transparent retry success (Tunnelsmith handled it) or sees the 429 and respects `Retry-After` itself (HTTPS case or cascade).
 - The `/metrics` endpoint (default `:9090`) exposes per-upstream counters. Watch `tunnelsmith_dial_attempts_total{upstream_id=...,outcome=...}` and `tunnelsmith_request_outcomes_total{outcome=...}` increment as your app makes requests; see [observability.md](observability.md) for the full metric reference.
+
+## Maintainer documentation checklist (what to publish for users)
+
+When you add Tunnelsmith support to your container image, publish these items in your own docs/README:
+
+1. **Feature statement:** "This image supports outbound proxying via `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`."
+2. **Topology choice:** one short section for Docker DNS mode and one for shared-netns mode, including which proxy URL to use in each (`tunnelsmith:8080` vs `localhost:8080`).
+3. **Complete compose example:** a full, runnable file (not snippets only) including your app + tunnelsmith (+ VPN sidecar if used).
+4. **User-configurable knobs:** env vars, config path, and where to place secrets (`.env`, Docker secrets, etc.).
+5. **Verification command:** one command users can run to confirm traffic actually routes through the intended exit.
+6. **Known pitfalls:** include at least `NO_PROXY`, shared-netns port publishing, and HTTPS status visibility limits without cooperative reporting.
+
+Treat this checklist as the minimum bar for "official Tunnelsmith support" documentation.
