@@ -178,7 +178,7 @@ services:
       # default (empty auth_tokens set = permit all).  Do NOT publish 9092 to
       # untrusted networks without setting [control].auth_tokens or
       # auth_tokens_file in your config.  Remove the line below if you don't
-      # need external cooperative-reporting.
+      # need external cooperative reporting.
       - "9092:9092"   # Cooperative-reporting control endpoint
     volumes:
       - ./config.toml:/etc/tunnelsmith/config.toml:ro
@@ -296,7 +296,7 @@ force     = true   # do not fall back to other upstreams on failure
 Sending `SIGHUP` applies a subset of config changes in place without a restart:
 
 **Hot-reloadable on SIGHUP:**
-- All `[failure.scoring]` knobs (penalties, cooldowns, score cap, probe chance, `decay_step`, cascade TTL, `debounce_window`, `prune_after`, body-match knobs) — **except `decay_interval`**, which requires restart (see below)
+- All `[failure.scoring]` configuration options — **except `decay_interval`**, which requires restart (see below)
 - `[[failure.status]]` codes and per-code penalty/cooldown
 - `failure.connection_refused`, `failure.body_buffer_kb`
 - `failure.max_retries_per_request` — hot-reloads for the HTTP forward-proxy path; when `[[upstream_pool]]` is in play the pool is not rebuilt on SIGHUP, so CONNECT/SOCKS retry behavior requires a restart
