@@ -11,6 +11,7 @@ package upstream
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"net"
 	"net/http"
@@ -84,20 +85,36 @@ func (u *directUpstream) Dial(ctx context.Context, network, addr string) (net.Co
 // upstream, sends a CONNECT request for the destination host:port, and
 // returns the conn once the proxy answers 2xx. After that the conn is a
 // raw byte tunnel.
+//
+// When username is non-empty the CONNECT request carries
+// Proxy-Authorization: Basic <base64(user:pass)> per RFC 7617. The header
+// is pre-encoded once at construction so each dial avoids the allocation.
 type httpUpstream struct {
-	id      string
-	addr    string
-	dialer  *net.Dialer
-	timeout time.Duration
+	id        string
+	addr      string
+	authValue string // empty disables proxy auth
+	dialer    *net.Dialer
+	timeout   time.Duration
 }
 
 func newHTTP(cfg config.UpstreamConfig, timeout time.Duration) *httpUpstream {
 	return &httpUpstream{
-		id:      cfg.ID,
-		addr:    cfg.Addr,
-		dialer:  &net.Dialer{Timeout: timeout},
-		timeout: timeout,
+		id:        cfg.ID,
+		addr:      cfg.Addr,
+		authValue: basicAuthHeader(cfg.Username, cfg.Password),
+		dialer:    &net.Dialer{Timeout: timeout},
+		timeout:   timeout,
 	}
+}
+
+// basicAuthHeader returns the Proxy-Authorization value for the given
+// credentials or "" when no username was configured. The "Basic " prefix
+// is included so callers can set the header verbatim.
+func basicAuthHeader(user, pass string) string {
+	if user == "" {
+		return ""
+	}
+	return "Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+pass))
 }
 
 func (u *httpUpstream) ID() string                { return u.id }
@@ -124,6 +141,9 @@ func (u *httpUpstream) Dial(ctx context.Context, network, addr string) (net.Conn
 		URL:    &url.URL{Host: addr},
 		Host:   addr,
 		Header: make(http.Header),
+	}
+	if u.authValue != "" {
+		req.Header.Set("Proxy-Authorization", u.authValue)
 	}
 	if err := req.Write(conn); err != nil {
 		_ = conn.Close()
@@ -165,7 +185,11 @@ type socks5Upstream struct {
 
 func newSOCKS5(cfg config.UpstreamConfig, timeout time.Duration) (*socks5Upstream, error) {
 	base := &net.Dialer{Timeout: timeout}
-	d, err := proxy.SOCKS5("tcp", cfg.Addr, nil, base)
+	var auth *proxy.Auth
+	if cfg.Username != "" {
+		auth = &proxy.Auth{User: cfg.Username, Password: cfg.Password}
+	}
+	d, err := proxy.SOCKS5("tcp", cfg.Addr, auth, base)
 	if err != nil {
 		return nil, fmt.Errorf("upstream %q: build socks5 dialer: %w", cfg.ID, err)
 	}

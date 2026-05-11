@@ -76,6 +76,11 @@ type ServerOptions struct {
 	// GateHealthz pulls /healthz under the auth gate when Tokens is
 	// also non-empty. Default false keeps liveness probes ungated.
 	GateHealthz bool
+	// Providers is the optional registry of vendor-API bindings used by
+	// GET /v1/providers and POST /v1/providers/{id_prefix}/refresh. nil
+	// disables the routes entirely (Phase 11/12 wire shape stays
+	// byte-for-byte identical for operators not using the feature).
+	Providers *ProviderRegistry
 }
 
 // NewServer builds a control HTTP server that serves on addr. backend is
@@ -91,6 +96,9 @@ func NewServer(addr string, backend Backend, metrics MetricsSink, opts ServerOpt
 	tokens := NewTokenSet(opts.Tokens)
 	mux := http.NewServeMux()
 	mountHandlers(mux, backend, metrics, tokens, opts.GateHealthz, logger)
+	if opts.Providers != nil {
+		mountProvidersHandlers(mux, opts.Providers, tokens, logger)
+	}
 	return &Server{
 		addr:   addr,
 		logger: logger,

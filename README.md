@@ -311,6 +311,17 @@ Sending `SIGHUP` applies a subset of config changes in place without a restart:
 - `[[upstream_pool]]` blocks — the entire block configuration (provider, countries, refresh schedule, `id_prefix`, `priority`, `include_inactive`, `cache_path`, etc.) is captured at boot; SIGHUP will not apply edits to these fields (the block shape is restart-frozen). The refresh ticker continues to hot-swap pool expansions at runtime (e.g., relay churn), but that is independent of SIGHUP.
 - `failure.scoring.decay_interval` — the decay ticker is started once at boot; changing this field requires a restart to retune the goroutine's interval
 
+## Supported `[[upstream_pool]]` providers
+
+Tunnelsmith ships two built-in providers; adding a third is one new package and one blank import — see [`docs/providers.md`](docs/providers.md#adding-a-new-provider) for the adapter-author guide.
+
+| Provider          | What it expands into                              | Vendor API       | Notes |
+|-------------------|---------------------------------------------------|------------------|-------|
+| `mullvad`         | one SOCKS5 upstream per active WireGuard relay    | none             | public relay list; runs inside a gluetun WireGuard tunnel |
+| `webshare`        | one HTTP/SOCKS5 upstream per Webshare proxy       | yes (refresh)    | per-proxy Basic auth threaded through automatically; rotate IPs on demand via `POST /v1/providers/{id_prefix}/refresh` |
+
+The control endpoint's provider routes (`GET /v1/providers`, `POST /v1/providers/{id_prefix}/refresh`) are documented in [`docs/control-api.md`](docs/control-api.md). They share the same opt-in bearer-token gate as `POST /v1/report`.
+
 ## Use with Mullvad
 
 Tunnelsmith ships a reference deployment at [`deploy/docker-compose.mullvad.yml`](deploy/docker-compose.mullvad.yml) that runs gluetun in WireGuard mode against your Mullvad account, plus tunnelsmith joining the same network namespace. A single `[[upstream_pool]]` block in the config fans out into one synthetic socks5 upstream per active Mullvad WireGuard relay in the countries you list. The scoreboard then learns per-host which relay works best. As of v1.1.0, relay-list churn is handled via hot-swap — no restart needed when Mullvad rotates relays.
@@ -387,6 +398,8 @@ Operators in multi-tenant or LAN-exposed deployments can opt into Phase 12 beare
 - [`docs/request-lifecycle.md`](docs/request-lifecycle.md): end-to-end trace of a single request
 - [`docs/integration-guide.md`](docs/integration-guide.md): for container maintainers adding Tunnelsmith support
 - [`docs/cooperative-reporting.md`](docs/cooperative-reporting.md): wire protocol for app-driven outcome reporting and the Phase 12 bearer-token auth section
+- [`docs/providers.md`](docs/providers.md): the `[[upstream_pool]]` provider abstraction, the in-tree Mullvad and Webshare providers, and the adapter-author guide for submitting a new provider via fork + PR
+- [`docs/control-api.md`](docs/control-api.md): `GET /v1/providers` and `POST /v1/providers/{id_prefix}/refresh`
 - [`docs/roadmap.md`](docs/roadmap.md): what's deliberately out of scope for v1 and what's tracked for v2
 - [`docs/decisions.md`](docs/decisions.md): architecture decision records
 

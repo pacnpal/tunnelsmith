@@ -1,6 +1,11 @@
 # Deployment
 
-This page is the operator-facing guide for running Tunnelsmith in front of a Mullvad VPN account using `docker compose`. The file `deploy/docker-compose.mullvad.yml` is the reference stack; this page explains why it looks the way it does, how to fill in the secrets, and what to check when something goes wrong.
+This page is the operator-facing guide for running Tunnelsmith in production.
+
+- The headline reference stack is **Mullvad over WireGuard via gluetun** — covered in full below.
+- Tunnelsmith also ships an out-of-the-box **Webshare** provider (paginated HTTP proxies, per-proxy Basic auth, on-demand IP rotation via the control endpoint) — covered in [Use with Webshare](#use-with-webshare) at the bottom of this page.
+
+The two providers are not mutually exclusive: a single `[[upstream_pool]]` config can mix Mullvad and Webshare blocks, and the scoreboard learns per-host which exit works best across all of them.
 
 The companion ADRs are:
 
@@ -130,9 +135,106 @@ docker compose -f deploy/docker-compose.mullvad.yml restart tunnelsmith
 
 If the mismatch persists, file an issue with `mullvad_exit_ip_hostname` from the curl output included.
 
+## Use with Webshare
+
+Webshare is a residential / shared-pool proxy provider with a REST API. The Webshare provider expands a single `[[upstream_pool]]` block into one upstream per proxy in your plan, threading the per-proxy username and password into the HTTP CONNECT (or SOCKS5) handshake automatically.
+
+### Quick start
+
+**1. Get a Webshare API token.** Log into your Webshare dashboard → API → create or copy your token.
+
+**2. Drop the token onto the host** so Tunnelsmith can mount it read-only:
+
+```sh
+sudo install -m 0600 -o root -g root /dev/stdin /etc/tunnelsmith/webshare.token <<'EOF'
+your-api-token-here
+EOF
+```
+
+**3. Configure the pool block.** Drop this into your Tunnelsmith config:
+
+```toml
+[control]
+bind        = ":9092"
+auth_tokens = ["pick-a-shared-secret"]
+
+[[upstream_pool]]
+provider       = "webshare"
+id_prefix      = "ws"
+priority       = 110
+api_token_file = "/etc/tunnelsmith/webshare.token"
+mode           = "direct"
+kind           = "http"
+country_codes  = ["US", "GB", "DE"]
+refresh        = "1h"
+cache_path     = "/data/tunnelsmith/webshare-cache.json"
+```
+
+`api_token_file` is preferred over inline `api_token` because the inline form is visible in `--print-config`. The `cache_path` lets the binary keep serving from the last-known-good proxy list when Webshare's API is briefly unreachable.
+
+**4. Run Tunnelsmith.** Same image, same listeners — Webshare expansion is a config-only change on top of the standard deployment.
+
+```sh
+docker run -d \
+    --name tunnelsmith \
+    -p 8080:8080 -p 1080:1080 -p 9092:9092 \
+    -v $(pwd)/config.toml:/etc/tunnelsmith/config.toml:ro \
+    -v /etc/tunnelsmith/webshare.token:/etc/tunnelsmith/webshare.token:ro \
+    -v tunnelsmith-data:/data/tunnelsmith \
+    ghcr.io/pacnpal/tunnelsmith:latest \
+    --config /etc/tunnelsmith/config.toml
+```
+
+**5. Confirm the pool expanded.** The startup log should include a line like:
+
+```json
+{"msg":"upstream_pool expanded","id_prefix":"ws","provider":"webshare","upstreams":42,"has_api":true}
+```
+
+`has_api: true` means the control endpoint can rotate IPs on demand:
+
+```sh
+curl -X POST \
+    -H "Authorization: Bearer pick-a-shared-secret" \
+    http://localhost:9092/v1/providers/ws/refresh
+# {"id_prefix":"ws","provider":"webshare","status":"accepted"}
+```
+
+The new list lands on the next refresh tick (or sooner if a tick is in flight). See [`docs/control-api.md`](control-api.md) for the full route reference.
+
+### Notes
+
+- **Mode.** `mode = "direct"` is the default and returns per-proxy IP:port entries. `mode = "backbone"` routes through `p.webshare.io` (required if your plan's `pool_filter` is `residential`).
+- **Country filter.** Webshare's API filters by ISO 3166-1 alpha-2 codes — `"US"`, not `"USA"` and not `"United States"`. The provider rejects a `countries` (Mullvad-style) field at config-load time so the typo is caught immediately.
+- **Kind.** `kind = "http"` (default) authenticates with `Proxy-Authorization: Basic` per RFC 7617. `kind = "socks5"` uses SOCKS5 user/pass auth instead.
+- **Rate limits.** Webshare answers `429 Too Many Requests` when you call `/proxy/list/refresh/` more often than your plan allows. The control route surfaces this as `502 Bad Gateway` with the upstream error message preserved verbatim.
+
+### Combining with Mullvad
+
+A single config can run both providers; the scoreboard learns per-host which works best:
+
+```toml
+[[upstream_pool]]
+provider       = "mullvad"
+id_prefix      = "mvd"
+priority       = 200
+countries      = ["Sweden", "Netherlands"]
+
+[[upstream_pool]]
+provider       = "webshare"
+id_prefix      = "ws"
+priority       = 110
+api_token_file = "/etc/tunnelsmith/webshare.token"
+country_codes  = ["US", "GB", "DE"]
+```
+
+The lower `priority` value on the Webshare block means Webshare upstreams are tried first; Mullvad is the fallback when Webshare returns a soft block or the host is poisoned for every Webshare IP. Flip the priorities to invert that preference.
+
 ## Where to look next
 
 - [`docs/configuration.md`](configuration.md) - every TOML key, default, and what it does.
+- [`docs/providers.md`](providers.md) - the provider abstraction reference and the adapter-author guide.
+- [`docs/control-api.md`](control-api.md) - `GET /v1/providers` and `POST /v1/providers/{id_prefix}/refresh`.
 - [`docs/request-lifecycle.md`](request-lifecycle.md) - end-to-end trace of a single request through Tunnelsmith.
 - [`docs/integration-guide.md`](integration-guide.md) - for maintainers of other containers who want to add Tunnelsmith support.
 - [`docs/architecture.md`](architecture.md) - scoring, cooldowns, decay, probing, cascade.

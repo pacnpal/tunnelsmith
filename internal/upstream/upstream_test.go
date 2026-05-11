@@ -262,6 +262,103 @@ func TestHTTPUpstreamCONNECTSuccess(t *testing.T) {
 	}
 }
 
+// TestHTTPUpstreamCONNECTSendsProxyAuthorization wires Username/Password
+// into a synthetic UpstreamConfig and asserts the CONNECT line carries a
+// Proxy-Authorization: Basic header per RFC 7617. Without this guard the
+// Webshare expansion would build upstreams that handshake but never
+// authenticate — the listener would see 407 Proxy Authentication Required
+// without a clear cause.
+func TestHTTPUpstreamCONNECTSendsProxyAuthorization(t *testing.T) {
+	t.Parallel()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	headerCh := make(chan string, 1)
+	go func() {
+		c, err := l.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = c.Close() }()
+		br := bufio.NewReader(c)
+		req, err := http.ReadRequest(br)
+		if err != nil {
+			headerCh <- ""
+			return
+		}
+		headerCh <- req.Header.Get("Proxy-Authorization")
+		_, _ = c.Write([]byte("HTTP/1.1 407 Proxy Authentication Required\r\n\r\n"))
+	}()
+
+	up, err := upstream.New(config.UpstreamConfig{
+		ID: "h", Kind: config.KindHTTP, Addr: l.Addr().String(),
+		Username: "u", Password: "p",
+	}, 2*time.Second)
+	if err != nil {
+		t.Fatalf("New http: %v", err)
+	}
+	_, _ = up.Dial(context.Background(), "tcp", "example.com:443")
+
+	select {
+	case got := <-headerCh:
+		// "Basic dTpw" is base64("u:p"). Asserting the exact value
+		// rather than just non-empty catches a future regression where
+		// the encoding picks up stray padding or a missing colon.
+		const want = "Basic dTpw"
+		if got != want {
+			t.Fatalf("Proxy-Authorization = %q, want %q", got, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for CONNECT request")
+	}
+}
+
+// TestHTTPUpstreamCONNECTOmitsAuthWhenUnset confirms an upstream without
+// Username sends no Proxy-Authorization header. Otherwise an open Mullvad
+// SOCKS5 (no auth) would be hit with a stray empty Basic header that some
+// strict proxies reject.
+func TestHTTPUpstreamCONNECTOmitsAuthWhenUnset(t *testing.T) {
+	t.Parallel()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	headerCh := make(chan string, 1)
+	go func() {
+		c, err := l.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = c.Close() }()
+		br := bufio.NewReader(c)
+		req, err := http.ReadRequest(br)
+		if err != nil {
+			headerCh <- "<read-err>"
+			return
+		}
+		headerCh <- req.Header.Get("Proxy-Authorization")
+		_, _ = c.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
+	}()
+	up, err := upstream.New(config.UpstreamConfig{
+		ID: "h", Kind: config.KindHTTP, Addr: l.Addr().String(),
+	}, 2*time.Second)
+	if err != nil {
+		t.Fatalf("New http: %v", err)
+	}
+	_, _ = up.Dial(context.Background(), "tcp", "example.com:443")
+	select {
+	case got := <-headerCh:
+		if got != "" {
+			t.Fatalf("Proxy-Authorization = %q, want empty", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for CONNECT request")
+	}
+}
+
 func TestHTTPUpstreamCONNECTNon2xx(t *testing.T) {
 	t.Parallel()
 

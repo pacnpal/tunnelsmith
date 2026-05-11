@@ -46,6 +46,26 @@ var (
 	_ encoding.TextMarshaler   = Duration(0)
 )
 
+// providerValidator is the hook that lets internal/upstream/provider
+// inject registry-driven validation without the config package needing
+// to import upstream/provider (which would form a cycle). SetProviderValidator
+// is called from a tiny adapter in cmd/tunnelsmith (or in tests) so the
+// concrete provider set is bound at link time.
+//
+// Nil means "no extra validation": Validate accepts any non-empty provider
+// string. cmd/tunnelsmith always sets a non-nil validator before calling
+// config.Load, so the only case where this is nil at runtime is unit tests
+// that exercise config.Validate in isolation.
+var providerValidator func(UpstreamPoolConfig) error
+
+// SetProviderValidator installs the registry-backed pool validator. Call
+// once at program start (cmd/tunnelsmith does this in main via the
+// configadapter sub-package). Passing nil disables provider-specific
+// validation.
+func SetProviderValidator(fn func(UpstreamPoolConfig) error) {
+	providerValidator = fn
+}
+
 // UpstreamKind enumerates the supported upstream egress mechanisms.
 type UpstreamKind string
 
@@ -152,11 +172,20 @@ type ControlConfig struct {
 // zero, kept as-is so the user can elect 0 as the highest-priority slot).
 // After Parse, Priority is always non-nil; downstream code can dereference
 // without a nil check.
+//
+// Username and Password authenticate to the upstream proxy (HTTP CONNECT
+// Proxy-Authorization: Basic, SOCKS5 user/pass). Both empty means no
+// auth, matching every upstream Mullvad expands to (Mullvad's SOCKS5 is
+// open inside the WireGuard tunnel). Webshare-expanded upstreams carry
+// per-proxy credentials so the http/socks5 dialer can authenticate. The
+// pair is read-only after Parse / pool expansion.
 type UpstreamConfig struct {
 	ID       string       `toml:"id"`
 	Kind     UpstreamKind `toml:"kind"`
 	Addr     string       `toml:"addr"`
 	Priority *int         `toml:"priority,omitempty"` // default: 100
+	Username string       `toml:"username,omitempty"`
+	Password string       `toml:"password,omitempty"`
 }
 
 // PriorityValue returns the resolved priority. After Parse the field is
@@ -169,18 +198,41 @@ func (u UpstreamConfig) PriorityValue() int {
 	return *u.Priority
 }
 
-// UpstreamPoolKind enumerates the providers an [[upstream_pool]] block can
-// expand. Only "mullvad" is implemented in Phase 6.
+// UpstreamPoolKind names the [[upstream_pool]].provider value. The set
+// of accepted values is the union of every provider registered into
+// internal/upstream/provider at init() time, so adding a new provider
+// is a single-file change.
+//
+// UpstreamPoolMullvad is the historical constant; new code should use
+// the provider's package-level Name constant directly.
 type UpstreamPoolKind string
 
-const (
-	UpstreamPoolMullvad UpstreamPoolKind = "mullvad"
-)
+// UpstreamPoolMullvad is retained for backwards compatibility with code
+// that referenced the original enum. New providers do not get a constant
+// here; reference their own package-level Name instead.
+const UpstreamPoolMullvad UpstreamPoolKind = "mullvad"
 
 // UpstreamPoolConfig declares a synthetic group of upstreams the binary
-// will expand at startup. Phase 6 only knows how to expand provider
-// "mullvad", which fans the configured countries out into one socks5
-// upstream per active Mullvad WireGuard relay (see ADR-004).
+// will expand at startup. The provider field selects which adapter
+// expands the block; provider-specific fields are validated by that
+// adapter's ValidateConfig.
+//
+// Provider-agnostic fields:
+//   - Provider: registry key (e.g., "mullvad", "webshare")
+//   - IDPrefix: prepended to every expanded upstream id
+//   - Priority: priority of every expanded upstream (default 200)
+//   - Refresh: how often the expander re-fetches (default 12h)
+//   - CachePath: persistence path for offline fallback
+//
+// Provider-specific fields. Each provider documents which subset it
+// honors; the rest are ignored:
+//   - Countries: human-readable list (Mullvad uses display names like "Sweden")
+//   - CountryCodes: ISO 3166-1 alpha-2 list (Webshare uses "SE", "NL")
+//   - IncludeInactive: forwarded to providers that distinguish active relays
+//   - APIToken / APITokenFile: vendor-API credential (Webshare, future providers)
+//   - PlanID: vendor plan/subscription scope (Webshare)
+//   - Mode: provider-specific routing flavor ("direct" | "backbone" for Webshare)
+//   - Kind: upstream kind to materialise as ("http" or "socks5"); default "http"
 //
 // Priority and Refresh use *int / *Duration sentinels so applyDefaults
 // can tell "field omitted" from "user wrote 0" / "user wrote 0s". After
@@ -189,10 +241,17 @@ type UpstreamPoolConfig struct {
 	Provider        UpstreamPoolKind `toml:"provider"`
 	IDPrefix        string           `toml:"id_prefix"`
 	Priority        *int             `toml:"priority,omitempty"` // default: 200
-	Countries       []string         `toml:"countries"`          // required, non-empty
+	Countries       []string         `toml:"countries"`          // Mullvad: required
+	CountryCodes    []string         `toml:"country_codes"`      // Webshare: ISO 3166-1 alpha-2
 	IncludeInactive bool             `toml:"include_inactive"`   // default: false
 	Refresh         *Duration        `toml:"refresh,omitempty"`  // default: 12h
 	CachePath       string           `toml:"cache_path"`         // default: "" (no cache)
+
+	APIToken     string `toml:"api_token,omitempty"`
+	APITokenFile string `toml:"api_token_file,omitempty"`
+	PlanID       string `toml:"plan_id,omitempty"`
+	Mode         string `toml:"mode,omitempty"`
+	Kind         string `toml:"kind,omitempty"` // "http" or "socks5"; default per provider
 }
 
 // PriorityValue returns the resolved priority for the synthetic upstreams
@@ -605,12 +664,19 @@ func (c *Config) Validate() error {
 	seenPoolPrefixes := make(map[string]int, len(c.UpstreamPools))
 	for i, p := range c.UpstreamPools {
 		idx := fmt.Sprintf("upstream_pool[%d]", i)
-		switch p.Provider {
-		case UpstreamPoolMullvad:
-		case "":
+		// Provider lookup runs against the registry so a typo
+		// ("mullvads") fails fast with the list of names the binary
+		// was built with. ProviderValidator is package-injected by
+		// SetProviderValidator at init time so the config package can
+		// remain free of upstream/provider imports (and the import
+		// cycle that would create).
+		switch {
+		case p.Provider == "":
 			errs = append(errs, fmt.Errorf("%s: provider is required", idx))
-		default:
-			errs = append(errs, fmt.Errorf("%s: provider %q is not supported (only %q in this version)", idx, p.Provider, UpstreamPoolMullvad))
+		case providerValidator != nil:
+			if err := providerValidator(p); err != nil {
+				errs = append(errs, fmt.Errorf("%s (id_prefix=%q): %w", idx, p.IDPrefix, err))
+			}
 		}
 		if p.IDPrefix == "" {
 			errs = append(errs, fmt.Errorf("%s: id_prefix is required", idx))
@@ -619,18 +685,10 @@ func (c *Config) Validate() error {
 		} else {
 			seenPoolPrefixes[p.IDPrefix] = i
 		}
-		if len(p.Countries) == 0 {
-			errs = append(errs, fmt.Errorf("%s (id_prefix=%q): countries must list at least one country", idx, p.IDPrefix))
-		}
-		for j, c := range p.Countries {
-			if strings.TrimSpace(c) == "" {
-				errs = append(errs, fmt.Errorf("%s (id_prefix=%q): countries[%d] is empty or whitespace", idx, p.IDPrefix, j))
-			}
-		}
 		// refresh = "0s" is allowed and means "disable periodic refresh"
 		// (the expander's RunRefresh exits immediately when Refresh <= 0).
 		// Any positive value below the 1m floor is almost certainly a typo
-		// that would hammer Mullvad's public relay API, so reject those.
+		// that would hammer the upstream vendor's API, so reject those.
 		// Negative values are nonsensical for an interval.
 		if p.Refresh != nil {
 			d := p.Refresh.Duration()
@@ -642,6 +700,9 @@ func (c *Config) Validate() error {
 		}
 		if p.CachePath != "" && !filepath.IsAbs(p.CachePath) {
 			errs = append(errs, fmt.Errorf("%s (id_prefix=%q): cache_path %q must be an absolute path", idx, p.IDPrefix, p.CachePath))
+		}
+		if p.APITokenFile != "" && !filepath.IsAbs(p.APITokenFile) {
+			errs = append(errs, fmt.Errorf("%s (id_prefix=%q): api_token_file %q must be an absolute path", idx, p.IDPrefix, p.APITokenFile))
 		}
 	}
 

@@ -2,12 +2,45 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+// TestMain installs a test-only ProviderValidator that mirrors the
+// rules the in-tree mullvad and webshare providers enforce in
+// production via internal/upstream/providers. The config package can't
+// import internal/upstream/providers without a cycle (providers imports
+// config to set the hook), so the test recreates the minimum set of
+// rules the test cases below assert against. Keeping this here lets
+// config tests run as a leaf node of the dependency tree.
+func TestMain(m *testing.M) {
+	SetProviderValidator(func(cfg UpstreamPoolConfig) error {
+		switch cfg.Provider {
+		case "mullvad":
+			if len(cfg.Countries) == 0 {
+				return fmt.Errorf("mullvad: countries must list at least one country")
+			}
+			for i, c := range cfg.Countries {
+				if strings.TrimSpace(c) == "" {
+					return fmt.Errorf("mullvad: countries[%d] is empty or whitespace", i)
+				}
+			}
+			return nil
+		case "webshare":
+			if cfg.APIToken == "" && cfg.APITokenFile == "" {
+				return fmt.Errorf("webshare: one of api_token or api_token_file is required")
+			}
+			return nil
+		default:
+			return fmt.Errorf("provider %q is not supported", cfg.Provider)
+		}
+	})
+	os.Exit(m.Run())
+}
 
 const validConfig = `
 [listener]
