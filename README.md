@@ -7,7 +7,7 @@
 
 A per-destination egress router for HTTP and SOCKS5. Picks the right exit for each URL based on what is actually working.
 
-> **Status: v1.1.0.** v1.0.0 shipped the per-host scoreboard, Mullvad pool integration, web UI, metrics, and Phase 11 cooperative outcome reporting. v1.1.0 adds Phase 11.1 (hot-swap of the running `[[upstream_pool]]` on Mullvad relay churn) and Phase 12 (opt-in bearer-token auth on the cooperative-reporting endpoint). See [`CHANGELOG.md`](CHANGELOG.md) for the full release notes.
+> **Status: v1.2.0.** v1.0.0 shipped the per-host scoreboard, Mullvad pool integration, web UI, metrics, and Phase 11 cooperative outcome reporting; v1.1.0 added Phase 11.1 (hot-swap of the running `[[upstream_pool]]` on Mullvad relay churn) and Phase 12 (opt-in bearer-token auth on the control endpoint). v1.2.0 adds Phase 13 (pluggable `[[upstream_pool]]` providers plus a first-class Webshare adapter, with two new bearer-gated control routes for vendor-side proxy-list refresh) and Phase 14 (opt-in TLS on the control listener, closing the plaintext-token risk ADR-007 named in its Non-goals). See [`CHANGELOG.md`](CHANGELOG.md) for the full release notes.
 
 ## What it does
 
