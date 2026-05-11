@@ -30,7 +30,7 @@ docker pull ghcr.io/pacnpal/tunnelsmith:1.1.0
 docker run --rm ghcr.io/pacnpal/tunnelsmith:1.1.0 --version
 ```
 
-Image tags omit the leading `v` that git tags carry (so git tag `v1.1.0` → image tag `1.1.0`). `:latest` is **not** published by the release workflow; always pin to a semver tag.
+Image tags omit the leading `v` that git tags carry (so git tag `v1.1.0` → image tag `1.1.0`). `:latest` is **not** published by the release workflow; always pin to a semver tag. Replace `1.1.0` with the desired version from the [releases page](https://github.com/pacnpal/tunnelsmith/releases).
 
 The image is built from [`Dockerfile`](Dockerfile) using a distroless base (`gcr.io/distroless/static-debian12:nonroot`) and runs as a non-root user. The Dockerfile `EXPOSE`s ports `8080` (HTTP CONNECT), `1080` (SOCKS5), `9090` (metrics), and `9091` (web UI). The control endpoint on `:9092` is enabled by default but not in the `EXPOSE` list; publish it explicitly when you need it (`-p 9092:9092`).
 
