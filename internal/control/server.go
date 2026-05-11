@@ -45,6 +45,7 @@ package control
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -114,18 +115,29 @@ func NewServer(addr string, backend Backend, metrics MetricsSink, opts ServerOpt
 	if opts.Providers != nil {
 		mountProvidersHandlers(mux, opts.Providers, tokens, logger)
 	}
+	httpSrv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	if opts.TLSCertFile != "" && opts.TLSKeyFile != "" {
+		// Pin the minimum TLS version explicitly rather than
+		// relying on whatever the stdlib default happens to be.
+		// Go's default is TLS 1.2+ today, but the listener's
+		// policy is operator-facing; encoding it here keeps the
+		// contract immune to a future stdlib default flip.
+		httpSrv.TLSConfig = &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		}
+	}
 	return &Server{
 		addr:        addr,
 		logger:      logger,
 		tokens:      tokens,
 		tlsCertFile: opts.TLSCertFile,
 		tlsKeyFile:  opts.TLSKeyFile,
-		srv: &http.Server{
-			Addr:              addr,
-			Handler:           mux,
-			ReadHeaderTimeout: 10 * time.Second,
-		},
-		ready: make(chan struct{}),
+		srv:         httpSrv,
+		ready:       make(chan struct{}),
 	}
 }
 
@@ -166,10 +178,20 @@ func (s *Server) Addr() net.Addr {
 // Serve binds the listener and blocks until Shutdown is called. When
 // TLSCertFile and TLSKeyFile were set in ServerOptions the listener
 // terminates TLS via http.Server.ServeTLS using the configured PEM
-// files; otherwise plain HTTP. config.Validate has already enforced
-// the both-or-neither invariant on the cert/key pair, so the
-// TLSEnabled() check below is reliable.
+// files; otherwise plain HTTP. config.Validate enforces the
+// both-or-neither invariant on the cert/key pair, but NewServer is
+// also callable from tests and any future internal package that
+// bypasses config.Validate. Fail fast here so a half-configured
+// ServerOptions can never silently downgrade an intended-TLS
+// listener to plaintext.
 func (s *Server) Serve(_ context.Context) error {
+	if (s.tlsCertFile == "") != (s.tlsKeyFile == "") {
+		err := fmt.Errorf("control serve: tls_cert_file and tls_key_file must be both set or both empty (got cert=%q, key=%q)",
+			s.tlsCertFile, s.tlsKeyFile)
+		s.bindErr = err
+		close(s.ready)
+		return err
+	}
 	l, err := net.Listen("tcp", s.addr)
 	if err != nil {
 		s.bindErr = fmt.Errorf("control listen %s: %w", s.addr, err)

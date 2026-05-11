@@ -204,6 +204,46 @@ func TestServePlaintextWhenTLSUnset(t *testing.T) {
 	}
 }
 
+// TestServeHalfConfiguredTLSFails pins the defense-in-depth check
+// inside Serve: a ServerOptions with cert-without-key (or vice
+// versa) returns an explicit error rather than silently falling
+// back to plaintext on a listener the operator intended to be TLS.
+// config.Validate already enforces this at config-load for
+// cmd/tunnelsmith, but NewServer is callable from tests and any
+// future internal package; the Serve-side guard makes the contract
+// the same regardless of entry point.
+func TestServeHalfConfiguredTLSFails(t *testing.T) {
+	cases := []struct {
+		name string
+		cert string
+		key  string
+	}{
+		{"cert without key", "/etc/cert.pem", ""},
+		{"key without cert", "", "/etc/key.pem"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := NewServer("127.0.0.1:0", &fakeBackend{}, nil, ServerOptions{
+				TLSCertFile: tc.cert,
+				TLSKeyFile:  tc.key,
+			}, quietControlLogger())
+			serveErr := make(chan error, 1)
+			go func() { serveErr <- srv.Serve(context.Background()) }()
+			select {
+			case err := <-serveErr:
+				if err == nil {
+					t.Fatal("expected Serve to reject half-configured TLS, got nil")
+				}
+				if !containsAny(err.Error(), []string{"tls_cert_file", "tls_key_file"}) {
+					t.Fatalf("err = %v, want one mentioning the cert/key pair", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("Serve did not return for half-configured TLS")
+			}
+		})
+	}
+}
+
 // TestServeTLSBadCertFails surfaces the failure mode where the
 // operator points cert/key at a path that doesn't exist (or contains
 // garbage). ServeTLS returns the error from the goroutine; Serve
