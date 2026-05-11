@@ -63,7 +63,7 @@ Other useful Make targets:
 
 ### Running the binary
 
-The binary starts five listeners by default: HTTP CONNECT and forward proxy on `:8080`, SOCKS5 on `:1080`, Prometheus metrics on `:9090`, web UI on `:9091`, and the cooperative-reporting control endpoint on `:9092`. Set any of those to `""` in the config to disable the corresponding listener. You need a TOML config file with at least one `[[upstream]]`.
+The binary starts five listeners by default: HTTP CONNECT and forward proxy on `:8080`, SOCKS5 on `:1080`, Prometheus metrics on `:9090`, web UI on `:9091`, and the cooperative-reporting control endpoint on `:9092`. The optional listeners (`[metrics].bind`, `[ui].bind`, `[control].bind`) can be disabled by setting them to `""` in the config; `[listener].http` and `[listener].socks` require valid host:port values and cannot be disabled. You need a TOML config file with at least one `[[upstream]]` or `[[upstream_pool]]` block.
 
 The minimal config below sends everything out the host's default route (`direct`). Copy it into a file, then start the binary:
 
@@ -188,6 +188,12 @@ services:
       TUNNELSMITH_LOG_LEVEL: info
 
 volumes:
+  # The image runs as a non-root user (UID/GID 65532).  Docker creates named
+  # volumes owned by root, so the first run will fail to write the scoreboard
+  # snapshot unless you pre-create the volume directory and chown it:
+  #   docker run --rm -v tunnelsmith-data:/data/tunnelsmith alpine \
+  #     chown -R 65532:65532 /data/tunnelsmith
+  # Alternatively use a host bind-mount and chown the host directory.
   tunnelsmith-data:
 ```
 
@@ -291,7 +297,8 @@ Sending `SIGHUP` applies a subset of config changes in place without a restart:
 **Hot-reloadable on SIGHUP:**
 - `[failure.scoring]` knobs: penalties, cooldowns, score cap, probe chance, `decay_step`, cascade TTL
 - `[[failure.status]]` codes and per-code penalty/cooldown
-- `failure.connection_refused`, `failure.max_retries_per_request`, `failure.body_buffer_kb`
+- `failure.connection_refused`, `failure.body_buffer_kb`
+- `failure.max_retries_per_request` — hot-reloads for the HTTP forward-proxy path; when `[[upstream_pool]]` is in play the pool is not rebuilt on SIGHUP, so CONNECT/SOCKS retry behaviour requires a restart
 - `[[rule]]` blocks (host routing overrides and body-regex patterns)
 - `[control].auth_tokens` and `[control].auth_tokens_file` (bearer-token rotation)
 - Static `[[upstream]]` list — only when no `[[upstream_pool]]` blocks are in play in either the running or new config
