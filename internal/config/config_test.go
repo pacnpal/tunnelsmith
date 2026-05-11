@@ -705,6 +705,38 @@ countries = ["Sweden"]
 			contains: "id_prefix is required",
 		},
 		{
+			name: "upstream_pool id_prefix with slash",
+			toml: `
+[[upstream_pool]]
+provider  = "mullvad"
+id_prefix = "mvd/foo"
+countries = ["Sweden"]
+`,
+			// Slash would break /v1/providers/{id_prefix}/refresh
+			// routing and split the prefix across path segments.
+			contains: "id_prefix",
+		},
+		{
+			name: "upstream_pool id_prefix with whitespace",
+			toml: `
+[[upstream_pool]]
+provider  = "mullvad"
+id_prefix = "mvd prefix"
+countries = ["Sweden"]
+`,
+			contains: "id_prefix",
+		},
+		{
+			name: "upstream_pool id_prefix with shell metacharacter",
+			toml: `
+[[upstream_pool]]
+provider  = "mullvad"
+id_prefix = "mvd$evil"
+countries = ["Sweden"]
+`,
+			contains: "id_prefix",
+		},
+		{
 			name: "upstream_pool empty countries",
 			toml: `
 [[upstream_pool]]

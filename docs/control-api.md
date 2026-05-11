@@ -87,7 +87,7 @@ Error responses:
 | `405`  | Wrong method (only `POST` is accepted). | `Allow: POST`; plain text |
 | `429`  | The vendor signaled rate-limited (Webshare answers 429 when on-demand refreshes exceed plan quota). Operators should back off before retrying. | JSON refresh-error envelope |
 | `501`  | Pool block exists, but the provider has no `API` surface (e.g. `provider = "mullvad"`). | JSON refresh-error envelope |
-| `502`  | The vendor's API returned a non-rate-limit error (e.g. Webshare 403 when `on_demand_refreshes_available` is zero). | JSON refresh-error envelope; error message preserved verbatim from the vendor |
+| `502`  | The vendor's API returned a non-rate-limit error (e.g. Webshare 403 when `on_demand_refreshes_available` is zero). | JSON refresh-error envelope with a sanitised category string (see table below); the full vendor-side chain lives in the operator log only |
 | `504`  | The vendor's API did not respond within the 30-second per-request timeout. | JSON refresh-error envelope |
 
 The refresh-error envelope:

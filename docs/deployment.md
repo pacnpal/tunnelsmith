@@ -207,7 +207,7 @@ The new list lands on the next refresh tick (or sooner if a tick is in flight). 
 - **Mode.** `mode = "direct"` is the default and returns per-proxy IP:port entries. `mode = "backbone"` routes through `p.webshare.io` (required if your plan's `pool_filter` is `residential`).
 - **Country filter.** Webshare's API filters by ISO 3166-1 alpha-2 codes — `"US"`, not `"USA"` and not `"United States"`. The provider rejects a `countries` (Mullvad-style) field at config-load time so the typo is caught immediately.
 - **Kind.** `kind = "http"` (default) authenticates with `Proxy-Authorization: Basic` per RFC 7617. `kind = "socks5"` uses SOCKS5 user/pass auth instead.
-- **Rate limits.** Webshare answers `429 Too Many Requests` when you call `/proxy/list/refresh/` more often than your plan allows. The control route surfaces this as `502 Bad Gateway` with the upstream error message preserved verbatim.
+- **Rate limits.** Webshare answers `429 Too Many Requests` when you call `/proxy/list/refresh/` more often than your plan allows. Tunnelsmith wraps the vendor error with `provider.ErrAPIRateLimited`, so the control route surfaces it as `429` with a sanitised `"vendor rate limited"` category in the JSON body. The full vendor-side error chain stays in the operator log. See [`docs/control-api.md`](control-api.md) for the full status / category table.
 
 ### Combining with Mullvad
 

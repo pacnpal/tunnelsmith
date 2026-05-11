@@ -68,6 +68,11 @@ func SetProviderValidator(fn func(UpstreamPoolConfig) error) {
 	providerValidator = fn
 }
 
+// idPrefixRe constrains [[upstream_pool]].id_prefix to a URL-safe and
+// metrics-safe charset. Length is bounded so a typo cannot produce a
+// huge label value either.
+var idPrefixRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
 // UpstreamKind enumerates the supported upstream egress mechanisms.
 type UpstreamKind string
 
@@ -682,6 +687,16 @@ func (c *Config) Validate() error {
 		}
 		if p.IDPrefix == "" {
 			errs = append(errs, fmt.Errorf("%s: id_prefix is required", idx))
+		} else if !idPrefixRe.MatchString(p.IDPrefix) {
+			// id_prefix is used both as a synthetic upstream-id prefix
+			// AND as a URL path segment in the control endpoint route
+			// POST /v1/providers/{id_prefix}/refresh. Anything outside
+			// [A-Za-z0-9_-] would either make the route unreachable (a
+			// slash splits the path), or land in a metrics label that
+			// some scrape tools refuse to parse. Catch the typo at
+			// config-load so the operator sees it once, not on every
+			// scrape after they restart.
+			errs = append(errs, fmt.Errorf("%s: id_prefix %q must match %s (alphanumeric, hyphen, underscore — used as URL path segment and metrics label)", idx, p.IDPrefix, idPrefixRe.String()))
 		} else if prev, ok := seenPoolPrefixes[p.IDPrefix]; ok {
 			errs = append(errs, fmt.Errorf("%s: duplicate id_prefix %q (also at upstream_pool[%d])", idx, p.IDPrefix, prev))
 		} else {
