@@ -113,6 +113,8 @@ Validation:
 - `kind = "http"` and `kind = "socks5"` require `addr` to parse as `host:port` with a non-empty host and a port in `1-65535`.
 - `username` / `password` are emitted by the Webshare expander automatically; an operator hand-writing an `[[upstream]]` may also set them to authenticate against any auth-required HTTP CONNECT or SOCKS5 proxy.
 
+> **Credential note.** `username` and `password` are stored in the TOML file in plaintext and re-printed verbatim by `tunnelsmith --print-config`. Treat the config file as a secret: keep it out of version control, restrict its mode to `0o600`, and prefer mounting it from a secret store (Docker secrets, Kubernetes `Secret`, etc.) rather than baking credentials into a committed file. For the Webshare provider the recommended pattern is `api_token_file` (which the expander reads once at startup) — see [`[[upstream_pool]]`](#upstream_pool) below.
+
 ## `[[upstream_pool]]`
 
 `[[upstream_pool]]` expands at startup into one or more synthetic `[[upstream]]` entries through a registered provider. Tunnelsmith ships with two providers out of the box:

@@ -51,7 +51,11 @@ func (p *Provider) BuildExpander(cfg config.UpstreamPoolConfig, logger *slog.Log
 	if logger == nil {
 		logger = slog.Default()
 	}
-	expLogger := logger.With("component", "mullvad-expander", "id_prefix", cfg.IDPrefix)
+	// Caller's logger is expected to already carry provider /
+	// id_prefix context (cmd/tunnelsmith threads those at the
+	// expandPool layer). Add only the component tag here so the
+	// id_prefix attribute doesn't double-up in structured logs.
+	expLogger := logger.With("component", "mullvad-expander")
 	client := NewClient()
 	client.Logger = expLogger
 	if cfg.CachePath != "" {

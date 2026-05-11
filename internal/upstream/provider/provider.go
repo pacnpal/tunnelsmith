@@ -21,7 +21,7 @@
 //     a vendor REST API the operator can poke (force a list refresh,
 //     check profile/subscription). Providers like Mullvad have nothing
 //     to expose here and return ErrAPINotSupported. The control listener
-//     surfaces this through POST /v1/providers/{name}/refresh.
+//     surfaces this through POST /v1/providers/{id_prefix}/refresh.
 //
 // The Mullvad expander predates this abstraction; mullvad.Provider adapts
 // the existing shape so behavior is unchanged. New providers should
@@ -39,7 +39,7 @@ import (
 // ErrAPINotSupported is returned by Provider.BuildAPI for providers that
 // have no vendor API to expose (currently mullvad). The control listener
 // translates this into 501 Not Implemented on
-// POST /v1/providers/{name}/refresh.
+// POST /v1/providers/{id_prefix}/refresh.
 var ErrAPINotSupported = errors.New("provider: vendor API not supported")
 
 // ErrAPIRateLimited is the cross-provider sentinel a provider's API

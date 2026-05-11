@@ -196,8 +196,12 @@ docker run -d \
 `has_api: true` means the control endpoint can rotate IPs on demand:
 
 ```sh
+# Read the token from the same source the binary uses rather than
+# pasting it into shell history; export to env first so the curl
+# line stays secret-free.
+export TUNNELSMITH_CONTROL_TOKEN="pick-a-shared-secret"
 curl -X POST \
-    -H "Authorization: Bearer pick-a-shared-secret" \
+    -H "Authorization: Bearer ${TUNNELSMITH_CONTROL_TOKEN}" \
     http://localhost:9092/v1/providers/ws/refresh
 # {"id_prefix":"ws","provider":"webshare","status":"accepted"}
 ```

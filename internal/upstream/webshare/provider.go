@@ -107,7 +107,10 @@ func (p *Provider) BuildExpander(cfg config.UpstreamPoolConfig, logger *slog.Log
 	if logger == nil {
 		logger = slog.Default()
 	}
-	logger = logger.With("component", "webshare-expander", "id_prefix", cfg.IDPrefix)
+	// Caller's logger already carries provider / id_prefix
+	// context (cmd/tunnelsmith threads those at expandPool). Add
+	// only the component tag here so id_prefix doesn't double-up.
+	logger = logger.With("component", "webshare-expander")
 	client, err := buildClient(cfg, logger)
 	if err != nil {
 		return nil, err
@@ -136,7 +139,9 @@ func (p *Provider) BuildAPI(cfg config.UpstreamPoolConfig, logger *slog.Logger) 
 	if logger == nil {
 		logger = slog.Default()
 	}
-	logger = logger.With("component", "webshare-api", "id_prefix", cfg.IDPrefix)
+	// Caller already carries provider / id_prefix context; see the
+	// note in BuildExpander above.
+	logger = logger.With("component", "webshare-api")
 	client, err := buildClient(cfg, logger)
 	if err != nil {
 		return nil, err

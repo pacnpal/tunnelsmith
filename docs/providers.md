@@ -93,7 +93,7 @@ You will work entirely on your fork until the final PR step.
 mkdir -p internal/upstream/<name>
 ```
 
-Use lowercase, ASCII-only, no whitespace. The directory name **must** match the `Name()` return value below.
+Use lowercase, ASCII-only, no whitespace. By convention the directory name **should** match the provider's `Name()` return value below; nothing in the registry enforces this (lookup is keyed off the `Name()` string), but matching keeps `grep` and import paths predictable for reviewers and operators.
 
 A minimal provider needs four files:
 
