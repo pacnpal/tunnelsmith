@@ -13,7 +13,7 @@ These are incremental fixes against the v1 surface and may land in a v1.x point 
 
 Designs that have been locked in but not yet implemented. Each has an ADR in `docs/decisions.md`.
 
-- **Phase 12: bearer-token auth on the control endpoint.** Optional bearer tokens for `POST /v1/report` so operators in multi-tenant deployments or LAN-exposed setups can gate reporting. Tokens defined inline or in a hot-reloadable file; constant-time compare; new metrics reject reasons. See [ADR-007](decisions.md).
+- ~~**Phase 12: bearer-token auth on the control endpoint.**~~ Shipped in [#27](https://github.com/pacnpal/tunnelsmith/pull/27). `[control].auth_tokens` (inline) and `[control].auth_tokens_file` (one token per line, `#` comments, dedup'd union) configure an opt-in token set; empty set keeps the Phase 11 wire shape byte-for-byte. `POST /v1/report` (and `/healthz` when `[control].gate_healthz = true`) require `Authorization: Bearer <token>`; 401 responses include `WWW-Authenticate: Bearer realm="tunnelsmith"` plus RFC 6750 §3 `Cache-Control: no-store` / `Pragma: no-cache`. Auth check uses `crypto/subtle.ConstantTimeCompare` over a per-request `TokenSnapshot` so SIGHUP rotation can't tear an in-flight decision. New `tunnelsmith_reports_rejected_total{reason}` labels: `auth_missing` and `auth_failed`. Go SDK gained `client.Options.Token`. See [ADR-007](decisions.md).
 
 ## v2 candidates
 
