@@ -260,7 +260,7 @@ By 1.2, the rest of the control surface has grown: PR #32 added `GET /v1/provide
 - **TLS on the metrics or UI listeners.** Same pattern would apply; not in scope for 1.2. Operators who want it can front those listeners with a reverse proxy in the meantime.
 - **mTLS / client-cert auth.** Bearer remains the right size for v1 auth. A future ADR can add it under a new config key without breaking the v1 shape.
 - **ACME / Let's Encrypt integration.** Tunnelsmith reads the PEM files the operator already manages; cert provisioning is out of scope.
-- **TLS minimum version / cipher pinning.** Stdlib defaults (TLS 1.2 minimum, modern cipher suites) are appropriate for an operator-facing endpoint. Tuning knobs land in a follow-up if a workload demands them.
+- **Operator-tunable TLS minimum version / cipher pinning.** The implementation pins `MinVersion: tls.VersionTLS12` on the listener's `tls.Config` so the policy survives any future stdlib default flip — that's a fixed in-binary baseline, not an operator knob. Exposing it as a config key (or letting operators pick TLS 1.3+ only, or pin specific cipher suites) is a non-goal for 1.2; tuning knobs land in a follow-up if a workload demands them.
 
 ### Consequences
 

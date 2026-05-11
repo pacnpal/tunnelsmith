@@ -94,7 +94,9 @@ type ServerOptions struct {
 	// TLSCertFile and TLSKeyFile, when both non-empty, switch the
 	// listener to HTTPS via http.Server.ServeTLS. Both empty keeps
 	// plaintext. config.Validate enforces the both-or-neither
-	// invariant so Server doesn't have to re-check.
+	// invariant for cmd/tunnelsmith, and Serve repeats the check
+	// at runtime (defence in depth for tests and any future
+	// internal caller that bypasses config.Validate).
 	TLSCertFile string
 	TLSKeyFile  string
 }
@@ -192,6 +194,22 @@ func (s *Server) Serve(_ context.Context) error {
 		close(s.ready)
 		return err
 	}
+	// Pre-load the keypair BEFORE binding the listener so a bad
+	// cert / key path surfaces without leaving an orphaned TCP
+	// socket bound on s.addr. net/http.Server.ServeTLS does not
+	// close the listener it receives if it errors early during
+	// cert load, which would otherwise leak the bound port until
+	// process exit. Pre-loading also moves the "listening" log
+	// line to a position that's truthful: we only log after we
+	// know the cert is valid.
+	if s.TLSEnabled() {
+		if _, err := tls.LoadX509KeyPair(s.tlsCertFile, s.tlsKeyFile); err != nil {
+			loadErr := fmt.Errorf("control serve: load tls keypair: %w", err)
+			s.bindErr = loadErr
+			close(s.ready)
+			return loadErr
+		}
+	}
 	l, err := net.Listen("tcp", s.addr)
 	if err != nil {
 		s.bindErr = fmt.Errorf("control listen %s: %w", s.addr, err)
@@ -211,6 +229,12 @@ func (s *Server) Serve(_ context.Context) error {
 		serveErr = s.srv.Serve(l)
 	}
 	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+		// Belt-and-suspenders: if ServeTLS errored after the
+		// pre-load check (any non-shutdown path), make sure the
+		// bound listener isn't leaked. The stdlib Serve path
+		// already closes the listener on its own normal exit, so
+		// this Close is a no-op there.
+		_ = l.Close()
 		return fmt.Errorf("control serve: %w", serveErr)
 	}
 	return nil
