@@ -81,6 +81,49 @@ func TestTokenSetReplaceIsAtomic(t *testing.T) {
 	}
 }
 
+// TestSnapshotIsStableAcrossRotation pins the round-8 race fix:
+// a TokenSnapshot captured at the start of a request keeps its decision
+// even when SIGHUP rotates the live token set mid-handler. Without the
+// snapshot handle, the handler would observe Enabled()=true on the
+// first atomic load, then Allow() on the second load could see an empty
+// set (permit) or a different non-empty set (mismatch) — both produce
+// inconsistent per-request decisions.
+func TestSnapshotIsStableAcrossRotation(t *testing.T) {
+	t.Parallel()
+	ts := NewTokenSet([]string{"old"})
+	snap := ts.Snapshot()
+	if !snap.Enabled() {
+		t.Fatal("pre-rotate: snapshot.Enabled() = false")
+	}
+	if !snap.Allow("old") {
+		t.Error("pre-rotate: snapshot.Allow(old) = false")
+	}
+
+	// Rotate the live set out from under the snapshot.
+	ts.Replace([]string{"new"})
+
+	// The captured snapshot must still report the OLD view; rotation
+	// doesn't follow back through it.
+	if !snap.Enabled() {
+		t.Error("post-rotate: captured snapshot.Enabled() = false (rotation should not affect captured view)")
+	}
+	if !snap.Allow("old") {
+		t.Error("post-rotate: captured snapshot.Allow(old) = false (rotation should not affect captured view)")
+	}
+	if snap.Allow("new") {
+		t.Error("post-rotate: captured snapshot.Allow(new) = true (new token leaked into old snapshot)")
+	}
+
+	// A fresh snapshot taken AFTER the rotation sees the new view.
+	fresh := ts.Snapshot()
+	if !fresh.Allow("new") {
+		t.Error("fresh snapshot.Allow(new) = false")
+	}
+	if fresh.Allow("old") {
+		t.Error("fresh snapshot.Allow(old) = true (old token leaked into new snapshot)")
+	}
+}
+
 func TestExtractBearerVariants(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -178,6 +221,13 @@ func TestReportRejectsMissingAuthorization(t *testing.T) {
 	}
 	if got := resp.Header.Get("WWW-Authenticate"); got != `Bearer realm="tunnelsmith"` {
 		t.Errorf("WWW-Authenticate = %q, want bearer realm header", got)
+	}
+	// RFC 6750 §3 cache directives so intermediaries do not cache 401s.
+	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control = %q, want no-store (RFC 6750 §3)", got)
+	}
+	if got := resp.Header.Get("Pragma"); got != "no-cache" {
+		t.Errorf("Pragma = %q, want no-cache (RFC 6750 §3)", got)
 	}
 	if !m.hasReject("auth_missing") {
 		t.Errorf("rejected reasons = %v, want auth_missing", m.rejected)

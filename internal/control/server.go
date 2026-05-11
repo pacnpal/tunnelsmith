@@ -105,10 +105,12 @@ func NewServer(addr string, backend Backend, metrics MetricsSink, opts ServerOpt
 }
 
 // ReplaceTokens atomically swaps the live auth token set, used by the
-// SIGHUP reloader so an operator can rotate tokens without bouncing the
-// process. Safe to call concurrently with in-flight requests; readers
-// load the pointer snapshot once per request so an in-flight check
-// keeps its decision even if the swap happens mid-handler.
+// SIGHUP reloader so an operator can rotate tokens without bouncing
+// the process. Safe to call concurrently with in-flight requests:
+// each handler calls TokenSource.Snapshot() exactly once at the start
+// of the request and runs every auth question (Enabled, Allow) off
+// that captured view, so an in-flight check keeps a stable decision
+// even if the underlying atomic pointer is rotated mid-handler.
 func (s *Server) ReplaceTokens(tokens []string) {
 	if s == nil || s.tokens == nil {
 		return

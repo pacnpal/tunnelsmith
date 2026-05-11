@@ -82,9 +82,10 @@ const maxReportBytes = 4 * 1024
 
 // mountHandlers attaches POST /v1/report and GET /healthz to mux. The
 // metrics sink is optional; when nil, counters are no-ops. The tokens
-// argument may be nil for the no-auth default; when non-nil and
-// Enabled() returns true, /v1/report (and /healthz when gateHealthz is
-// true) require Authorization: Bearer <token> per ADR-007 (Phase 12).
+// argument may be nil for the no-auth default; when non-nil and the
+// per-request snapshot is enabled, /v1/report (and /healthz when
+// gateHealthz is true) require Authorization: Bearer <token> per
+// ADR-007 (Phase 12).
 func mountHandlers(mux *http.ServeMux, backend Backend, metricsSink MetricsSink, tokens TokenSource, gateHealthz bool, logger *slog.Logger) {
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		// /healthz stays ungated by default so liveness probes work
@@ -92,17 +93,22 @@ func mountHandlers(mux *http.ServeMux, backend Backend, metricsSink MetricsSink,
 		// something that already authenticates can opt in to gating
 		// via [control].gate_healthz = true (ADR-007 phase boundary).
 		//
+		// One snapshot per request: Enabled() and Allow() both run
+		// off the same captured view so a concurrent SIGHUP rotation
+		// can't tear the decision (e.g., snapshot says gated but the
+		// next pointer load has rotated to empty).
+		//
 		// Pass nil metrics sink: tunnelsmith_reports_rejected_total is
 		// semantically scoped to cooperative outcome *reports*, so
 		// counting a gated-/healthz auth failure on the same counter
 		// would skew dashboards and rate-rejection alerts that watch
-		// it. The 401 + WWW-Authenticate response is enough for a
-		// misconfigured probe runner; if /healthz auth-failure
-		// observability ever becomes important, give it its own
-		// counter rather than overloading this one.
-		if gateHealthz && tokens != nil && tokens.Enabled() {
-			if !checkAuth(w, r, tokens, nil) {
-				return
+		// it.
+		if gateHealthz && tokens != nil {
+			snap := tokens.Snapshot()
+			if snap.Enabled() {
+				if !checkAuth(w, r, snap, nil) {
+					return
+				}
 			}
 		}
 		w.WriteHeader(http.StatusOK)
@@ -115,10 +121,13 @@ func mountHandlers(mux *http.ServeMux, backend Backend, metricsSink MetricsSink,
 
 // checkAuth runs the bearer-token check and writes the 401 response (with
 // WWW-Authenticate per RFC 6750 §3) when the request is rejected. Returns
-// true iff the caller is permitted to proceed. tokens must be non-nil
-// and Enabled() when called; callers gate on Enabled themselves to keep
-// the no-auth fast path branch-light.
-func checkAuth(w http.ResponseWriter, r *http.Request, tokens TokenSource, m MetricsSink) bool {
+// true iff the caller is permitted to proceed. snap must be a non-empty
+// snapshot (Enabled() true) when called; callers gate on Enabled
+// themselves to keep the no-auth fast path branch-light. Taking the
+// snapshot as a parameter rather than re-loading the atomic pointer per
+// call site ensures Enabled() and Allow() see one stable view even when
+// SIGHUP rotates the live set mid-handler.
+func checkAuth(w http.ResponseWriter, r *http.Request, snap TokenSnapshot, m MetricsSink) bool {
 	token, status := extractBearer(r)
 	switch status {
 	case authMissing:
@@ -128,18 +137,23 @@ func checkAuth(w http.ResponseWriter, r *http.Request, tokens TokenSource, m Met
 		writeAuthChallenge(w, m, metrics.ReportRejectAuthFailed, "malformed Authorization header")
 		return false
 	}
-	if !tokens.Allow(token) {
+	if !snap.Allow(token) {
 		writeAuthChallenge(w, m, metrics.ReportRejectAuthFailed, "unknown token")
 		return false
 	}
 	return true
 }
 
-// writeAuthChallenge emits a 401 with the RFC 6750 WWW-Authenticate
-// header and (when present) ticks reports_rejected_total with the right
-// reason label.
+// writeAuthChallenge emits a 401 with the RFC 6750 §3 WWW-Authenticate
+// header plus Cache-Control: no-store and Pragma: no-cache (also per
+// §3, so intermediaries do not cache the 401 in a way that confuses
+// retries from the same client). When the metrics sink is non-nil, the
+// rejection ticks reports_rejected_total with the right reason label.
 func writeAuthChallenge(w http.ResponseWriter, m MetricsSink, reason, msg string) {
-	w.Header().Set("WWW-Authenticate", `Bearer realm="tunnelsmith"`)
+	h := w.Header()
+	h.Set("WWW-Authenticate", `Bearer realm="tunnelsmith"`)
+	h.Set("Cache-Control", "no-store")
+	h.Set("Pragma", "no-cache")
 	if m != nil {
 		m.ObserveReportRejected(reason)
 	}
@@ -156,12 +170,18 @@ func handleReport(w http.ResponseWriter, r *http.Request, backend Backend, m Met
 	}
 
 	// Auth gates the report path before the body is read so an
-	// unauthenticated client never costs us the 4 KiB buffer. The
-	// no-auth default (Enabled() false) short-circuits with one
-	// pointer-load.
-	if tokens != nil && tokens.Enabled() {
-		if !checkAuth(w, r, tokens, m) {
-			return
+	// unauthenticated client never costs us the 4 KiB buffer. One
+	// snapshot per request: Enabled() and Allow() both run off the
+	// same captured view so a concurrent SIGHUP rotation can't tear
+	// the decision (e.g., Enabled() true → SIGHUP empties → Allow()
+	// permits everything, which would emit a 401-for-missing-header
+	// on what's now a no-auth endpoint).
+	if tokens != nil {
+		snap := tokens.Snapshot()
+		if snap.Enabled() {
+			if !checkAuth(w, r, snap, m) {
+				return
+			}
 		}
 	}
 

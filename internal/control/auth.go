@@ -23,28 +23,71 @@ import (
 	"sync/atomic"
 )
 
-// TokenSource is the auth surface mountHandlers consumes. Allow returns
-// true when the supplied token is accepted; the empty set must return
-// true so the no-auth default is observable through this one method.
+// TokenSource is the auth surface mountHandlers consumes. The handler
+// path pulls a per-request snapshot via Snapshot() and runs both the
+// enabled-check and the token comparison off that same view so a
+// concurrent SIGHUP rotation cannot tear the decision (e.g., Enabled()
+// true → SIGHUP swaps to empty → Allow() permits everything, returning
+// a 401-for-no-header on what's now a no-auth endpoint).
 type TokenSource interface {
-	// Allow returns true when token is a member of the live token set
-	// or when the set is empty. Empty token strings never match unless
-	// the set is empty.
-	Allow(token string) bool
-
-	// Enabled reports whether the source has any tokens. Callers use it
-	// to skip the Authorization header check entirely on the no-auth
-	// path so unauthenticated clients keep working byte-for-byte the
-	// way they did in Phase 11.
-	Enabled() bool
+	// Snapshot returns the live token view for one request. The
+	// returned TokenSnapshot is a value/pointer that does not observe
+	// further rotations; callers should take one snapshot per request
+	// and use it for every auth question.
+	Snapshot() TokenSnapshot
 }
 
-// tokenSet is the production TokenSource. The stored snapshot holds
-// each token as a precomputed []byte so Allow can call
+// TokenSnapshot is one frozen view of the auth token set. Methods are
+// safe to call after the underlying tokenSet has been rotated; the
+// snapshot keeps its own reference to the captured [][]byte slice.
+type TokenSnapshot interface {
+	// Enabled reports whether this snapshot has any tokens. Callers
+	// use it to skip the Authorization header parse entirely on the
+	// no-auth path so unauthenticated clients keep working byte-for-
+	// byte the way they did in Phase 11.
+	Enabled() bool
+
+	// Allow returns true when token is a member of this snapshot or
+	// when the snapshot is empty. Empty token strings never match
+	// unless the snapshot is empty.
+	Allow(token string) bool
+}
+
+// tokenSnapshot is the concrete view returned by tokenSet.Snapshot. A
+// value type keeps GC pressure low: handlers stack-allocate it once per
+// request and the captured slice is reference-counted by Go's runtime
+// as part of the atomic.Pointer's payload.
+type tokenSnapshot struct {
+	tokens [][]byte
+}
+
+// Enabled implements TokenSnapshot.
+func (s tokenSnapshot) Enabled() bool { return len(s.tokens) > 0 }
+
+// Allow implements TokenSnapshot. See tokenSet.Allow for the per-token
+// constant-time comparison semantics.
+func (s tokenSnapshot) Allow(input string) bool {
+	if len(s.tokens) == 0 {
+		return true
+	}
+	if input == "" {
+		return false
+	}
+	in := []byte(input)
+	var ok int
+	for _, t := range s.tokens {
+		ok |= subtle.ConstantTimeCompare(in, t)
+	}
+	return ok == 1
+}
+
+// tokenSet is the production TokenSource. The stored slice holds each
+// token as a precomputed []byte so Allow on the snapshot can call
 // subtle.ConstantTimeCompare without a per-token allocation on the
 // request path; the snapshot is swapped atomically so SIGHUP rotation
-// does not block in-flight requests, and readers grab the pointer once
-// and use that snapshot for the whole comparison loop.
+// does not block in-flight requests. Callers obtain a TokenSnapshot
+// through Snapshot() and run the whole request-auth decision off that
+// one captured view.
 type tokenSet struct {
 	tokens atomic.Pointer[[][]byte]
 }
@@ -72,41 +115,37 @@ func (s *tokenSet) store(tokens []string) {
 	s.tokens.Store(&cp)
 }
 
-func (s *tokenSet) snapshot() [][]byte {
+// Snapshot implements TokenSource. The returned tokenSnapshot captures
+// the live token slice by reference; the caller may use it across the
+// whole request even if SIGHUP swaps the underlying pointer mid-handler.
+// The comparison loop inside Allow intentionally avoids a short-circuit
+// `break` on match so total work is independent of which token matched.
+// subtle.ConstantTimeCompare returns 0 on length mismatch (an inherent
+// timing leak of input length vs. stored token length); ADR-007 accepts
+// that for v1 since operator-chosen tokens are usually fixed-length
+// high-entropy strings. Tokens are stored pre-converted to []byte so
+// the hot path allocates exactly once per request (the input → []byte
+// conversion inside Allow).
+func (s *tokenSet) Snapshot() TokenSnapshot {
 	p := s.tokens.Load()
 	if p == nil {
-		return nil
+		return tokenSnapshot{}
 	}
-	return *p
+	return tokenSnapshot{tokens: *p}
 }
 
-// Allow implements TokenSource. The comparison loop intentionally
-// avoids a short-circuit `break` on match so total work is independent
-// of which token in the set matched. subtle.ConstantTimeCompare
-// returns 0 on length mismatch (an inherent timing leak of input length
-// vs. stored token length); ADR-007 accepts that for v1 since
-// operator-chosen tokens are usually fixed-length high-entropy
-// strings. Tokens are stored pre-converted to []byte so this hot path
-// allocates exactly once per request (the input → []byte conversion).
+// Allow is a convenience that takes one snapshot and runs Allow on it.
+// Tests use it for assertions that don't care about the snapshot handle;
+// production callers should prefer Snapshot() so multiple checks
+// (Enabled + Allow) share the same captured view.
 func (s *tokenSet) Allow(input string) bool {
-	tokens := s.snapshot()
-	if len(tokens) == 0 {
-		return true
-	}
-	if input == "" {
-		return false
-	}
-	in := []byte(input)
-	var ok int
-	for _, t := range tokens {
-		ok |= subtle.ConstantTimeCompare(in, t)
-	}
-	return ok == 1
+	return s.Snapshot().Allow(input)
 }
 
-// Enabled reports whether the live snapshot has any tokens.
+// Enabled is a convenience that takes one snapshot and reports its
+// non-empty state. See Allow above for the snapshot rationale.
 func (s *tokenSet) Enabled() bool {
-	return len(s.snapshot()) > 0
+	return s.Snapshot().Enabled()
 }
 
 // authStatus enumerates how an inbound request's Authorization header
@@ -213,7 +252,12 @@ func LoadTokensFile(path string) ([]string, error) {
 		out = append(out, trim)
 	}
 	if err := sc.Err(); err != nil {
-		return nil, fmt.Errorf("read auth_tokens_file %q: %w (line %d)", path, err, lineNo)
+		// lineNo counts successfully scanned lines; a Scanner error
+		// means the failure landed on the NEXT line (which never made
+		// it back through Scan). Report lineNo+1 so the operator sees
+		// the actual problem line instead of an off-by-one (or 0 on a
+		// first-line failure like a buffer overflow on the first token).
+		return nil, fmt.Errorf("read auth_tokens_file %q: %w (line %d)", path, err, lineNo+1)
 	}
 	return out, nil
 }
