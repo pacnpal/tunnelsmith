@@ -286,7 +286,7 @@ force     = true   # do not fall back to other upstreams on failure
 
 ### Key sections
 
-**`[failure.scoring]`** — Per-(host, upstream) scoring knobs: penalty and cooldown amounts for ECONNREFUSED, timeout, HTTP 429/403/451, and body-regex matches; score cap; probe chance; time decay; cascade TTL. All have sane defaults; omit the section to use them.
+**`[failure.scoring]`** — Per-(host, upstream) scoring knobs for ECONNREFUSED, timeout, and body-regex matches; score cap; probe chance; time decay (`decay_step`, `decay_interval`); cascade TTL. Per-status-code rules (HTTP 429/403/451 penalties and cooldowns) come from `[[failure.status]]`. All have sane defaults; omit the section to use them.
 
 **`[[rule]]`** — Optional per-host routing overrides. `prefer` lists upstreams to try first (in order). `force = true` prevents fallback to other upstreams. `body_regex` fires body-match detection on plain-HTTP responses so geo-block soft-failures served as `200 OK` still penalize the right upstream.
 
@@ -298,7 +298,7 @@ Sending `SIGHUP` applies a subset of config changes in place without a restart:
 - `[failure.scoring]` knobs: penalties, cooldowns, score cap, probe chance, `decay_step`, cascade TTL
 - `[[failure.status]]` codes and per-code penalty/cooldown
 - `failure.connection_refused`, `failure.body_buffer_kb`
-- `failure.max_retries_per_request` — hot-reloads for the HTTP forward-proxy path; when `[[upstream_pool]]` is in play the pool is not rebuilt on SIGHUP, so CONNECT/SOCKS retry behaviour requires a restart
+- `failure.max_retries_per_request` — hot-reloads for the HTTP forward-proxy path; when `[[upstream_pool]]` is in play the pool is not rebuilt on SIGHUP, so CONNECT/SOCKS retry behavior requires a restart
 - `[[rule]]` blocks (host routing overrides and body-regex patterns)
 - `[control].auth_tokens` and `[control].auth_tokens_file` (bearer-token rotation)
 - Static `[[upstream]]` list — only when no `[[upstream_pool]]` blocks are in play in either the running or new config
