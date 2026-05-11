@@ -199,7 +199,7 @@ func LoadTokenFile(path string) (string, error) {
 // from the control endpoint to verify the API key is valid before any
 // list operation.
 func (c *Client) Profile(ctx context.Context) (*Profile, error) {
-	body, err := c.do(ctx, http.MethodGet, "/profile/", nil, nil)
+	body, err := c.do(ctx, http.MethodGet, "/profile/", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -317,7 +317,7 @@ func (c *Client) listProxiesOnline(ctx context.Context, opts ListProxiesOptions)
 	path := "/proxy/list/?" + q.Encode()
 	var all []Proxy
 	for page := 1; page <= maxResponsePages; page++ {
-		body, err := c.do(ctx, http.MethodGet, path, nil, nil)
+		body, err := c.do(ctx, http.MethodGet, path, nil)
 		if err != nil {
 			return nil, fmt.Errorf("webshare: list page %d: %w", page, err)
 		}
@@ -377,7 +377,7 @@ func (c *Client) RefreshProxyList(ctx context.Context, planID string) error {
 	if planID != "" {
 		path += "?plan_id=" + url.QueryEscape(planID)
 	}
-	_, err := c.do(ctx, http.MethodPost, path, nil, nil)
+	_, err := c.do(ctx, http.MethodPost, path, nil)
 	return err
 }
 
@@ -385,7 +385,7 @@ func (c *Client) RefreshProxyList(ctx context.Context, planID string) error {
 // the URL path after BaseURL. body is the optional request body
 // (typically nil for Webshare's GET/POST-empty endpoints). Returns the
 // full response body, capped at maxBodyBytes.
-func (c *Client) do(ctx context.Context, method, path string, body io.Reader, _ http.Header) ([]byte, error) {
+func (c *Client) do(ctx context.Context, method, path string, body io.Reader) ([]byte, error) {
 	if c.APIToken == "" {
 		return nil, fmt.Errorf("webshare: APIToken is empty")
 	}

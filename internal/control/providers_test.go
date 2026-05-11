@@ -12,7 +12,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/pacnpal/tunnelsmith/internal/upstream/provider"
 )
@@ -229,7 +228,7 @@ func TestProviderRoutesMethodChecksPrecedeAuth(t *testing.T) {
 	}
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusMethodNotAllowed {
-		t.Fatalf("wrong-method on /v1/providers: status = %d, want 405 (got %d, suggests auth gate fired first)", resp.StatusCode, resp.StatusCode)
+		t.Fatalf("wrong-method on /v1/providers: status = %d, want 405 (suggests auth gate fired first)", resp.StatusCode)
 	}
 
 	// Malformed path under /v1/providers/ without Authorization:
@@ -286,6 +285,3 @@ func TestProviderRefreshMalformedPath(t *testing.T) {
 		}
 	}
 }
-
-// silence unused import warning in some configurations
-var _ = time.Second
