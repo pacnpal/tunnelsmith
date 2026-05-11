@@ -1,0 +1,89 @@
+# Full example stack: Mullvad WireGuard + Tunnelsmith + browser app container.
+#
+# This compose file demonstrates an application container using Tunnelsmith as
+# its outbound connection. The app service uses Playwright's Chromium and
+# explicitly sets browser proxying to http://localhost:8080 (Tunnelsmith).
+#
+# Prereqs:
+#   cp deploy/.env.example deploy/.env
+#   # then set:
+#   #   MULLVAD_WIREGUARD_PRIVATE_KEY
+#   #   MULLVAD_WIREGUARD_ADDRESSES
+#
+# Run:
+#   docker compose -f deploy/docker-compose.mullvad.playwright.yml up --abort-on-container-exit
+#
+# Success criteria:
+#   - playwright-browser exits 0
+#   - logs include mullvad_exit_ip: true from am.i.mullvad.net/json
+
+services:
+  gluetun:
+    image: qmcgaw/gluetun:v3.41.1
+    container_name: tunnelsmith-gluetun
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      VPN_SERVICE_PROVIDER: mullvad
+      VPN_TYPE: wireguard
+      WIREGUARD_PRIVATE_KEY: ${MULLVAD_WIREGUARD_PRIVATE_KEY:?MULLVAD_WIREGUARD_PRIVATE_KEY is required}
+      WIREGUARD_ADDRESSES: ${MULLVAD_WIREGUARD_ADDRESSES:?MULLVAD_WIREGUARD_ADDRESSES is required}
+      SERVER_CITIES: ${MULLVAD_SERVER_CITIES:-Stockholm}
+      DOT: "off"
+      HEALTH_VPN_DURATION_INITIAL: "30s"
+    ports:
+      - "8080:8080"
+      - "1080:1080"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "--tries=1", "--timeout=5", "https://am.i.mullvad.net/connected"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  tunnelsmith:
+    image: ${TUNNELSMITH_IMAGE:-ghcr.io/pacnpal/tunnelsmith:latest}
+    container_name: tunnelsmith
+    network_mode: "service:gluetun"
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    volumes:
+      - ./tunnelsmith.mullvad.toml:/etc/tunnelsmith/config.toml:ro
+    command:
+      - --config=/etc/tunnelsmith/config.toml
+    restart: unless-stopped
+    environment:
+      TUNNELSMITH_LOG_LEVEL: ${TUNNELSMITH_LOG_LEVEL:-info}
+
+  playwright-browser:
+    image: mcr.microsoft.com/playwright:v1.54.0-noble
+    container_name: tunnelsmith-playwright-browser
+    network_mode: "service:gluetun"
+    depends_on:
+      tunnelsmith:
+        condition: service_started
+    command:
+      - /bin/sh
+      - -lc
+      - |
+        node -e '
+        const { chromium } = require("playwright");
+        (async () => {
+          const browser = await chromium.launch({
+            headless: true,
+            proxy: { server: "http://localhost:8080" },
+          });
+          const page = await browser.newPage();
+          await page.goto("https://am.i.mullvad.net/json", { waitUntil: "networkidle" });
+          const body = await page.textContent("body");
+          console.log(body);
+          await browser.close();
+        })().catch((err) => {
+          console.error(err);
+          process.exit(1);
+        });
+        '

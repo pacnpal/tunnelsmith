@@ -313,7 +313,13 @@ Sending `SIGHUP` applies a subset of config changes in place without a restart:
 
 ## Use with Mullvad
 
-Tunnelsmith ships a reference deployment at [`deploy/docker-compose.mullvad.yml`](deploy/docker-compose.mullvad.yml) that runs gluetun in WireGuard mode against your Mullvad account, plus tunnelsmith joining the same network namespace. A single `[[upstream_pool]]` block in the config fans out into one synthetic socks5 upstream per active Mullvad WireGuard relay in the countries you list. The scoreboard then learns per-host which relay works best. As of v1.1.0, relay-list churn is handled via hot-swap — no restart needed when Mullvad rotates relays.
+Tunnelsmith ships a reference deployment at [`deploy/docker-compose.mullvad.yml`](deploy/docker-compose.mullvad.yml) that runs gluetun in WireGuard mode against your Mullvad account, plus tunnelsmith joining the same network namespace.
+
+The critical failover piece is the `[[upstream_pool]]` block in [`deploy/tunnelsmith.mullvad.toml`](deploy/tunnelsmith.mullvad.toml):
+- `provider = "mullvad"` tells tunnelsmith to fetch Mullvad's live relay list (`https://api.mullvad.net/public/relays/wireguard/v2/`).
+- `countries = [...]` is the operator-managed list of eligible exits.
+- tunnelsmith expands that into one synthetic SOCKS5 upstream per active relay in those countries, then the scoreboard learns per-host which relay works best.
+- as of v1.1.0, relay-list churn hot-swaps the running pool (no restart needed for normal Mullvad relay rotation).
 
 ### Quick setup
 
@@ -350,6 +356,21 @@ curl --socks5-hostname localhost:1080 https://am.i.mullvad.net/json | jq .
 ```
 
 See [`docs/deployment.md`](docs/deployment.md) for the full walkthrough including troubleshooting.
+
+### Full Docker Compose example: browser container using Tunnelsmith
+
+For a complete stack with a browser app container, use [`deploy/docker-compose.mullvad.playwright.yml`](deploy/docker-compose.mullvad.playwright.yml). It runs:
+- `gluetun` (WireGuard tunnel to Mullvad)
+- `tunnelsmith` (HTTP/SOCKS5 proxy + Mullvad upstream pool fan-out)
+- a Playwright container (Chromium) configured to send browser traffic through `http://localhost:8080` (tunnelsmith) inside the shared network namespace
+
+Bring it up:
+
+```sh
+docker compose -f deploy/docker-compose.mullvad.playwright.yml up --build --abort-on-container-exit
+```
+
+The browser container prints the JSON response from `https://am.i.mullvad.net/json`, which verifies the request went through Mullvad via Tunnelsmith.
 
 ## For container maintainers
 
