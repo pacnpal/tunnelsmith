@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-05-11
+
+Two additive features on top of v1.0.0: cooperative-report hot-swap of the running `[[upstream_pool]]` (Phase 11.1) so Mullvad relay churn no longer needs a binary restart, and opt-in bearer-token auth on the cooperative-reporting control endpoint (Phase 12) so operators in multi-tenant or LAN-exposed deployments can gate `POST /v1/report`. Both ship with the Phase 11 wire shape byte-for-byte preserved when the new opt-ins are left at defaults.
+
 ### Added (Phase 12)
 
 - Opt-in bearer-token auth on the control endpoint. `[control].auth_tokens` (inline) and `[control].auth_tokens_file` (one token per line, `#` comments) configure a token set; when non-empty, every `POST /v1/report` must carry `Authorization: Bearer <token>`. Empty token set keeps the Phase 11 wire shape byte-for-byte. The new `[control].gate_healthz` knob pulls `/healthz` under the same gate (default `false`).

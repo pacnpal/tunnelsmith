@@ -64,7 +64,7 @@ Set `MULLVAD_WIREGUARD_PRIVATE_KEY` and `MULLVAD_WIREGUARD_ADDRESSES`. The file'
 
 ## Step 3: pick the countries
 
-Edit `deploy/tunnelsmith.mullvad.toml` and adjust the `countries` list to whatever subset of Mullvad's exit countries you want available. A background refresh goroutine polls the relay list every 12 hours by default; in v1.0.0 the refresh logs the diff but the running pool is whatever the startup snapshot produced, so picking up newly-added relays requires a restart. Pool hot-reload is tracked for a future release.
+Edit `deploy/tunnelsmith.mullvad.toml` and adjust the `countries` list to whatever subset of Mullvad's exit countries you want available. A background refresh goroutine polls the relay list every 12 hours by default. As of v1.1.0 (Phase 11.1), the refresh tick **hot-swaps the running priority pool** on every successful diff: a new pool is built from the merged `(static [[upstream]]) ∪ (every block's latest expansion)` slice and installed via `Scoreboard.ReplacePool`. Cached HTTP transports drop on swap; force pins to upstreams that disappeared in the new expansion are evicted automatically. The swap is logged and `tunnelsmith_pool_hotswap_total{result}` counts every refresh-tick swap. Operators no longer need to restart the binary to pick up a Mullvad relay rotation — only changes to the `[[upstream_pool]]` block shape (provider, id_prefix, priority, countries, include_inactive, refresh, cache_path) still require a restart.
 
 ```toml
 [[upstream_pool]]
