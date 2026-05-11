@@ -188,7 +188,7 @@ func (s *Server) Addr() net.Addr {
 // listener to plaintext.
 func (s *Server) Serve(_ context.Context) error {
 	if (s.tlsCertFile == "") != (s.tlsKeyFile == "") {
-		err := fmt.Errorf("control serve: tls_cert_file and tls_key_file must be both set or both empty (got cert=%q, key=%q)",
+		err := fmt.Errorf("control serve: control.tls_cert_file and control.tls_key_file must be both set or both empty (got cert=%q, key=%q)",
 			s.tlsCertFile, s.tlsKeyFile)
 		s.bindErr = err
 		close(s.ready)

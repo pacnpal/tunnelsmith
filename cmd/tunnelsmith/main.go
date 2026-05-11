@@ -245,7 +245,12 @@ func run(args []string, stdout, stderr *os.File) error {
 			TLSCertFile: cfg.Control.TLSCertFile,
 			TLSKeyFile:  cfg.Control.TLSKeyFile,
 		}, logger)
-		if cfg.Control.TLSCertFile != "" {
+		// Gate on the runtime invariant (both cert+key non-empty) rather
+		// than just TLSCertFile being set, so a future code path that
+		// bypasses config.Validate can't trick this branch into logging
+		// "TLS enabled" for a half-configured server that will fail to
+		// bind.
+		if controlSrv.TLSEnabled() {
 			logger.Info("control TLS enabled at startup",
 				"cert_file", cfg.Control.TLSCertFile,
 				"key_file", cfg.Control.TLSKeyFile,
