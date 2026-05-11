@@ -122,6 +122,104 @@ docker run -d \
   --config /etc/tunnelsmith/config.toml
 ```
 
+### Running with Docker Compose
+
+Save the two files below alongside each other, then run `docker compose up -d`.
+
+**`config.toml`** — a two-upstream pool: one SOCKS5 proxy, one direct fallback:
+
+```toml
+[listener]
+http  = ":8080"
+socks = ":1080"
+
+[cache]
+ttl          = "15m"
+negative_ttl = "1m"
+persist_path = "/data/tunnelsmith/scoreboard.db"
+
+[metrics]
+bind = ":9090"
+
+[ui]
+bind = ":9091"
+
+[control]
+bind = ":9092"
+
+[failure]
+timeout_ms              = 8000
+max_retries_per_request = 5
+
+[[failure.status]]
+code              = 429
+penalty           = 4
+cooldown          = "120s"
+honor_retry_after = true
+
+[[failure.status]]
+code     = 403
+penalty  = 6
+cooldown = "30m"
+
+[[failure.status]]
+code     = 451
+penalty  = 8
+cooldown = "6h"
+
+[[upstream]]
+id       = "my-socks5"
+kind     = "socks5"
+addr     = "proxy.example.com:1080"
+priority = 10
+
+[[upstream]]
+id       = "direct"
+kind     = "direct"
+priority = 20
+```
+
+**`docker-compose.yml`**:
+
+```yaml
+services:
+  tunnelsmith:
+    image: ghcr.io/pacnpal/tunnelsmith:latest
+    container_name: tunnelsmith
+    restart: unless-stopped
+    ports:
+      - "8080:8080"   # HTTP CONNECT and forward proxy
+      - "1080:1080"   # SOCKS5
+      - "9090:9090"   # Prometheus metrics
+      - "9091:9091"   # Web UI (bind to a private interface in production)
+      - "9092:9092"   # Cooperative-reporting control endpoint
+    volumes:
+      - ./config.toml:/etc/tunnelsmith/config.toml:ro
+      - tunnelsmith-data:/data/tunnelsmith
+    command:
+      - --config=/etc/tunnelsmith/config.toml
+    environment:
+      TUNNELSMITH_LOG_LEVEL: info
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- --tries=1 http://localhost:9090/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  tunnelsmith-data:
+```
+
+Then:
+
+```sh
+docker compose up -d
+curl --proxy http://localhost:8080 https://example.com
+curl --socks5-hostname localhost:1080 https://example.com
+```
+
+Open `http://localhost:9091` in a browser to see the live scoreboard. Metrics are at `http://localhost:9090/metrics`.
+
 ### CLI reference
 
 ```
