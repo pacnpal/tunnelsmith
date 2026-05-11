@@ -30,13 +30,13 @@ docker pull ghcr.io/pacnpal/tunnelsmith:latest
 docker run --rm ghcr.io/pacnpal/tunnelsmith:latest --version
 ```
 
-Pin to a specific version for production use:
+Pin to a specific version for production use (image tags omit the leading `v` that git tags carry):
 
 ```sh
-docker pull ghcr.io/pacnpal/tunnelsmith:v1.1.0
+docker pull ghcr.io/pacnpal/tunnelsmith:1.1.0
 ```
 
-The image is built from [`Dockerfile`](Dockerfile) using a distroless base (`gcr.io/distroless/static-debian12:nonroot`) and runs as a non-root user. It exposes ports `8080` (HTTP CONNECT), `1080` (SOCKS5), `9090` (metrics), and `9091` (web UI).
+The image is built from [`Dockerfile`](Dockerfile) using a distroless base (`gcr.io/distroless/static-debian12:nonroot`) and runs as a non-root user. The Dockerfile `EXPOSE`s ports `8080` (HTTP CONNECT), `1080` (SOCKS5), `9090` (metrics), and `9091` (web UI). The control endpoint on `:9092` is enabled by default but not in the `EXPOSE` list; publish it explicitly when you need it (`-p 9092:9092`).
 
 ### Build from source
 
@@ -63,7 +63,7 @@ Other useful Make targets:
 
 ### Running the binary
 
-The binary starts an HTTP CONNECT and forward proxy on `:8080` and a SOCKS5 listener on `:1080`. You need a TOML config file with at least one `[[upstream]]`.
+The binary starts five listeners by default: HTTP CONNECT and forward proxy on `:8080`, SOCKS5 on `:1080`, Prometheus metrics on `:9090`, web UI on `:9091`, and the cooperative-reporting control endpoint on `:9092`. Set any of those to `""` in the config to disable the corresponding listener. You need a TOML config file with at least one `[[upstream]]`.
 
 The minimal config below sends everything out the host's default route (`direct`). Copy it into a file, then start the binary:
 
@@ -289,7 +289,7 @@ force     = true   # do not fall back to other upstreams on failure
 Sending `SIGHUP` applies a subset of config changes in place without a restart:
 
 **Hot-reloadable on SIGHUP:**
-- `[failure.scoring]` knobs (penalties, cooldowns, score cap, probe chance, decay, cascade TTL)
+- `[failure.scoring]` knobs: penalties, cooldowns, score cap, probe chance, `decay_step`, cascade TTL
 - `[[failure.status]]` codes and per-code penalty/cooldown
 - `failure.connection_refused`, `failure.max_retries_per_request`, `failure.body_buffer_kb`
 - `[[rule]]` blocks (host routing overrides and body-regex patterns)
@@ -301,6 +301,7 @@ Sending `SIGHUP` applies a subset of config changes in place without a restart:
 - `[control].gate_healthz`
 - `cache.persist_path` and `cache.persist_interval`
 - `[[upstream_pool]]` block shapes (provider, countries, refresh schedule)
+- `failure.scoring.decay_interval` — the decay ticker is started once at boot; changing this field requires a restart to retune the goroutine's interval
 
 ## Use with Mullvad
 
