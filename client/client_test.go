@@ -172,6 +172,10 @@ func TestNewValidatesOptions(t *testing.T) {
 		{"bad control scheme", client.Options{ProxyURL: "http://x", ControlURL: "ftp://y"}},
 		{"control missing host", client.Options{ProxyURL: "http://x", ControlURL: "http:///"}},
 		{"control non-root path", client.Options{ProxyURL: "http://x", ControlURL: "http://y/base"}},
+		{"token with embedded space", client.Options{ProxyURL: "http://x", ControlURL: "http://y", Token: "abc def"}},
+		{"token with leading space", client.Options{ProxyURL: "http://x", ControlURL: "http://y", Token: " tok"}},
+		{"token with newline", client.Options{ProxyURL: "http://x", ControlURL: "http://y", Token: "tok\n"}},
+		{"token with tab", client.Options{ProxyURL: "http://x", ControlURL: "http://y", Token: "tok\tinside"}},
 	}
 	for _, tc := range cases {
 		tc := tc

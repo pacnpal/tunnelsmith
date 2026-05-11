@@ -192,12 +192,18 @@ func LoadTokensFile(path string) ([]string, error) {
 		if trim == "" || strings.HasPrefix(trim, "#") {
 			continue
 		}
-		// Tokens are RFC 6750 token68; reject any line with internal
-		// whitespace so a stray space inside a token can't slip in
-		// (extractBearer would reject the inbound match anyway, but a
-		// loud error at load time is more actionable than silent auth
-		// failures at request time).
-		if strings.ContainsAny(trim, " \t\v\f") {
+		// Tokens are RFC 6750 token68; reject any line whose token
+		// contains whitespace so a stray space inside a token can't
+		// slip in (extractBearer would reject the inbound match
+		// anyway, but a loud error at load time is more actionable
+		// than silent auth failures at request time). The whitespace
+		// set matches extractBearer and config.Validate so all three
+		// validation sites agree on what "no whitespace" means; \r
+		// and \n cannot realistically reach this check (Scanner splits
+		// on \n; trailing \r is already stripped above) but including
+		// them in the set keeps the contract uniform if the line
+		// scanning ever changes.
+		if strings.ContainsAny(trim, " \t\r\n\v\f") {
 			return nil, fmt.Errorf("auth_tokens_file %q line %d: token contains whitespace; bearer credentials are RFC 6750 token68 (no whitespace)", path, lineNo)
 		}
 		if _, dup := seen[trim]; dup {

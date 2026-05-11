@@ -172,6 +172,15 @@ func New(opts Options) (*http.Client, error) {
 	if cu.RawQuery != "" || cu.Fragment != "" {
 		return nil, fmt.Errorf("client: ControlURL must not include a query or fragment, got %q", opts.ControlURL)
 	}
+	// Phase 12: validate Token if set. Tunnelsmith's server rejects any
+	// bearer credential containing whitespace as malformed (RFC 6750
+	// token68), so attaching a whitespace-bearing token would produce a
+	// confusing 401 at first request. Worse, Go's net/http rejects
+	// header values with newlines at write time with a generic error.
+	// Fail fast at construction with a precise message instead.
+	if opts.Token != "" && strings.ContainsAny(opts.Token, " \t\r\n\v\f") {
+		return nil, errors.New("client: Options.Token contains whitespace; bearer credentials are RFC 6750 token68 (no whitespace)")
+	}
 
 	timeout := opts.Timeout
 	if timeout < 0 {
