@@ -13,8 +13,11 @@
 //
 // Webshare's API returns paginated JSON with predictable error codes
 // (https://apidocs.webshare.io/). Pagination is followed automatically
-// using the "next" cursor; the client refuses to fetch more than
-// maxResponsePages × pageSize entries to bound memory.
+// using the "next" cursor. Two independent guards bound memory: at
+// most maxResponsePages pages are followed (500 by default) and each
+// page response body is capped at maxBodyBytes (4 MiB by default).
+// The per-page entry count is whatever Webshare returns; pageSize is
+// a request hint, not a server-enforced ceiling.
 //
 // Wire-protocol references (Webshare apidocs):
 //

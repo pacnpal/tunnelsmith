@@ -144,9 +144,14 @@ func (p *Provider) BuildAPI(cfg config.UpstreamPoolConfig, logger *slog.Logger) 
 	return &apiAdapter{client: client, planID: cfg.PlanID}, nil
 }
 
-// buildClient is shared by BuildExpander and BuildAPI so the same
-// token-load + cache-wiring lives in one place. The Client is
-// goroutine-safe — same instance is fine across both callers.
+// buildClient centralises the token-load + cache-wiring so both
+// BuildExpander and BuildAPI share one construction path. Each call
+// allocates a fresh *Client: the Client struct is read-only after
+// construction, has no shared mutable state, and the cache uses an
+// atomic tmp-and-rename write, so two separate clients pointed at
+// the same cache path are safe. The cost (one extra token-file read
+// at startup) is negligible and avoids the lifecycle questions
+// caching would introduce.
 func buildClient(cfg config.UpstreamPoolConfig, logger *slog.Logger) (*Client, error) {
 	token, err := resolveToken(cfg)
 	if err != nil {
