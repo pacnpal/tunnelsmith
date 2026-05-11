@@ -308,7 +308,7 @@ Sending `SIGHUP` applies a subset of config changes in place without a restart:
 - Listener bind addresses: `[listener].http`, `[listener].socks`, `[metrics].bind`, `[ui].bind`, `[control].bind`
 - `[control].gate_healthz`
 - `cache.persist_path` and `cache.persist_interval`
-- `[[upstream_pool]]` blocks — the entire block configuration (provider, countries, refresh schedule, `id_prefix`, `priority`, `include_inactive`, `cache_path`, etc.) is restart-frozen; the pool is constructed once at boot and not rebuilt on SIGHUP
+- `[[upstream_pool]]` blocks — the entire block configuration (provider, countries, refresh schedule, `id_prefix`, `priority`, `include_inactive`, `cache_path`, etc.) is captured at boot; SIGHUP will not apply edits to these fields (the block shape is restart-frozen). The refresh ticker continues to hot-swap pool expansions at runtime (e.g., relay churn), but that is independent of SIGHUP.
 - `failure.scoring.decay_interval` — the decay ticker is started once at boot; changing this field requires a restart to retune the goroutine's interval
 
 ## Use with Mullvad
