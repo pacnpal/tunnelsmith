@@ -21,18 +21,6 @@ Each request goes through the scoreboard's `DialFor`. The scoreboard picks the b
 
 ## Installation
 
-### Pre-built binary
-
-Download the latest release for your platform from the [releases page](https://github.com/pacnpal/tunnelsmith/releases/latest). Binaries are published for `linux/amd64` and `linux/arm64`.
-
-```sh
-# Example for linux/amd64
-curl -L https://github.com/pacnpal/tunnelsmith/releases/latest/download/tunnelsmith_linux_amd64 \
-  -o tunnelsmith
-chmod +x tunnelsmith
-./tunnelsmith --version
-```
-
 ### Container image
 
 Multi-arch images (`linux/amd64`, `linux/arm64`) are published to GitHub Container Registry on every release:
@@ -134,8 +122,6 @@ http  = ":8080"
 socks = ":1080"
 
 [cache]
-ttl          = "15m"
-negative_ttl = "1m"
 persist_path = "/data/tunnelsmith/scoreboard.db"
 
 [metrics]
@@ -200,11 +186,6 @@ services:
       - --config=/etc/tunnelsmith/config.toml
     environment:
       TUNNELSMITH_LOG_LEVEL: info
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- --tries=1 http://localhost:9090/healthz || exit 1"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
 
 volumes:
   tunnelsmith-data:
@@ -254,10 +235,8 @@ http  = ":8080"   # HTTP CONNECT and forward proxy
 socks = ":1080"   # SOCKS5 listener
 
 [cache]
-ttl             = "15m"   # how long a successful (host, upstream) pair is cached
-negative_ttl    = "1m"    # cascade-failure cooldown duration
-persist_path    = ""      # absolute path for scoreboard persistence (empty = in-memory only)
-persist_interval = "30s"  # how often to snapshot to persist_path
+persist_path     = ""      # absolute path for scoreboard persistence (empty = in-memory only)
+persist_interval = "30s"   # how often to snapshot to persist_path
 
 [metrics]
 bind = ":9090"   # Prometheus /metrics and /healthz (empty disables)
@@ -307,7 +286,7 @@ force     = true   # do not fall back to other upstreams on failure
 
 **`[control]` auth (Phase 12)** — Add `auth_tokens = ["your-token"]` or point `auth_tokens_file` at a one-token-per-line file to gate `POST /v1/report` with bearer-token auth. Hot-reloads on SIGHUP without a restart.
 
-Sending `SIGHUP` applies updated upstreams, scoring parameters, detection rules, and auth tokens in place. Listener bind addresses (`[listener]`, `[metrics]`, `[ui]`, `[control]`) require a restart to change.
+Sending `SIGHUP` applies a subset of config changes in place without a restart: `[failure.scoring]` knobs, `[[failure.status]]` codes, `failure.connection_refused`, `failure.max_retries_per_request`, `failure.body_buffer_kb`, `[[rule]]` blocks, and `[control]` auth tokens. Static `[[upstream]]` changes are also hot-reloaded when no `[[upstream_pool]]` blocks are in play. Listener bind addresses (`[listener]`, `[metrics]`, `[ui]`, `[control].bind`), `[control].gate_healthz`, `cache.persist_path`, and `[[upstream_pool]]` block shapes always require a restart.
 
 ## Use with Mullvad
 
@@ -356,12 +335,19 @@ If you build a container that benefits from outbound proxying (`*arr` apps, scra
 For HTTPS coverage of the per-host scoreboard, the optional Phase 11 cooperative reporting protocol lets your app submit per-request outcomes back to Tunnelsmith. Three lines of Go via the [`client`](client) package, or any HTTP client in any language using the wire protocol at [`docs/cooperative-reporting.md`](docs/cooperative-reporting.md):
 
 ```go
-// Go SDK — three lines of integration
+// Go SDK — three-line integration; error handling shown inline.
 c, err := client.New(client.Options{
     ProxyURL:   "http://tunnelsmith:8080",
     ControlURL: "http://tunnelsmith:9092",
 })
+if err != nil {
+    log.Fatal(err)
+}
 resp, err := c.Get("https://example.com/api/things")
+if err != nil {
+    log.Fatal(err)
+}
+defer resp.Body.Close()
 _ = client.Report(resp, "ok")
 ```
 
