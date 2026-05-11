@@ -134,9 +134,13 @@ type Profile struct {
 	Raw   json.RawMessage
 }
 
-// ListProxiesOptions controls pagination, filtering, and mode for the
-// proxy-list endpoint. PageSize and Page both have defaults; Mode is
-// required and defaults to "direct" when zero.
+// ListProxiesOptions controls filtering and pagination for the
+// proxy-list endpoint. Every field is optional: ListProxies fills in
+// defaults (mode = "direct", page size = DefaultPageSize) when fields
+// are zero. There is no Page field — ListProxies always walks the
+// full result set by following the "next" cursor returned with each
+// page; the per-call page-size hint is the only knob the caller has
+// over pagination shape.
 type ListProxiesOptions struct {
 	Mode         string   // "direct" (default) or "backbone"
 	PlanID       string   // optional
