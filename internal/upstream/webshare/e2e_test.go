@@ -75,6 +75,12 @@ func TestEndToEnd_WebshareDirectMode(t *testing.T) {
 		switch {
 		case r.URL.Path == "/profile/":
 			_, _ = w.Write([]byte(`{"id": 1, "email": "u@example.com"}`))
+		// /proxy/list/refresh/ must come before the broader
+		// /proxy/list/ prefix branch — Go's switch evaluates
+		// top-to-bottom and HasPrefix("/proxy/list/refresh/", "/proxy/list/")
+		// is true, so the order matters.
+		case strings.HasPrefix(r.URL.Path, "/proxy/list/refresh/"):
+			w.WriteHeader(http.StatusNoContent)
 		case strings.HasPrefix(r.URL.Path, "/proxy/list/"):
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"count":    1,
@@ -90,8 +96,6 @@ func TestEndToEnd_WebshareDirectMode(t *testing.T) {
 					CountryCode:  "US",
 				}},
 			})
-		case strings.HasPrefix(r.URL.Path, "/proxy/list/refresh/"):
-			w.WriteHeader(http.StatusNoContent)
 		default:
 			http.NotFound(w, r)
 		}

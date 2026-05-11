@@ -48,9 +48,10 @@ var (
 
 // providerValidator is the hook that lets internal/upstream/provider
 // inject registry-driven validation without the config package needing
-// to import upstream/provider (which would form a cycle). SetProviderValidator
-// is called from a tiny adapter in cmd/tunnelsmith (or in tests) so the
-// concrete provider set is bound at link time.
+// to import upstream/provider (which would form a cycle).
+// SetProviderValidator is called from internal/upstream/providers's
+// package-level init() (cmd/tunnelsmith pulls that package in via a
+// blank import) so the concrete provider set is bound at link time.
 //
 // Nil means "no extra validation": Validate accepts any non-empty provider
 // string. cmd/tunnelsmith always sets a non-nil validator before calling
@@ -58,10 +59,11 @@ var (
 // that exercise config.Validate in isolation.
 var providerValidator func(UpstreamPoolConfig) error
 
-// SetProviderValidator installs the registry-backed pool validator. Call
-// once at program start (cmd/tunnelsmith does this in main via the
-// configadapter sub-package). Passing nil disables provider-specific
-// validation.
+// SetProviderValidator installs the registry-backed pool validator.
+// internal/upstream/providers calls this in its init() and is itself
+// blank-imported by cmd/tunnelsmith; tests that exercise config in
+// isolation install their own validator from TestMain. Passing nil
+// disables provider-specific validation.
 func SetProviderValidator(fn func(UpstreamPoolConfig) error) {
 	providerValidator = fn
 }

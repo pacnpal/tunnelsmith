@@ -46,7 +46,7 @@ Defaults (`mode = "direct"`, `kind = "http"`, `country_codes = []`, `refresh = "
 Webshare's API token is account-wide. Two options:
 
 - **`api_token`** — inline in the TOML. Cleartext in `--print-config` and in any logs that dump the resolved config. Use only for throwaway tokens or short-lived debugging.
-- **`api_token_file`** — absolute path to a one-token-per-file file (whitespace and a trailing newline are stripped). Recommended for production. The file must exist at startup; SIGHUP re-reads it.
+- **`api_token_file`** — absolute path to a one-token-per-file file (whitespace and a trailing newline are stripped). Recommended for production. The file must exist at startup; the token is read once during pool expansion and the in-memory copy is reused by the refresh ticker and the control-API surface. **Rotation requires a restart** in v1 — the SIGHUP path does not re-read the Webshare token file (the Phase 12 `auth_tokens_file` reload is for the control listener's own bearer tokens, not the vendor token).
 
 ### Vendor API
 

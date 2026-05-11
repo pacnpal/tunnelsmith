@@ -42,6 +42,17 @@ import (
 // POST /v1/providers/{name}/refresh.
 var ErrAPINotSupported = errors.New("provider: vendor API not supported")
 
+// ErrAPIRateLimited is the cross-provider sentinel a provider's API
+// implementation wraps when the vendor signals a rate-limit response
+// (Webshare answers 429, for example). The control handler maps it to
+// HTTP 429 so an operator scripting against /v1/providers/{x}/refresh
+// can distinguish "back off and retry" from a generic vendor failure.
+//
+// Providers should wrap with %w so errors.Is(err, provider.ErrAPIRateLimited)
+// matches across the chain; the wrapped value should keep the original
+// vendor-specific error for diagnostic output.
+var ErrAPIRateLimited = errors.New("provider: vendor API rate limited")
+
 // Expander turns a provider's view of the world into the
 // config.UpstreamConfig slice the priority pool consumes. The contract
 // matches what cmd/tunnelsmith already drives for Mullvad so the pool

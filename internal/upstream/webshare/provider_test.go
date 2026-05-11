@@ -55,13 +55,35 @@ func TestProviderValidateConfig(t *testing.T) {
 			t.Fatalf("ValidateConfig: got %v, want countries error", err)
 		}
 	})
-	t.Run("invalid country code", func(t *testing.T) {
+	t.Run("invalid country code length", func(t *testing.T) {
 		err := p.ValidateConfig(config.UpstreamPoolConfig{
 			IDPrefix: "ws", APIToken: "tok",
 			CountryCodes: []string{"USA"},
 		})
 		if err == nil || !strings.Contains(err.Error(), "two-letter") {
 			t.Fatalf("ValidateConfig: got %v, want ISO error", err)
+		}
+	})
+	t.Run("invalid country code non-letter", func(t *testing.T) {
+		for _, bad := range []string{"1!", "  ", "U ", "U1"} {
+			err := p.ValidateConfig(config.UpstreamPoolConfig{
+				IDPrefix: "ws", APIToken: "tok",
+				CountryCodes: []string{bad},
+			})
+			if err == nil || !strings.Contains(err.Error(), "ASCII letters only") {
+				t.Errorf("ValidateConfig(%q): got %v, want non-letter error", bad, err)
+			}
+		}
+	})
+	t.Run("country codes case-insensitive accepted", func(t *testing.T) {
+		// Lowercase codes are accepted at validate time; the API
+		// call normalises them to uppercase before sending.
+		err := p.ValidateConfig(config.UpstreamPoolConfig{
+			IDPrefix: "ws", APIToken: "tok",
+			CountryCodes: []string{"us", "Gb", "DE"},
+		})
+		if err != nil {
+			t.Fatalf("ValidateConfig: %v", err)
 		}
 	})
 	t.Run("invalid mode", func(t *testing.T) {
@@ -80,6 +102,38 @@ func TestProviderValidateConfig(t *testing.T) {
 			t.Fatalf("ValidateConfig: got %v, want kind error", err)
 		}
 	})
+}
+
+// TestProviderAPIWrapsRateLimited locks in the contract the control
+// listener relies on: a Webshare-side 429 must surface as
+// provider.ErrAPIRateLimited at the API boundary so the control
+// handler's errors.Is check maps it to HTTP 429 without importing
+// this package.
+func TestProviderAPIWrapsRateLimited(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	t.Cleanup(srv.Close)
+
+	p := &Provider{}
+	api, err := p.BuildAPI(config.UpstreamPoolConfig{
+		Provider: "webshare", IDPrefix: "ws", APIToken: "tok",
+	}, nil)
+	if err != nil {
+		t.Fatalf("BuildAPI: %v", err)
+	}
+	a := api.(*apiAdapter)
+	a.client.BaseURL = srv.URL
+	a.client.HTTPClient = srv.Client()
+	gotErr := a.RefreshProxyList(context.Background(), provider.RefreshOptions{})
+	if !errors.Is(gotErr, provider.ErrAPIRateLimited) {
+		t.Fatalf("RefreshProxyList err = %v, want wrapping provider.ErrAPIRateLimited", gotErr)
+	}
+	// The wrapped vendor error must still be reachable so logs and
+	// JSON envelopes carry the webshare-specific message.
+	if !errors.Is(gotErr, ErrRateLimited) {
+		t.Fatalf("RefreshProxyList err = %v, want also wrapping webshare.ErrRateLimited", gotErr)
+	}
 }
 
 func TestProviderBuildAPIRefreshes(t *testing.T) {
@@ -155,9 +209,11 @@ func TestProviderBuildExpanderLoadsTokenFile(t *testing.T) {
 func TestProviderBuildAPITokenError(t *testing.T) {
 	p := &Provider{}
 	// Both empty: BuildExpander/BuildAPI must fail before any
-	// HTTP call leaves the binary.
+	// HTTP call leaves the binary. ErrTokenMissing is the
+	// sentinel resolveToken returns so the assertion uses
+	// errors.Is rather than a brittle substring match.
 	_, err := p.BuildAPI(config.UpstreamPoolConfig{IDPrefix: "ws"}, nil)
-	if err == nil || !errors.Is(err, errors.New("webshare: no api_token or api_token_file configured")) && !strings.Contains(err.Error(), "no api_token") {
-		t.Fatalf("BuildAPI: got %v, want missing-token error", err)
+	if !errors.Is(err, ErrTokenMissing) {
+		t.Fatalf("BuildAPI: got %v, want ErrTokenMissing", err)
 	}
 }

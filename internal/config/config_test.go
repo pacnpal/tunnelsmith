@@ -31,8 +31,13 @@ func TestMain(m *testing.M) {
 			}
 			return nil
 		case "webshare":
-			if cfg.APIToken == "" && cfg.APITokenFile == "" {
+			hasInline := strings.TrimSpace(cfg.APIToken) != ""
+			hasFile := strings.TrimSpace(cfg.APITokenFile) != ""
+			if !hasInline && !hasFile {
 				return fmt.Errorf("webshare: one of api_token or api_token_file is required")
+			}
+			if hasInline && hasFile {
+				return fmt.Errorf("webshare: set only one of api_token or api_token_file")
 			}
 			return nil
 		default:

@@ -688,7 +688,15 @@ func expandUpstreamPools(ctx context.Context, blocks []config.UpstreamPoolConfig
 // provider has no API still appear (with HasAPI=false) so an operator
 // running GET /v1/providers can confirm the block is wired even though
 // refresh would return 501.
+//
+// Returns nil when there are no [[upstream_pool]] blocks at all. The
+// control listener leaves /v1/providers and /v1/providers/{x}/refresh
+// unmounted in that case, preserving the original wire shape (404 on
+// those paths) for deployments that don't use the feature.
 func buildProviderRegistry(blocks []*poolBlock) *control.ProviderRegistry {
+	if len(blocks) == 0 {
+		return nil
+	}
 	bindings := make([]control.ProviderAPIBinding, 0, len(blocks))
 	for _, b := range blocks {
 		bindings = append(bindings, control.ProviderAPIBinding{

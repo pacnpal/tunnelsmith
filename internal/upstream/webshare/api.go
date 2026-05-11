@@ -71,8 +71,10 @@ var ErrUnauthorized = errors.New("webshare: unauthorized (check api_token)")
 var ErrForbidden = errors.New("webshare: forbidden")
 
 // ErrRateLimited is returned when Webshare answers 429. The caller
-// should back off and try again later; the control endpoint surfaces
-// this as 429 to the operator.
+// should back off and try again later. The apiAdapter in provider.go
+// wraps this with provider.ErrAPIRateLimited so the control listener's
+// generic dispatcher can map it to HTTP 429 without importing this
+// package.
 var ErrRateLimited = errors.New("webshare: rate limited")
 
 // Proxy is a single entry in Webshare's proxy list. Field names track
@@ -141,8 +143,15 @@ func NewClient() *Client {
 	}
 }
 
-// LoadTokenFile reads a single token from path. Whitespace and a
+// LoadTokenFile reads a single token from path. Outer whitespace and a
 // trailing newline are stripped; empty files return an explicit error.
+// Files containing more than one whitespace-separated field are also
+// rejected: a file with an accidental second line (logrotate footer,
+// editor scratch) would otherwise become a single "token\nnoise"
+// Authorization header that Webshare quietly rejects at request time,
+// which is harder to diagnose than the load-time error this guard
+// produces.
+//
 // The path must be absolute (config.Validate enforces this) so a
 // relative path in development cannot silently resolve under a CWD the
 // operator did not intend.
@@ -157,6 +166,9 @@ func LoadTokenFile(path string) (string, error) {
 	tok := strings.TrimSpace(string(data))
 	if tok == "" {
 		return "", fmt.Errorf("webshare: api_token_file %q is empty", path)
+	}
+	if len(strings.Fields(tok)) != 1 {
+		return "", fmt.Errorf("webshare: api_token_file %q must contain exactly one token (no embedded whitespace or extra lines)", path)
 	}
 	return tok, nil
 }
@@ -180,7 +192,15 @@ func (c *Client) Profile(ctx context.Context) (*Profile, error) {
 // ListProxies follows pagination and returns the full list in one
 // slice. The Cache, if configured, is written on success so a later
 // network outage can still produce a usable list; cached reads only
-// happen when the live fetch fails.
+// happen when the live fetch fails AND the failure is transient.
+//
+// Auth-class failures (401, 403) and rate-limit (429) deliberately
+// do NOT fall back to the cache: a revoked token, an expired plan,
+// or a quota cap should not be silently masked by a stale list,
+// because the operator would keep dialing through proxies the vendor
+// no longer authorises. Network-class failures (DNS, TCP, timeout,
+// 5xx) still fall back so a transient API hiccup doesn't drop the
+// running pool.
 func (c *Client) ListProxies(ctx context.Context, opts ListProxiesOptions) ([]Proxy, error) {
 	out, fetchErr := c.listProxiesOnline(ctx, opts)
 	if fetchErr == nil {
@@ -194,10 +214,29 @@ func (c *Client) ListProxies(ctx context.Context, opts ListProxiesOptions) ([]Pr
 		}
 		return out, nil
 	}
-	if cached, ok := c.tryCacheFallback(); ok {
-		return cached, nil
+	if cacheFallbackAllowed(fetchErr) {
+		if cached, ok := c.tryCacheFallback(); ok {
+			return cached, nil
+		}
 	}
 	return nil, fetchErr
+}
+
+// cacheFallbackAllowed reports whether a stale cached list is a safe
+// substitute for the failed live fetch. Returns false for auth and
+// rate-limit errors because those represent a vendor-side intentional
+// reject that the operator should see, not paper over.
+func cacheFallbackAllowed(err error) bool {
+	switch {
+	case errors.Is(err, ErrUnauthorized):
+		return false
+	case errors.Is(err, ErrForbidden):
+		return false
+	case errors.Is(err, ErrRateLimited):
+		return false
+	default:
+		return true
+	}
 }
 
 // listProxiesOnline performs the actual paginated walk. Separate so
@@ -219,7 +258,15 @@ func (c *Client) listProxiesOnline(ctx context.Context, opts ListProxiesOptions)
 		q.Set("plan_id", opts.PlanID)
 	}
 	if len(opts.CountryCodes) > 0 {
-		q.Set("country_code__in", strings.Join(opts.CountryCodes, ","))
+		// Normalize to uppercase before sending. Webshare's API
+		// matches ISO codes case-sensitively in some plan flavours;
+		// the provider already validated that each entry is two
+		// ASCII letters, so ToUpper is safe and deterministic.
+		upper := make([]string, len(opts.CountryCodes))
+		for i, c := range opts.CountryCodes {
+			upper[i] = strings.ToUpper(c)
+		}
+		q.Set("country_code__in", strings.Join(upper, ","))
 	}
 	if opts.Search != "" && mode == "direct" {
 		// Search is documented as ignored in backbone mode. Pass it

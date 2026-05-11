@@ -91,12 +91,15 @@ func (e *Expander) transform(proxies []Proxy) []config.UpstreamConfig {
 		if !p.Valid {
 			continue
 		}
-		if p.ProxyAddress == "" || p.Port == 0 {
+		if p.ProxyAddress == "" || p.Port < 1 || p.Port > 65535 {
 			// Backbone mode returns a constant address; direct returns
-			// per-proxy IPs. Either way a missing field is a server
-			// glitch we'd rather skip than turn into a bad upstream.
-			e.log.Warn("webshare expander: skip proxy with empty address/port",
+			// per-proxy IPs. Either way a missing or out-of-range field
+			// is a server glitch we'd rather skip than turn into a bad
+			// upstream that would fail every dial.
+			e.log.Warn("webshare expander: skip proxy with invalid address/port",
 				slog.String("id", p.ID),
+				slog.String("address", p.ProxyAddress),
+				slog.Int("port", p.Port),
 			)
 			continue
 		}

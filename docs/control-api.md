@@ -8,7 +8,7 @@ The control endpoint serves three families of routes:
 - **`GET /v1/providers`** + **`POST /v1/providers/{id_prefix}/refresh`** — vendor-API surface for `[[upstream_pool]]` providers that expose one.
 - **`GET /healthz`** — liveness probe.
 
-This document covers the provider routes. They are off by default; configuring at least one `[[upstream_pool]]` block whose provider implements `provider.API` (currently: Webshare) brings them online.
+This document covers the provider routes. They are mounted only when the running config carries at least one `[[upstream_pool]]` block — operators running a static `[[upstream]]`-only config get the old wire shape (404 on these paths). When a pool block exists but its provider has no vendor API (e.g. `provider = "mullvad"`), `GET /v1/providers` still lists it (with `has_api: false`) and `POST /v1/providers/{id_prefix}/refresh` returns 501 Not Implemented.
 
 ## Authentication
 
@@ -83,10 +83,11 @@ Error responses:
 | Status | When | Body |
 |--------|------|------|
 | `401`  | Auth required (token set non-empty) and `Authorization: Bearer <token>` missing/malformed/unknown. | RFC 6750 `WWW-Authenticate: Bearer realm="tunnelsmith"`; plain-text body |
-| `404`  | `{id_prefix}` does not match any registered pool block. | plain text |
+| `404`  | `{id_prefix}` does not match any registered pool block, **or** the entire route family is unmounted (no `[[upstream_pool]]` configured). | plain text |
 | `405`  | Wrong method (only `POST` is accepted). | `Allow: POST`; plain text |
+| `429`  | The vendor signaled rate-limited (Webshare answers 429 when on-demand refreshes exceed plan quota). Operators should back off before retrying. | JSON refresh-error envelope |
 | `501`  | Pool block exists, but the provider has no `API` surface (e.g. `provider = "mullvad"`). | JSON refresh-error envelope |
-| `502`  | The vendor's API returned an error (e.g. Webshare 403 when `on_demand_refreshes_available` is zero). | JSON refresh-error envelope; error message preserved verbatim from the vendor |
+| `502`  | The vendor's API returned a non-rate-limit error (e.g. Webshare 403 when `on_demand_refreshes_available` is zero). | JSON refresh-error envelope; error message preserved verbatim from the vendor |
 | `504`  | The vendor's API did not respond within the 30-second per-request timeout. | JSON refresh-error envelope |
 
 The refresh-error envelope:
@@ -95,11 +96,17 @@ The refresh-error envelope:
 {
   "id_prefix": "ws",
   "provider":  "webshare",
-  "error":     "webshare: forbidden"
+  "error":     "vendor rate limited"
 }
 ```
 
-Provider errors are logged at WARN with full context (`id_prefix`, `provider`, `err`); the HTTP response carries only the error text so an operator scripting against the endpoint sees the same string the log line carries.
+The `error` field is a short category string drawn from a closed vocabulary so vendor-side details (response bodies, internal hostnames, token-derived URLs) never escape through the HTTP response. The full error chain is logged at WARN with `id_prefix`, `provider`, `http_status`, and the wrapped `err`; that log line is the operator-facing diagnostic. Current categories:
+
+| Category              | Status | When |
+|-----------------------|--------|------|
+| `"upstream timeout"`  | 504    | provider call exceeded the 30-second deadline |
+| `"vendor rate limited"` | 429  | provider's API returned a rate-limit response (Webshare 429) |
+| `"refresh failed"`    | 502    | any other provider-side error |
 
 ## Adding new provider routes
 

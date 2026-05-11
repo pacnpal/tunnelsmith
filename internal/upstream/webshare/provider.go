@@ -10,6 +10,11 @@ import (
 	"github.com/pacnpal/tunnelsmith/internal/upstream/provider"
 )
 
+// ErrTokenMissing is returned by buildClient when neither api_token nor
+// api_token_file is set. Surfaced as a sentinel so tests and callers
+// can match it with errors.Is rather than string-matching the message.
+var ErrTokenMissing = errors.New("webshare: no api_token or api_token_file configured")
+
 // ProviderName is the [[upstream_pool]] provider value this package
 // registers under.
 const ProviderName = "webshare"
@@ -66,11 +71,28 @@ func (p *Provider) ValidateConfig(cfg config.UpstreamPoolConfig) error {
 		return errors.New("webshare: use country_codes (ISO 3166-1 alpha-2) instead of countries")
 	}
 	for i, code := range cfg.CountryCodes {
-		if len(code) != 2 {
-			return fmt.Errorf("webshare: country_codes[%d] %q must be a two-letter ISO 3166-1 alpha-2 code", i, code)
+		if !isISOAlpha2(code) {
+			return fmt.Errorf("webshare: country_codes[%d] %q must be a two-letter ISO 3166-1 alpha-2 code (ASCII letters only)", i, code)
 		}
 	}
 	return nil
+}
+
+// isISOAlpha2 reports whether s is exactly two ASCII letters. Webshare's
+// API expects ISO 3166-1 alpha-2 codes; values like "1!" or " U" or
+// "USA" would silently produce zero matches at runtime, so reject them
+// at config-load.
+func isISOAlpha2(s string) bool {
+	if len(s) != 2 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < 'A' || c > 'Z') && (c < 'a' || c > 'z') {
+			return false
+		}
+	}
+	return true
 }
 
 // BuildExpander loads the API token (from inline or file), builds a
@@ -99,9 +121,11 @@ func (p *Provider) BuildExpander(cfg config.UpstreamPoolConfig, logger *slog.Log
 	return exp, nil
 }
 
-// BuildAPI returns the vendor API surface. Webshare's surface is one
-// call (RefreshProxyList) plus Profile, which the control endpoint
-// uses as a "ping" to validate credentials.
+// BuildAPI returns the vendor API surface. The provider.API interface
+// only declares RefreshProxyList in v1, so that is the single method
+// the control endpoint dispatches against. The webshare.Client also
+// exposes Profile and other methods directly for future expansion;
+// they are not part of the control surface today.
 func (p *Provider) BuildAPI(cfg config.UpstreamPoolConfig, logger *slog.Logger) (provider.API, error) {
 	if logger == nil {
 		logger = slog.Default()
@@ -138,7 +162,7 @@ func resolveToken(cfg config.UpstreamPoolConfig) (string, error) {
 	case cfg.APITokenFile != "":
 		return LoadTokenFile(cfg.APITokenFile)
 	default:
-		return "", errors.New("webshare: no api_token or api_token_file configured")
+		return "", ErrTokenMissing
 	}
 }
 
@@ -155,7 +179,26 @@ func (a *apiAdapter) RefreshProxyList(ctx context.Context, opts provider.Refresh
 	if planID == "" {
 		planID = a.planID
 	}
-	return a.client.RefreshProxyList(ctx, planID)
+	return wrapVendorErr(a.client.RefreshProxyList(ctx, planID))
+}
+
+// wrapVendorErr translates Webshare-specific typed errors into the
+// cross-provider sentinels declared in package provider so the control
+// listener can dispatch on errors.Is without importing this package
+// (which would form an import cycle through internal/upstream/providers).
+//
+// %w on both sides preserves the wrapped chain: the control handler
+// sees provider.ErrAPIRateLimited; an operator reading the JSON
+// response body still sees the Webshare-specific message.
+func wrapVendorErr(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, ErrRateLimited):
+		return fmt.Errorf("%w: %w", provider.ErrAPIRateLimited, err)
+	default:
+		return err
+	}
 }
 
 func init() { provider.MustRegister(NewProvider()) }

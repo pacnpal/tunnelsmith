@@ -35,8 +35,6 @@ func TestExpanderSnapshotTransforms(t *testing.T) {
 		{ID: "d-20", Username: "u", Password: "p", ProxyAddress: "2.2.2.2", Port: 8002, Valid: false, CountryCode: "DE"},
 		{ID: "d-30", Username: "u", Password: "p", ProxyAddress: "3.3.3.3", Port: 8003, Valid: true, CountryCode: "GB"},
 	})
-	priority := 200
-	_ = priority
 	exp, err := NewExpander(ExpanderConfig{IDPrefix: "ws", Priority: 200}, c, nil)
 	if err != nil {
 		t.Fatalf("NewExpander: %v", err)
@@ -118,7 +116,10 @@ func TestExpanderSnapshotIsSortedByID(t *testing.T) {
 		{ID: "d-10", ProxyAddress: "1.1.1.1", Port: 1, Valid: true},
 		{ID: "d-20", ProxyAddress: "2.2.2.2", Port: 1, Valid: true},
 	})
-	exp, _ := NewExpander(ExpanderConfig{IDPrefix: "ws", Priority: 1}, c, nil)
+	exp, err := NewExpander(ExpanderConfig{IDPrefix: "ws", Priority: 1}, c, nil)
+	if err != nil {
+		t.Fatalf("NewExpander: %v", err)
+	}
 	got, err := exp.Snapshot(context.Background())
 	if err != nil {
 		t.Fatalf("Snapshot: %v", err)

@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -18,17 +19,26 @@ import (
 // It only knows the endpoints the Client touches; each handler asserts
 // the Authorization header so a regression that drops the token would
 // fail loudly.
+//
+// Dispatch is longest-prefix-wins so a test that registers both
+// "/proxy/list/" and "/proxy/list/refresh/" gets deterministic
+// behaviour (Go's map iteration is randomised; a plain for-range over
+// the map would flake).
 func newFakeServer(t *testing.T, handlers map[string]http.HandlerFunc) (*httptest.Server, *[]string) {
 	t.Helper()
+	prefixes := make([]string, 0, len(handlers))
+	for p := range handlers {
+		prefixes = append(prefixes, p)
+	}
+	sort.Slice(prefixes, func(i, j int) bool {
+		return len(prefixes[i]) > len(prefixes[j])
+	})
 	var receivedTokens []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		receivedTokens = append(receivedTokens, r.Header.Get("Authorization"))
-		// Match by path prefix so /proxy/list/?page=2 dispatches the
-		// same handler as /proxy/list/. The handler map keys are
-		// raw paths (no query).
-		for prefix, h := range handlers {
+		for _, prefix := range prefixes {
 			if strings.HasPrefix(r.URL.Path, prefix) {
-				h(w, r)
+				handlers[prefix](w, r)
 				return
 			}
 		}
@@ -154,6 +164,33 @@ func TestListProxiesSendsModeAndCountryFilter(t *testing.T) {
 	}
 }
 
+// TestListProxiesNormalizesCountryCodes asserts lowercase / mixed-case
+// ISO codes are uppercased before being sent to the vendor. Webshare's
+// docs imply case-sensitive matching in some plan flavours; the
+// expander already validates ASCII letters, so the API layer just
+// needs to canonicalise.
+func TestListProxiesNormalizesCountryCodes(t *testing.T) {
+	var observed string
+	srv, _ := newFakeServer(t, map[string]http.HandlerFunc{
+		"/proxy/list/": func(w http.ResponseWriter, r *http.Request) {
+			observed = r.URL.RawQuery
+			_, _ = w.Write(mustEncode(t, paginatedResponse([]Proxy{}, "")))
+		},
+	})
+	c := NewClient()
+	c.BaseURL = srv.URL
+	c.APIToken = "tok"
+	c.HTTPClient = srv.Client()
+	if _, err := c.ListProxies(context.Background(), ListProxiesOptions{
+		CountryCodes: []string{"us", "Gb", "DE"},
+	}); err != nil {
+		t.Fatalf("ListProxies: %v", err)
+	}
+	if !strings.Contains(observed, "country_code__in=US%2CGB%2CDE") {
+		t.Fatalf("country codes not normalised: %q", observed)
+	}
+}
+
 func TestRefreshProxyListAcceptsNoContent(t *testing.T) {
 	called := 0
 	srv, _ := newFakeServer(t, map[string]http.HandlerFunc{
@@ -232,6 +269,53 @@ func TestRefreshProxyListSurfacesRateLimited(t *testing.T) {
 	}
 }
 
+// TestListProxiesSkipsCacheOnAuthFailure pins the security stance that
+// a 401 / 403 / 429 must propagate to the caller even when a stale
+// cache could mask it. Otherwise a revoked token would silently keep
+// serving from the disk snapshot.
+func TestListProxiesSkipsCacheOnAuthFailure(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		want   error
+	}{
+		{"unauthorized", http.StatusUnauthorized, ErrUnauthorized},
+		{"forbidden", http.StatusForbidden, ErrForbidden},
+		{"rate limited", http.StatusTooManyRequests, ErrRateLimited},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, _ := newFakeServer(t, map[string]http.HandlerFunc{
+				"/proxy/list/": func(w http.ResponseWriter, _ *http.Request) {
+					w.WriteHeader(tc.status)
+				},
+			})
+			// Seed a populated cache; a regression would silently
+			// return cached entries here.
+			cachePath := filepath.Join(t.TempDir(), "cache.json")
+			cached := []Proxy{{ID: "d-99", ProxyAddress: "9.9.9.9", Port: 1, Valid: true}}
+			if err := (&Cache{Path: cachePath}).Write(cached); err != nil {
+				t.Fatalf("seed cache: %v", err)
+			}
+			c := NewClient()
+			c.BaseURL = srv.URL
+			c.APIToken = "tok"
+			c.HTTPClient = srv.Client()
+			c.Cache = &Cache{Path: cachePath}
+			got, err := c.ListProxies(context.Background(), ListProxiesOptions{})
+			if err == nil {
+				t.Fatalf("expected error, got nil and %+v", got)
+			}
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("err = %v, want wrapping %v", err, tc.want)
+			}
+			if got != nil {
+				t.Fatalf("expected nil list on auth/rate-limit, got %+v", got)
+			}
+		})
+	}
+}
+
 func TestListProxiesFallsBackToCache(t *testing.T) {
 	// API returns 500 every time; the cache has a list.
 	srv, _ := newFakeServer(t, map[string]http.HandlerFunc{
@@ -304,6 +388,30 @@ func TestLoadTokenFile(t *testing.T) {
 	}
 	if _, err := LoadTokenFile(empty); err == nil {
 		t.Fatal("expected error for empty file, got nil")
+	}
+}
+
+func TestLoadTokenFileRejectsMultipleTokens(t *testing.T) {
+	dir := t.TempDir()
+	cases := map[string]string{
+		"two lines":       "tok1\ntok2\n",
+		"space separated": "tok1 tok2",
+		"trailing junk":   "tok1\nfooter line\n",
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(dir, name)
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			_, err := LoadTokenFile(path)
+			if err == nil {
+				t.Fatal("expected error for multi-field file, got nil")
+			}
+			if !strings.Contains(err.Error(), "exactly one token") {
+				t.Fatalf("err = %v, want one mentioning 'exactly one token'", err)
+			}
+		})
 	}
 }
 

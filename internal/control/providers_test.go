@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -138,6 +139,27 @@ func TestProviderRefreshSurfacesUpstreamErrorAsBadGateway(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502", resp.StatusCode)
+	}
+}
+
+// TestProviderRefreshMapsRateLimitedTo429 locks the contract that lets
+// an operator scripting against /v1/providers/{x}/refresh tell "back
+// off and retry" from a generic vendor failure. The provider's API
+// implementation wraps its vendor-specific rate-limit error with
+// provider.ErrAPIRateLimited; the control handler must dispatch on
+// the sentinel to return 429.
+func TestProviderRefreshMapsRateLimitedTo429(t *testing.T) {
+	api := &fakeAPI{err: fmt.Errorf("%w: vendor said no", provider.ErrAPIRateLimited)}
+	srv := newProviderTestServer(t, []ProviderAPIBinding{
+		{IDPrefix: "ws", Provider: "webshare", API: api},
+	}, nil)
+	resp, err := http.Post(srv.URL+"/v1/providers/ws/refresh", "", nil)
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", resp.StatusCode)
 	}
 }
 

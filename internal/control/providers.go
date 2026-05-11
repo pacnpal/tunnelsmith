@@ -203,19 +203,26 @@ func handleProviderRefresh(w http.ResponseWriter, r *http.Request, registry *Pro
 	ctx, cancel := context.WithTimeout(r.Context(), providerRefreshTimeout)
 	defer cancel()
 	if err := binding.API.RefreshProxyList(ctx, provider.RefreshOptions{PlanID: planID}); err != nil {
-		status := http.StatusBadGateway
-		if errors.Is(err, context.DeadlineExceeded) {
-			status = http.StatusGatewayTimeout
-		}
-		// Provider errors carry useful diagnostic but might also
-		// leak vendor-side details. Surface the type via the JSON
-		// "error" field; log the full chain at WARN for operators.
+		// Map known provider error sentinels to the closest HTTP
+		// status so an operator scripting against the route can
+		// distinguish "back off and retry" (429) from a timeout
+		// (504) from a generic vendor failure (502). The default
+		// is 502 because a vendor that returned an error is still
+		// effectively a bad gateway from the operator's view.
+		status, publicMsg := classifyProviderError(err)
+		// The full err chain stays in the operator log; the JSON
+		// response body carries only the category string so vendor-
+		// side detail (response bodies, internal hostnames, token-
+		// derived URLs from any %w wrapping) never escapes the
+		// operator's own infrastructure even though the route is
+		// bearer-token gated.
 		logger.Warn("provider refresh failed",
 			"id_prefix", idPrefix,
 			"provider", binding.Provider,
+			"http_status", status,
 			"err", err,
 		)
-		writeRefreshError(w, status, binding, err.Error())
+		writeRefreshError(w, status, binding, publicMsg)
 		return
 	}
 	logger.Info("provider refresh triggered",
@@ -229,6 +236,23 @@ func handleProviderRefresh(w http.ResponseWriter, r *http.Request, registry *Pro
 		Provider: binding.Provider,
 		Status:   "accepted",
 	})
+}
+
+// classifyProviderError maps a provider.API.RefreshProxyList error to
+// (HTTP status, sanitised public message). The public message is short
+// and category-level so vendor-side detail never leaves the binary
+// through the HTTP body; full err chains live in the operator log
+// instead. The match order matters: more-specific sentinels first,
+// generic fall-through at the end.
+func classifyProviderError(err error) (int, string) {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return http.StatusGatewayTimeout, "upstream timeout"
+	case errors.Is(err, provider.ErrAPIRateLimited):
+		return http.StatusTooManyRequests, "vendor rate limited"
+	default:
+		return http.StatusBadGateway, "refresh failed"
+	}
 }
 
 func writeRefreshError(w http.ResponseWriter, status int, binding ProviderAPIBinding, msg string) {
