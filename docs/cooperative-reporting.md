@@ -14,7 +14,7 @@ You decide what counts as "the request worked" or "this exit is broken for this 
 
 ## What this is not
 
-- Not authentication. The control endpoint trusts the network boundary, same as the UI listener. Bind it to loopback or to a private subnet only.
+- Not authentication by default. Phase 11 ships with no credential check; the security boundary is the network (bind to loopback or a private subnet). Phase 12 adds **opt-in** bearer-token auth on top — see the Auth section below. Even with tokens on, the network is still part of the trust story (tokens travel in plaintext until Phase 13 ships TLS on the control listener).
 - Not idempotent. If your app retries a report, the scoreboard gets penalized twice. Deduplicate on your side if you care.
 - Not sufficient for uninstrumented clients. Browsers, closed-source SDKs, OS update channels, and anything else you cannot modify do not benefit. ADR-006 lists this explicitly as a non-goal.
 
@@ -119,12 +119,40 @@ The Go SDK auto-reports `429` → `rate_limited`, `403` → `forbidden`, and `45
 
 ### Trust boundary
 
-There is no auth on `/v1/report`. The operator is responsible for:
+The control listener supports two modes:
 
-- Binding the control listener to loopback or a private subnet (`control.bind` in the config).
-- Trusting any client that can reach the listener.
+- **No auth (default).** `auth_tokens` empty and `auth_tokens_file` unset. Any client that can reach the listener can submit reports. Bind to loopback or a private subnet (`control.bind` in the config).
+- **Bearer-token auth (Phase 12, opt-in).** `auth_tokens` and/or `auth_tokens_file` non-empty. Every `POST /v1/report` must carry `Authorization: Bearer <token>`. See the Auth section below.
 
-If you need to expose the control endpoint to a public interface, wait for Phase 12 token auth or front it with a reverse proxy that enforces auth itself.
+Even with bearer-token auth on, **tokens travel in plaintext on the control listener** — TLS termination on the listener itself is a Phase 13 candidate. Until then, treat the network path between your apps and Tunnelsmith as semi-trusted: bind to loopback or to a private subnet, use short-lived tokens, and rotate via SIGHUP. If you need TLS today, front the control listener with a reverse proxy that terminates TLS.
+
+### Auth (Phase 12)
+
+Enable on the server side by adding tokens to `[control]`:
+
+```toml
+[control]
+bind = ":9092"
+auth_tokens = ["replace-me-with-a-long-random-string"]
+# auth_tokens_file = "/etc/tunnelsmith/control_tokens"  # one token per line, # comments OK
+# gate_healthz = false                                  # default false; true gates /healthz too
+```
+
+Token rotation is a SIGHUP away. On a clean reload the inline list and the file are re-read and the dedup'd union becomes the live token set. A missing `auth_tokens_file` at startup warns and is treated as empty (the next SIGHUP re-reads it). A missing `auth_tokens_file` on SIGHUP is different: the runtime warns but **preserves the current live token set** rather than rotating, so a logrotate-style brief disappearance does not silently disable auth (side-effect: inline edits made in the same config bump are also deferred until the file resolves cleanly). At runtime, the inline list and the file form one set: if you list a token both ways, the inline ordering wins.
+
+**Client side**, attach the bearer credential. For Go apps using the SDK, set `client.Options.Token` and the SDK adds the header to every report. For non-Go apps, add one header to your existing POST:
+
+```http
+POST /v1/report HTTP/1.1
+Content-Type: application/json
+Authorization: Bearer <token>
+
+{ "host": "...", "upstream": "...", "outcome": "..." }
+```
+
+The server emits `401 Unauthorized` for a missing or unknown token, with `WWW-Authenticate: Bearer realm="tunnelsmith"`. Two new metric labels expose the rejection cause: `tunnelsmith_reports_rejected_total{reason="auth_missing"}` (no `Authorization` header on a gated endpoint) and `tunnelsmith_reports_rejected_total{reason="auth_failed"}` (header present but malformed, multiple `Authorization` headers, or token unknown). Operators with alerting on the existing reject counter should add a panel for these two labels. SDK clients see the 401 surfaced as an error from `client.Report` — the SDK does **not** retry 401 since it always indicates a configuration mismatch rather than a transient fault.
+
+Token comparison uses `crypto/subtle.ConstantTimeCompare` against every stored token without short-circuiting on match, so the total work is independent of which token (if any) matched. `subtle.ConstantTimeCompare` returns 0 on length mismatch, which leaks the input's length relative to the stored tokens; for v1 we accept that leak since operator-chosen bearer tokens are usually high-entropy fixed-length strings. Tokens are stored in memory as raw strings (no at-rest hashing); protect the config file and the `auth_tokens_file` with normal filesystem permissions (e.g. mode `0600`, owner-only).
 
 ### Body size limit
 
@@ -157,7 +185,7 @@ The control endpoint emits two Prometheus counters under the `tunnelsmith_` name
 | metric | labels | meaning |
 |---|---|---|
 | `tunnelsmith_reports_received_total` | `outcome`, `upstream_id` | Reports the endpoint accepted (status 204). |
-| `tunnelsmith_reports_rejected_total` | `reason` | Reports the endpoint refused. `reason` is one of `bad_json`, `missing_field`, `unknown_outcome`, `unknown_upstream`, `scoreboard_unavailable`. |
+| `tunnelsmith_reports_rejected_total` | `reason` | Reports the endpoint refused. `reason` is one of `bad_json`, `missing_field`, `unknown_outcome`, `unknown_upstream`, `scoreboard_unavailable`, `auth_missing` (Phase 12: no `Authorization` header on a gated endpoint), or `auth_failed` (Phase 12: header malformed, multiple `Authorization` headers, or token unknown). SDK clients see Phase 12 401 responses surfaced as errors from `client.Report` — the SDK does **not** retry 401 since it always indicates a configuration mismatch. |
 
 Watch these as you ship the integration. A spike in `tunnelsmith_reports_rejected_total{reason="unknown_upstream"}` after a config change usually means the app cached an old upstream id; restart the app to clear it.
 

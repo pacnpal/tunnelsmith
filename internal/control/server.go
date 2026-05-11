@@ -9,10 +9,17 @@
 // them into Scoreboard.RecordSuccess / Scoreboard.RecordFailure exactly
 // like the listener-detected status codes from Phase 5.
 //
-// The endpoint deliberately has no auth. The security boundary is the
-// host network or Docker bridge, same as the UI listener; the operator
-// binds Bind to loopback or a private subnet that only trusted clients
-// can reach. docs/cooperative-reporting.md spells this out.
+// Auth is opt-in. Phase 11 shipped the endpoint with no credential
+// check; the operator's only line of defence was binding Bind to
+// loopback or a private subnet. Phase 12 adds optional bearer-token
+// auth (ServerOptions.Tokens; GateHealthz pulls /healthz under the
+// same gate when set). An empty token set keeps the Phase 11 wire
+// shape byte-for-byte; a non-empty set requires Authorization: Bearer
+// <token> on POST /v1/report (and on GET /healthz when GateHealthz is
+// true). docs/cooperative-reporting.md and ADR-007 spell out the
+// trust stance and the threat model around plaintext tokens on this
+// listener (TLS termination on the control listener itself is a
+// Phase 13 candidate).
 //
 // The wire protocol:
 //
@@ -52,26 +59,42 @@ type Server struct {
 	addr   string
 	logger *slog.Logger
 	srv    *http.Server
+	tokens *tokenSet // always non-nil; an empty token set encodes the no-auth default
 
 	ready    chan struct{}
 	listener net.Listener
 	bindErr  error
 }
 
+// ServerOptions threads the Phase 12 auth knobs into NewServer without
+// growing the positional signature past 4 params (the original Phase 11
+// shape). Empty Tokens + GateHealthz=false reproduces Phase 11 behavior
+// exactly; the unauthenticated wire shape stays the default.
+type ServerOptions struct {
+	// Tokens is the initial auth token set. Empty/nil = no auth.
+	Tokens []string
+	// GateHealthz pulls /healthz under the auth gate when Tokens is
+	// also non-empty. Default false keeps liveness probes ungated.
+	GateHealthz bool
+}
+
 // NewServer builds a control HTTP server that serves on addr. backend is
 // the scoreboard surface the report handler calls into; tests pass a fake
 // to drive every endpoint without spinning up a real scoreboard. metrics
 // may be nil; when set, the handlers emit Phase 11 counters through it.
-func NewServer(addr string, backend Backend, metrics MetricsSink, logger *slog.Logger) *Server {
+// opts may be a zero value, which keeps the Phase 11 no-auth default.
+func NewServer(addr string, backend Backend, metrics MetricsSink, opts ServerOptions, logger *slog.Logger) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	logger = logger.With("component", "control")
+	tokens := NewTokenSet(opts.Tokens)
 	mux := http.NewServeMux()
-	mountHandlers(mux, backend, metrics, logger)
+	mountHandlers(mux, backend, metrics, tokens, opts.GateHealthz, logger)
 	return &Server{
 		addr:   addr,
 		logger: logger,
+		tokens: tokens,
 		srv: &http.Server{
 			Addr:              addr,
 			Handler:           mux,
@@ -79,6 +102,21 @@ func NewServer(addr string, backend Backend, metrics MetricsSink, logger *slog.L
 		},
 		ready: make(chan struct{}),
 	}
+}
+
+// ReplaceTokens atomically swaps the live auth token set, used by the
+// SIGHUP reloader so an operator can rotate tokens without bouncing
+// the process. Safe to call concurrently with in-flight requests:
+// each handler calls TokenSource.Snapshot() exactly once at the start
+// of the request and runs every auth question (Enabled, Allow) off
+// that captured view, so an in-flight check keeps a stable decision
+// even if the underlying atomic pointer is rotated mid-handler.
+func (s *Server) ReplaceTokens(tokens []string) {
+	if s == nil || s.tokens == nil {
+		return
+	}
+	s.tokens.Replace(tokens)
+	s.logger.Info("control auth tokens reloaded", "count", len(tokens))
 }
 
 // Ready returns a channel that closes once Serve has either bound the

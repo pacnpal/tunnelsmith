@@ -54,6 +54,8 @@ const (
 	ReportRejectUnknownOutcome       = "unknown_outcome"
 	ReportRejectUnknownUpstream      = "unknown_upstream"
 	ReportRejectScoreboardNotStarted = "scoreboard_unavailable"
+	ReportRejectAuthMissing          = "auth_missing" // Phase 12: control auth on; no Authorization header
+	ReportRejectAuthFailed           = "auth_failed"  // Phase 12: control auth on; header malformed or token unknown
 )
 
 // Registry holds Tunnelsmith's metric vectors and the Prometheus registry
@@ -157,7 +159,7 @@ func New() *Registry {
 		ReportsRejected: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "tunnelsmith",
 			Name:      "reports_rejected_total",
-			Help:      "Number of cooperative outcome reports the control endpoint rejected, labelled by reason (bad_json, missing_field, unknown_outcome, unknown_upstream, scoreboard_unavailable).",
+			Help:      "Number of cooperative outcome reports the control endpoint rejected, labelled by reason (bad_json, missing_field, unknown_outcome, unknown_upstream, scoreboard_unavailable, auth_missing, auth_failed).",
 		}, []string{"reason"}),
 		PoolHotSwaps: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "tunnelsmith",

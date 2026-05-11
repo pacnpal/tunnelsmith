@@ -75,13 +75,24 @@ When set, `bind` must parse via `net.SplitHostPort` with a port in `1-65535`. Th
 
 Phase 11 cooperative-reporting endpoint. Apps that integrate via [`docs/cooperative-reporting.md`](cooperative-reporting.md) POST per-request outcomes here so Tunnelsmith's scoreboard learns from HTTPS traffic the proxy cannot inspect on its own.
 
-| key    | type   | default | notes |
-|--------|--------|---------|-------|
-| `bind` | string | `:9092` | host:port for the control HTTP listener; empty disables it entirely |
+| key                | type     | default | notes |
+|--------------------|----------|---------|-------|
+| `bind`             | string   | `:9092` | host:port for the control HTTP listener; empty disables it entirely |
+| `auth_tokens`      | []string | `[]`    | Phase 12 inline bearer tokens; empty = no auth (Phase 11 wire shape). Each token must be an RFC 6750 token68 string — empty strings **and any token containing whitespace** (leading, trailing, or embedded) are rejected at config-load time, since `extractBearer` either trims them away or fails them as malformed |
+| `auth_tokens_file` | string   | `""`    | Phase 12 absolute path to a one-token-per-line file; `#` comments and blank lines ignored, leading/trailing line whitespace trimmed. A line whose token contains internal whitespace returns an error at load time (same RFC 6750 token68 rule as `auth_tokens`). A missing file at startup warns and is treated as empty (SIGHUP retries). Combined with `auth_tokens` as a dedup'd union |
+| `gate_healthz`     | bool     | `false` | when `true` and auth is enabled, `/healthz` also requires `Authorization: Bearer <token>`. Default `false` keeps liveness probes ungated for orchestrators that cannot inject a token |
 
-When set, `bind` must parse via `net.SplitHostPort` with a port in `1-65535`. Like `[ui]`, the control port is **unauthenticated**: there is no login, no token, no rate limit. `POST /v1/report` mutates scoreboard state every time it is called. Bind it to a loopback address or to the private subnet your trusted apps reach Tunnelsmith over. See [`docs/cooperative-reporting.md`](cooperative-reporting.md) for the wire protocol, outcome vocabulary, and the trust boundary.
+When set, `bind` must parse via `net.SplitHostPort` with a port in `1-65535`.
+
+The control port is **unauthenticated by default**: `auth_tokens` empty and `auth_tokens_file` unset is the Phase 11 wire shape, and `POST /v1/report` mutates scoreboard state every time it is called. Operators relying on that default should bind to a loopback address or to a private subnet that only trusted apps reach Tunnelsmith over.
+
+When `auth_tokens` and/or `auth_tokens_file` is non-empty (Phase 12), every `POST /v1/report` must carry `Authorization: Bearer <token>`. A missing or malformed header returns `401 Unauthorized` with `WWW-Authenticate: Bearer realm="tunnelsmith"`; rejections tick `tunnelsmith_reports_rejected_total{reason}` with `auth_missing` or `auth_failed`. **Tokens travel in plaintext on the control listener** — TLS on the listener itself is a Phase 13 candidate. Until then, bind the listener to a network segment the operator already trusts, treat tokens as rotatable secrets, and prefer short-lived values. See [`docs/cooperative-reporting.md`](cooperative-reporting.md) for the wire protocol, outcome vocabulary, the auth section, and the full trust boundary.
 
 `control.bind` is **restart-only**. SIGHUP hot-reload does not move the listener; the same constraint applies as `[metrics]` and `[ui]`. Restart the binary to change the address.
+
+`auth_tokens` and `auth_tokens_file` **are** hot-reloaded on SIGHUP, but the policy differs from startup. On a clean reload the runtime rebuilds the merged token set and rotates it through `control.Server.ReplaceTokens`. When `auth_tokens_file` is missing on SIGHUP **the runtime does not rotate** — it warns and preserves the current live token set instead. Hard errors (permission denied, IO failure) preserve the current set for the same reason: a logrotate-style brief disappearance or a permission flap should not silently disable auth. Side-effect: a SIGHUP that *also* edits inline `auth_tokens` will not apply those edits while the file is missing. To pick up new tokens, make sure `auth_tokens_file` (when set) resolves cleanly before signalling.
+
+`gate_healthz` is **restart-only**. The handler closure that decides whether `/healthz` is gated is captured at `NewServer` / handler-mount time, so SIGHUP cannot flip the running listener. Restart the binary to change `gate_healthz`. (Phase 13 candidate: hot-rebind the gate.)
 
 ## `[[upstream]]`
 

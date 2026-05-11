@@ -60,6 +60,26 @@ bind = ":9091"
 [control]
 bind = ":9092"
 
+# Phase 12: optional bearer-token auth on POST /v1/report. Empty/omitted
+# = no auth, byte-for-byte Phase 11 behaviour. When set, every report
+# must carry `Authorization: Bearer <token>`; misconfigured clients see
+# 401 with `WWW-Authenticate: Bearer realm="tunnelsmith"`, and the
+# rejection ticks tunnelsmith_reports_rejected_total{reason="auth_missing"}
+# or {reason="auth_failed"}. SIGHUP re-reads both the inline list and
+# the file so tokens rotate without a restart. Tokens travel in
+# plaintext on the control listener — TLS is Phase 13. Keep the listener
+# on loopback or a private subnet.
+# auth_tokens = [
+#     "replace-me-with-a-long-random-string",
+#     "second-token-for-rotation",
+# ]
+# auth_tokens_file = "/etc/tunnelsmith/control_tokens"
+#
+# Set gate_healthz = true to pull /healthz under the same gate. Default
+# false keeps liveness probes ungated for orchestrators that cannot
+# inject a token.
+# gate_healthz = false
+
 # --------------------------------------------------------------------
 # Upstreams. At least one is required. Every upstream needs a unique id.
 #

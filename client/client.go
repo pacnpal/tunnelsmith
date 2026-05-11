@@ -77,6 +77,16 @@ type Options struct {
 	// Reports are best-effort; the user-facing request never fails
 	// because a report could not be delivered.
 	Logger *slog.Logger
+
+	// Token is the optional bearer credential attached to every
+	// /v1/report POST as `Authorization: Bearer <Token>` (Phase 12).
+	// Leave empty for the no-auth default; the SDK omits the header so
+	// it stays wire-compatible with operators who haven't opted in.
+	// Tunnelsmith returns 401 if Token is empty or unknown while the
+	// server has auth configured; the SDK surfaces that error to the
+	// caller and never retries 401 because it always indicates a
+	// configuration error rather than a transient fault.
+	Token string
 }
 
 // ErrNoUpstream is returned by Report when the response has no recorded
@@ -92,6 +102,7 @@ type reportingTransport struct {
 	base            *http.Transport
 	controlURL      string
 	timeout         time.Duration
+	token           string // Phase 12 bearer token; "" disables the header
 	logger          *slog.Logger
 	reporter        *http.Client  // dedicated client for control-plane POSTs
 	autoReportSlots chan struct{} // bounds concurrent async report goroutines
@@ -105,6 +116,7 @@ type upstreamBox struct {
 	upstream        atomic.Value // string; "" until populated
 	controlURL      string
 	timeout         time.Duration
+	token           string // Phase 12 bearer token; "" disables the header
 	logger          *slog.Logger
 	reporter        *http.Client
 	autoReportSlots chan struct{}
@@ -160,6 +172,15 @@ func New(opts Options) (*http.Client, error) {
 	if cu.RawQuery != "" || cu.Fragment != "" {
 		return nil, fmt.Errorf("client: ControlURL must not include a query or fragment, got %q", opts.ControlURL)
 	}
+	// Phase 12: validate Token if set. Tunnelsmith's server rejects any
+	// bearer credential containing whitespace as malformed (RFC 6750
+	// token68), so attaching a whitespace-bearing token would produce a
+	// confusing 401 at first request. Worse, Go's net/http rejects
+	// header values with newlines at write time with a generic error.
+	// Fail fast at construction with a precise message instead.
+	if opts.Token != "" && strings.ContainsAny(opts.Token, " \t\r\n\v\f") {
+		return nil, errors.New("client: Options.Token contains whitespace; bearer credentials are RFC 6750 token68 (no whitespace)")
+	}
 
 	timeout := opts.Timeout
 	if timeout < 0 {
@@ -200,6 +221,7 @@ func New(opts Options) (*http.Client, error) {
 		base:       base,
 		controlURL: strings.TrimRight(opts.ControlURL, "/"),
 		timeout:    timeout,
+		token:      opts.Token,
 		logger:     opts.Logger,
 		// Reuse a single client for control-plane POSTs so report
 		// bursts share a connection. CheckRedirect refuses every
@@ -230,6 +252,7 @@ func (r *reportingTransport) RoundTrip(req *http.Request) (*http.Response, error
 	box := &upstreamBox{
 		controlURL:      r.controlURL,
 		timeout:         r.timeout,
+		token:           r.token,
 		logger:          r.logger,
 		reporter:        r.reporter,
 		autoReportSlots: r.autoReportSlots,
@@ -417,6 +440,9 @@ func postReportSync(b *upstreamBox, host, upstream, outcome string, httpStatus *
 		return fmt.Errorf("build report request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if b.token != "" {
+		req.Header.Set("Authorization", "Bearer "+b.token)
+	}
 
 	resp, err := b.reporter.Do(req)
 	if err != nil {

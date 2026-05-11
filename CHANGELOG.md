@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (Phase 12)
+
+- Opt-in bearer-token auth on the control endpoint. `[control].auth_tokens` (inline) and `[control].auth_tokens_file` (one token per line, `#` comments) configure a token set; when non-empty, every `POST /v1/report` must carry `Authorization: Bearer <token>`. Empty token set keeps the Phase 11 wire shape byte-for-byte. The new `[control].gate_healthz` knob pulls `/healthz` under the same gate (default `false`).
+- Two new reject reasons in `tunnelsmith_reports_rejected_total{reason}`: `auth_missing` (no `Authorization` header on a gated endpoint) and `auth_failed` (header malformed, multiple `Authorization` headers, or token unknown). 401 responses carry `WWW-Authenticate: Bearer realm="tunnelsmith"` per RFC 6750.
+- Token rotation hot-reloads on SIGHUP via `control.Server.ReplaceTokens`. The auth check uses `crypto/subtle.ConstantTimeCompare` across the live token set without short-circuiting on match, so total work is independent of which token matched.
+- Go SDK adds `client.Options.Token`. When non-empty, every `/v1/report` POST carries `Authorization: Bearer <token>`. 401 surfaces as an error to the caller; the SDK does **not** retry 401 since it always indicates a configuration mismatch.
+- `examples/integration/main.go` gets a `--token` flag; `examples/tunnelsmith.toml` documents the new keys.
+- ADR-007 in `docs/decisions.md` (status: Accepted) and the Auth section in `docs/cooperative-reporting.md` document the design and the wire delta.
+
 ### Added (Phase 11.1)
 
 - `[[upstream_pool]]` refresh tick now hot-swaps the running priority pool. Each successful diff (a fresh Mullvad relay snapshot that differs from the last) rebuilds the pool from `(static [[upstream]]) ∪ (every block's latest expansion)` and installs it via `Scoreboard.ReplacePool`. Cached HTTP transports drop on swap so new `Upstream` objects use freshly-pinned `DialContext` closures; force pins to upstreams that disappeared in the new expansion are evicted automatically; per-(host, upstream) scoreboard entries for removed ids age out via score decay. Resolves the v1.x maintenance bullet about Mullvad relay churn — operators no longer need to bounce the binary to pick up a Mullvad rotation.

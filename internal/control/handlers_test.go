@@ -85,8 +85,15 @@ func quietLogger() *slog.Logger {
 
 func newTestServer(t *testing.T, backend Backend, m MetricsSink) *httptest.Server {
 	t.Helper()
+	return newTestServerWithAuth(t, backend, m, nil, false)
+}
+
+// newTestServerWithAuth lets Phase 12 auth tests inject a token set
+// without rewriting every existing call site.
+func newTestServerWithAuth(t *testing.T, backend Backend, m MetricsSink, tokens []string, gateHealthz bool) *httptest.Server {
+	t.Helper()
 	mux := http.NewServeMux()
-	mountHandlers(mux, backend, m, quietLogger())
+	mountHandlers(mux, backend, m, NewTokenSet(tokens), gateHealthz, quietLogger())
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return srv
@@ -500,7 +507,7 @@ func TestOutcomeMapTargetsValidKinds(t *testing.T) {
 func TestServerServeAndShutdown(t *testing.T) {
 	t.Parallel()
 	backend := &fakeBackend{poolIDs: []string{"u1"}}
-	s := NewServer("127.0.0.1:0", backend, nil, quietLogger())
+	s := NewServer("127.0.0.1:0", backend, nil, ServerOptions{}, quietLogger())
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- s.Serve(context.Background()) }()

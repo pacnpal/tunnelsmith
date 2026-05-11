@@ -81,24 +81,108 @@ type reportRequest struct {
 const maxReportBytes = 4 * 1024
 
 // mountHandlers attaches POST /v1/report and GET /healthz to mux. The
-// metrics sink is optional; when nil, counters are no-ops.
-func mountHandlers(mux *http.ServeMux, backend Backend, metricsSink MetricsSink, logger *slog.Logger) {
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+// metrics sink is optional; when nil, counters are no-ops. The tokens
+// argument may be nil for the no-auth default; when non-nil and the
+// per-request snapshot is enabled, /v1/report (and /healthz when
+// gateHealthz is true) require Authorization: Bearer <token> per
+// ADR-007 (Phase 12).
+func mountHandlers(mux *http.ServeMux, backend Backend, metricsSink MetricsSink, tokens TokenSource, gateHealthz bool, logger *slog.Logger) {
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		// /healthz stays ungated by default so liveness probes work
+		// without secrets. Operators who fronted the listener with
+		// something that already authenticates can opt in to gating
+		// via [control].gate_healthz = true (ADR-007 phase boundary).
+		//
+		// One snapshot per request: Enabled() and Allow() both run
+		// off the same captured view so a concurrent SIGHUP rotation
+		// can't tear the decision (e.g., snapshot says gated but the
+		// next pointer load has rotated to empty).
+		//
+		// Pass nil metrics sink: tunnelsmith_reports_rejected_total is
+		// semantically scoped to cooperative outcome *reports*, so
+		// counting a gated-/healthz auth failure on the same counter
+		// would skew dashboards and rate-rejection alerts that watch
+		// it.
+		if gateHealthz && tokens != nil {
+			snap := tokens.Snapshot()
+			if snap.Enabled() {
+				if !checkAuth(w, r, snap, nil) {
+					return
+				}
+			}
+		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
 	mux.HandleFunc("/v1/report", func(w http.ResponseWriter, r *http.Request) {
-		handleReport(w, r, backend, metricsSink, logger)
+		handleReport(w, r, backend, metricsSink, tokens, logger)
 	})
+}
+
+// checkAuth runs the bearer-token check and writes the 401 response (with
+// WWW-Authenticate per RFC 6750 §3) when the request is rejected. Returns
+// true iff the caller is permitted to proceed. snap must be a non-empty
+// snapshot (Enabled() true) when called; callers gate on Enabled
+// themselves to keep the no-auth fast path branch-light. Taking the
+// snapshot as a parameter rather than re-loading the atomic pointer per
+// call site ensures Enabled() and Allow() see one stable view even when
+// SIGHUP rotates the live set mid-handler.
+func checkAuth(w http.ResponseWriter, r *http.Request, snap TokenSnapshot, m MetricsSink) bool {
+	token, status := extractBearer(r)
+	switch status {
+	case authMissing:
+		writeAuthChallenge(w, m, metrics.ReportRejectAuthMissing, "Authorization header required")
+		return false
+	case authMalformed:
+		writeAuthChallenge(w, m, metrics.ReportRejectAuthFailed, "malformed Authorization header")
+		return false
+	}
+	if !snap.Allow(token) {
+		writeAuthChallenge(w, m, metrics.ReportRejectAuthFailed, "unknown token")
+		return false
+	}
+	return true
+}
+
+// writeAuthChallenge emits a 401 with the RFC 6750 §3 WWW-Authenticate
+// header plus Cache-Control: no-store and Pragma: no-cache (also per
+// §3, so intermediaries do not cache the 401 in a way that confuses
+// retries from the same client). When the metrics sink is non-nil, the
+// rejection ticks reports_rejected_total with the right reason label.
+func writeAuthChallenge(w http.ResponseWriter, m MetricsSink, reason, msg string) {
+	h := w.Header()
+	h.Set("WWW-Authenticate", `Bearer realm="tunnelsmith"`)
+	h.Set("Cache-Control", "no-store")
+	h.Set("Pragma", "no-cache")
+	if m != nil {
+		m.ObserveReportRejected(reason)
+	}
+	http.Error(w, msg, http.StatusUnauthorized)
 }
 
 // handleReport implements the POST /v1/report contract documented in
 // docs/cooperative-reporting.md.
-func handleReport(w http.ResponseWriter, r *http.Request, backend Backend, m MetricsSink, logger *slog.Logger) {
+func handleReport(w http.ResponseWriter, r *http.Request, backend Backend, m MetricsSink, tokens TokenSource, logger *slog.Logger) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
+	}
+
+	// Auth gates the report path before the body is read so an
+	// unauthenticated client never costs us the 4 KiB buffer. One
+	// snapshot per request: Enabled() and Allow() both run off the
+	// same captured view so a concurrent SIGHUP rotation can't tear
+	// the decision (e.g., Enabled() true → SIGHUP empties → Allow()
+	// permits everything, which would emit a 401-for-missing-header
+	// on what's now a no-auth endpoint).
+	if tokens != nil {
+		snap := tokens.Snapshot()
+		if snap.Enabled() {
+			if !checkAuth(w, r, snap, m) {
+				return
+			}
+		}
 	}
 
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxReportBytes+1))
