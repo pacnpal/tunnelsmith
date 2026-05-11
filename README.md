@@ -19,43 +19,255 @@ This is the gap between HAProxy (no per-host memory), Squid (static rules, no le
 
 Each request goes through the scoreboard's `DialFor`. The scoreboard picks the best non-cooled upstream for the host, dials, and either records success and returns the conn or records the failure (penalty + cooldown for that pair) and advances. Retries are capped per request; if every retry fails, the host enters cascade cooling and subsequent requests fail fast for a short TTL instead of stampeding the pool. A small probe chance occasionally picks a non-top candidate so previously penalized upstreams get a chance to recover. Time decay drifts old scores toward zero so the scoreboard responds to current conditions rather than yesterday's. Optional `[[rule]]` blocks pin specific hosts to specific upstreams (`prefer` / `force`) and run response-body regex inspection for soft geo-blocks served as 200s. See [`docs/architecture.md`](docs/architecture.md) for the full design.
 
-## Quick start
+## Installation
 
-The binary boots an HTTP CONNECT plus forward proxy on `:8080` and a SOCKS5 listener on `:1080`. The pool tries upstreams in priority order and retries on hard failure up to `failure.max_retries_per_request` (default 5). [`deploy/tunnelsmith.example.toml`](deploy/tunnelsmith.example.toml) ships an unreachable SOCKS5 entry first and `direct` as the fallback, so each curl below exercises the retry path. Image builds run in CI per ADR-001; locally, run the binary directly:
+### Pre-built binary
+
+Download the latest release for your platform from the [releases page](https://github.com/pacnpal/tunnelsmith/releases/latest). Binaries are published for `linux/amd64` and `linux/arm64`.
 
 ```sh
-make build
-./bin/tunnelsmith --config deploy/tunnelsmith.example.toml
+# Example for linux/amd64
+curl -L https://github.com/pacnpal/tunnelsmith/releases/latest/download/tunnelsmith_linux_amd64 \
+  -o tunnelsmith
+chmod +x tunnelsmith
+./tunnelsmith --version
 ```
 
-In another shell:
+### Container image
+
+Multi-arch images (`linux/amd64`, `linux/arm64`) are published to GitHub Container Registry on every release:
+
+```sh
+docker pull ghcr.io/pacnpal/tunnelsmith:latest
+docker run --rm ghcr.io/pacnpal/tunnelsmith:latest --version
+```
+
+Pin to a specific version for production use:
+
+```sh
+docker pull ghcr.io/pacnpal/tunnelsmith:v1.1.0
+```
+
+The image is built from [`Dockerfile`](Dockerfile) using a distroless base (`gcr.io/distroless/static-debian12:nonroot`) and runs as a non-root user. It exposes ports `8080` (HTTP CONNECT), `1080` (SOCKS5), `9090` (metrics), and `9091` (web UI).
+
+### Build from source
+
+Requires Go 1.23 or later.
+
+```sh
+git clone https://github.com/pacnpal/tunnelsmith.git
+cd tunnelsmith
+make build          # produces bin/tunnelsmith
+./bin/tunnelsmith --version
+```
+
+Other useful Make targets:
+
+| Target | Description |
+|--------|-------------|
+| `make build` | Compile the binary into `bin/tunnelsmith` |
+| `make test` | Run all unit tests |
+| `make lint` | Run `golangci-lint` over the whole module |
+| `make tidy` | Run `go mod tidy` |
+| `make clean` | Remove `bin/` and clear the test cache |
+
+## Quick start
+
+### Running the binary
+
+The binary starts an HTTP CONNECT and forward proxy on `:8080` and a SOCKS5 listener on `:1080`. You need a TOML config file with at least one `[[upstream]]`.
+
+The minimal config below sends everything out the host's default route (`direct`). Copy it into a file, then start the binary:
+
+```toml
+# minimal.toml
+[listener]
+http  = ":8080"
+socks = ":1080"
+
+[[upstream]]
+id       = "direct"
+kind     = "direct"
+priority = 10
+```
+
+```sh
+./bin/tunnelsmith --config minimal.toml
+```
+
+In another shell, verify both listeners:
 
 ```sh
 curl --proxy http://localhost:8080 https://example.com
 curl --socks5-hostname localhost:1080 https://example.com
 ```
 
-The Tunnelsmith logs show one `upstream dial` line per attempt with `outcome=failure` for the unreachable entry and `outcome=success` for `direct`. CI uses [`deploy/docker-compose.example.yml`](deploy/docker-compose.example.yml) to exercise the same path against the built image.
+The example config at [`deploy/tunnelsmith.example.toml`](deploy/tunnelsmith.example.toml) adds an intentionally unreachable SOCKS5 entry first so every request exercises the retry/fallback path — useful for confirming the pool is wired up correctly:
+
+```sh
+./bin/tunnelsmith --config deploy/tunnelsmith.example.toml
+```
+
+Tunnelsmith logs one `upstream dial` line per attempt; you will see `outcome=failure` for the unreachable entry and `outcome=success` for `direct`.
+
+### Running with Docker
+
+```sh
+docker run -d \
+  --name tunnelsmith \
+  -p 8080:8080 \
+  -p 1080:1080 \
+  -v "$(pwd)/deploy/tunnelsmith.example.toml:/etc/tunnelsmith/config.toml:ro" \
+  ghcr.io/pacnpal/tunnelsmith:latest \
+  --config /etc/tunnelsmith/config.toml
+```
+
+### CLI reference
+
+```
+tunnelsmith [flags]
+
+Flags:
+  --config <path>     Path to the TOML config file (default: /etc/tunnelsmith/config.toml)
+  --print-config      Load the config, apply defaults, print the resolved TOML to stdout, and exit
+  --version           Print version, commit, and build date, then exit
+
+Environment:
+  TUNNELSMITH_LOG_LEVEL   Log verbosity: debug | info | warn | error (default: info)
+```
+
+Use `--print-config` to confirm what the binary actually sees after defaults are applied:
+
+```sh
+./bin/tunnelsmith --config my-config.toml --print-config
+```
+
+Logs are JSON, one event per line. Set `TUNNELSMITH_LOG_LEVEL=debug` for verbose dial traces.
 
 ## Configuration
 
 Tunnelsmith reads a TOML config from `--config` (default `/etc/tunnelsmith/config.toml`). A complete commented example is at [`examples/tunnelsmith.toml`](examples/tunnelsmith.toml). Every key is documented in [`docs/configuration.md`](docs/configuration.md).
 
-`tunnelsmith --config <path> --print-config` loads, applies defaults, and prints the resolved config. Use it to confirm what the binary actually sees.
+### Config overview
 
-`TUNNELSMITH_LOG_LEVEL` (`debug` | `info` | `warn` | `error`, default `info`) controls log verbosity. Logs are JSON, one line per event.
+```toml
+[listener]
+http  = ":8080"   # HTTP CONNECT and forward proxy
+socks = ":1080"   # SOCKS5 listener
+
+[cache]
+ttl             = "15m"   # how long a successful (host, upstream) pair is cached
+negative_ttl    = "1m"    # cascade-failure cooldown duration
+persist_path    = ""      # absolute path for scoreboard persistence (empty = in-memory only)
+persist_interval = "30s"  # how often to snapshot to persist_path
+
+[metrics]
+bind = ":9090"   # Prometheus /metrics and /healthz (empty disables)
+
+[ui]
+bind = ":9091"   # web UI (empty disables)
+
+[control]
+bind = ":9092"   # cooperative-reporting endpoint (empty disables)
+
+# At least one [[upstream]] or [[upstream_pool]] is required.
+# Lower priority value wins (tried first). Unique id required.
+
+[[upstream]]
+id       = "direct"
+kind     = "direct"   # send traffic out the host's default route; no addr
+priority = 10
+
+[[upstream]]
+id       = "my-socks5"
+kind     = "socks5"
+addr     = "proxy.example.com:1080"
+priority = 20
+
+[[upstream]]
+id       = "my-http-proxy"
+kind     = "http"
+addr     = "proxy.example.com:8888"   # HTTP CONNECT proxy
+priority = 30
+
+[failure]
+timeout_ms              = 8000   # per-attempt connect/read timeout in ms
+max_retries_per_request = 5      # cap on per-request retries through the pool
+
+# Optional per-host routing rules.
+[[rule]]
+host_glob = "*.bbc.co.uk"
+prefer    = ["my-socks5"]
+force     = true   # do not fall back to other upstreams on failure
+```
+
+### Key sections
+
+**`[failure.scoring]`** — Per-(host, upstream) scoring knobs: penalty and cooldown amounts for ECONNREFUSED, timeout, HTTP 429/403/451, and body-regex matches; score cap; probe chance; time decay; cascade TTL. All have sane defaults; omit the section to use them.
+
+**`[[rule]]`** — Optional per-host routing overrides. `prefer` lists upstreams to try first (in order). `force = true` prevents fallback to other upstreams. `body_regex` fires body-match detection on plain-HTTP responses so geo-block soft-failures served as `200 OK` still penalize the right upstream.
+
+**`[control]` auth (Phase 12)** — Add `auth_tokens = ["your-token"]` or point `auth_tokens_file` at a one-token-per-line file to gate `POST /v1/report` with bearer-token auth. Hot-reloads on SIGHUP without a restart.
+
+Sending `SIGHUP` applies updated upstreams, scoring parameters, detection rules, and auth tokens in place. Listener bind addresses (`[listener]`, `[metrics]`, `[ui]`, `[control]`) require a restart to change.
 
 ## Use with Mullvad
 
-Tunnelsmith ships a reference deployment at [`deploy/docker-compose.mullvad.yml`](deploy/docker-compose.mullvad.yml) that runs gluetun in WireGuard mode against your Mullvad account, plus tunnelsmith joining the same network namespace. A single `[[upstream_pool]]` block in the config fans out into one synthetic socks5 upstream per active Mullvad WireGuard relay in the countries you list. The scoreboard then learns per-host which relay works best.
+Tunnelsmith ships a reference deployment at [`deploy/docker-compose.mullvad.yml`](deploy/docker-compose.mullvad.yml) that runs gluetun in WireGuard mode against your Mullvad account, plus tunnelsmith joining the same network namespace. A single `[[upstream_pool]]` block in the config fans out into one synthetic socks5 upstream per active Mullvad WireGuard relay in the countries you list. The scoreboard then learns per-host which relay works best. As of v1.1.0, relay-list churn is handled via hot-swap — no restart needed when Mullvad rotates relays.
 
-Setup is a one-time keypair generation (counts against Mullvad's 5-device cap) plus two repo-secret-shaped env vars. See [`docs/deployment.md`](docs/deployment.md) for the full walkthrough.
+### Quick setup
+
+**1. Generate a WireGuard keypair** on [mullvad.net/en/account/wireguard-config](https://mullvad.net/en/account/wireguard-config). Download the `.conf` file and copy the `PrivateKey` and `Address` values. Each keypair counts against Mullvad's 5-device cap.
+
+**2. Populate `deploy/.env`:**
+
+```sh
+cp deploy/.env.example deploy/.env
+$EDITOR deploy/.env
+# Set MULLVAD_WIREGUARD_PRIVATE_KEY and MULLVAD_WIREGUARD_ADDRESSES
+```
+
+**3. Pick your exit countries** in `deploy/tunnelsmith.mullvad.toml`:
+
+```toml
+[[upstream_pool]]
+provider  = "mullvad"
+id_prefix = "mvd"
+countries = ["Sweden", "Netherlands", "Switzerland"]
+```
+
+**4. Bring up the stack:**
+
+```sh
+docker compose -f deploy/docker-compose.mullvad.yml up -d
+```
+
+**5. Smoke test:**
+
+```sh
+curl --socks5-hostname localhost:1080 https://am.i.mullvad.net/json | jq .
+# Expected: "mullvad_exit_ip": true, with a country in your list
+```
+
+See [`docs/deployment.md`](docs/deployment.md) for the full walkthrough including troubleshooting.
 
 ## For container maintainers
 
 If you build a container that benefits from outbound proxying (`*arr` apps, scrapers, downloaders, RSS pollers, federated services), [`docs/integration-guide.md`](docs/integration-guide.md) is a layered checklist for shipping Tunnelsmith support, from "document the standard env-var pattern" to "ship an official compose snippet". The lowest level is no code changes.
 
-For HTTPS coverage of the per-host scoreboard, the optional Phase 11 cooperative reporting protocol lets your app submit per-request outcomes back to Tunnelsmith. Three lines of Go via the [`client`](client) package, or any HTTP client in any language using the wire protocol at [`docs/cooperative-reporting.md`](docs/cooperative-reporting.md). Operators in multi-tenant or LAN-exposed deployments can opt into Phase 12 bearer-token auth on `/v1/report` via `[control].auth_tokens` / `[control].auth_tokens_file`; the empty default keeps the Phase 11 wire shape byte-for-byte.
+For HTTPS coverage of the per-host scoreboard, the optional Phase 11 cooperative reporting protocol lets your app submit per-request outcomes back to Tunnelsmith. Three lines of Go via the [`client`](client) package, or any HTTP client in any language using the wire protocol at [`docs/cooperative-reporting.md`](docs/cooperative-reporting.md):
+
+```go
+// Go SDK — three lines of integration
+c, err := client.New(client.Options{
+    ProxyURL:   "http://tunnelsmith:8080",
+    ControlURL: "http://tunnelsmith:9092",
+})
+resp, err := c.Get("https://example.com/api/things")
+_ = client.Report(resp, "ok")
+```
+
+Operators in multi-tenant or LAN-exposed deployments can opt into Phase 12 bearer-token auth on `/v1/report` via `[control].auth_tokens` / `[control].auth_tokens_file`; the empty default keeps the Phase 11 wire shape byte-for-byte.
 
 ## Documentation
 
