@@ -197,7 +197,11 @@ func TestServePlaintextWhenTLSUnset(t *testing.T) {
 		t.Fatal("TLSEnabled() must be false with empty cert/key")
 	}
 	addr := srv.Addr().String()
-	resp, err := http.Get("http://" + addr + "/healthz")
+	// Bounded client timeout so a regression that hangs /healthz
+	// fails the test fast rather than stalling on Go's default no-
+	// timeout client. Matches the other tests in this file.
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://" + addr + "/healthz")
 	if err != nil {
 		t.Fatalf("GET /healthz: %v", err)
 	}
