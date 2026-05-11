@@ -79,6 +79,13 @@ bind = ":9092"
 # false keeps liveness probes ungated for orchestrators that cannot
 # inject a token.
 # gate_healthz = false
+#
+# 1.2+: opt-in TLS termination on the control listener. Both-or-neither;
+# absolute paths; restart-only (SIGHUP does not re-read the cert files,
+# matching the bind-path policy). Both empty preserves the Phase 11/12
+# plaintext wire shape. See ADR-009 in docs/decisions.md.
+# tls_cert_file = "/etc/tunnelsmith/control-cert.pem"
+# tls_key_file  = "/etc/tunnelsmith/control-key.pem"
 
 # --------------------------------------------------------------------
 # Upstreams. At least one is required. Every upstream needs a unique id.

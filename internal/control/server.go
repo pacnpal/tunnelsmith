@@ -45,6 +45,7 @@ package control
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -60,6 +61,15 @@ type Server struct {
 	logger *slog.Logger
 	srv    *http.Server
 	tokens *tokenSet // always non-nil; an empty token set encodes the no-auth default
+
+	// tlsCertFile / tlsKeyFile are non-empty when the operator
+	// configured [control].tls_cert_file + tls_key_file. config.Validate
+	// already enforces both-or-neither, so the in-process invariant is
+	// "either both empty (plaintext) or both set (TLS)". Captured at
+	// construction so Serve can pick http.Server.ServeTLS over Serve
+	// without re-reading config.
+	tlsCertFile string
+	tlsKeyFile  string
 
 	ready    chan struct{}
 	listener net.Listener
@@ -81,6 +91,14 @@ type ServerOptions struct {
 	// disables the routes entirely (Phase 11/12 wire shape stays
 	// byte-for-byte identical for operators not using the feature).
 	Providers *ProviderRegistry
+	// TLSCertFile and TLSKeyFile, when both non-empty, switch the
+	// listener to HTTPS via http.Server.ServeTLS. Both empty keeps
+	// plaintext. config.Validate enforces the both-or-neither
+	// invariant for cmd/tunnelsmith, and Serve repeats the check
+	// at runtime (defence in depth for tests and any future
+	// internal caller that bypasses config.Validate).
+	TLSCertFile string
+	TLSKeyFile  string
 }
 
 // NewServer builds a control HTTP server that serves on addr. backend is
@@ -99,16 +117,29 @@ func NewServer(addr string, backend Backend, metrics MetricsSink, opts ServerOpt
 	if opts.Providers != nil {
 		mountProvidersHandlers(mux, opts.Providers, tokens, logger)
 	}
+	httpSrv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	if opts.TLSCertFile != "" && opts.TLSKeyFile != "" {
+		// Pin the minimum TLS version explicitly rather than
+		// relying on whatever the stdlib default happens to be.
+		// Go's default is TLS 1.2+ today, but the listener's
+		// policy is operator-facing; encoding it here keeps the
+		// contract immune to a future stdlib default flip.
+		httpSrv.TLSConfig = &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		}
+	}
 	return &Server{
-		addr:   addr,
-		logger: logger,
-		tokens: tokens,
-		srv: &http.Server{
-			Addr:              addr,
-			Handler:           mux,
-			ReadHeaderTimeout: 10 * time.Second,
-		},
-		ready: make(chan struct{}),
+		addr:        addr,
+		logger:      logger,
+		tokens:      tokens,
+		tlsCertFile: opts.TLSCertFile,
+		tlsKeyFile:  opts.TLSKeyFile,
+		srv:         httpSrv,
+		ready:       make(chan struct{}),
 	}
 }
 
@@ -146,8 +177,39 @@ func (s *Server) Addr() net.Addr {
 	return s.listener.Addr()
 }
 
-// Serve binds the listener and blocks until Shutdown is called.
+// Serve binds the listener and blocks until Shutdown is called. When
+// TLSCertFile and TLSKeyFile were set in ServerOptions the listener
+// terminates TLS via http.Server.ServeTLS using the configured PEM
+// files; otherwise plain HTTP. config.Validate enforces the
+// both-or-neither invariant on the cert/key pair, but NewServer is
+// also callable from tests and any future internal package that
+// bypasses config.Validate. Fail fast here so a half-configured
+// ServerOptions can never silently downgrade an intended-TLS
+// listener to plaintext.
 func (s *Server) Serve(_ context.Context) error {
+	if (s.tlsCertFile == "") != (s.tlsKeyFile == "") {
+		err := fmt.Errorf("control serve: control.tls_cert_file and control.tls_key_file must be both set or both empty (got cert=%q, key=%q)",
+			s.tlsCertFile, s.tlsKeyFile)
+		s.bindErr = err
+		close(s.ready)
+		return err
+	}
+	// Pre-load the keypair BEFORE binding the listener so a bad
+	// cert / key path surfaces without leaving an orphaned TCP
+	// socket bound on s.addr. net/http.Server.ServeTLS does not
+	// close the listener it receives if it errors early during
+	// cert load, which would otherwise leak the bound port until
+	// process exit. Pre-loading also moves the "listening" log
+	// line to a position that's truthful: we only log after we
+	// know the cert is valid.
+	if s.TLSEnabled() {
+		if _, err := tls.LoadX509KeyPair(s.tlsCertFile, s.tlsKeyFile); err != nil {
+			loadErr := fmt.Errorf("control serve: load tls keypair: %w", err)
+			s.bindErr = loadErr
+			close(s.ready)
+			return loadErr
+		}
+	}
 	l, err := net.Listen("tcp", s.addr)
 	if err != nil {
 		s.bindErr = fmt.Errorf("control listen %s: %w", s.addr, err)
@@ -156,11 +218,33 @@ func (s *Server) Serve(_ context.Context) error {
 	}
 	s.listener = l
 	close(s.ready)
-	s.logger.Info("listening", "addr", l.Addr().String())
-	if err := s.srv.Serve(l); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return fmt.Errorf("control serve: %w", err)
+	s.logger.Info("listening",
+		"addr", l.Addr().String(),
+		"tls", s.TLSEnabled(),
+	)
+	var serveErr error
+	if s.TLSEnabled() {
+		serveErr = s.srv.ServeTLS(l, s.tlsCertFile, s.tlsKeyFile)
+	} else {
+		serveErr = s.srv.Serve(l)
+	}
+	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+		// Belt-and-suspenders: if ServeTLS errored after the
+		// pre-load check (any non-shutdown path), make sure the
+		// bound listener isn't leaked. The stdlib Serve path
+		// already closes the listener on its own normal exit, so
+		// this Close is a no-op there.
+		_ = l.Close()
+		return fmt.Errorf("control serve: %w", serveErr)
 	}
 	return nil
+}
+
+// TLSEnabled reports whether this server is configured to terminate
+// TLS. Used by Serve to pick ServeTLS vs Serve and by callers that
+// want to log or expose the listener's transport mode.
+func (s *Server) TLSEnabled() bool {
+	return s != nil && s.tlsCertFile != "" && s.tlsKeyFile != ""
 }
 
 // Shutdown stops the control server.

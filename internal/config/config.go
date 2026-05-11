@@ -160,15 +160,27 @@ type UIConfig struct {
 // a restart. GateHealthz pulls /healthz under the same gate; default
 // false keeps liveness probes ungated.
 //
-// The trust boundary is still the network: tokens travel in plaintext
-// on the control listener (TLS is Phase 13 candidate), so operators
-// should still bind to loopback or a private subnet. docs/cooperative-
-// reporting.md spells out the trust stance.
+// TLSCertFile and TLSKeyFile add opt-in TLS termination on the
+// control listener (1.2 follow-up to Phase 12). Both empty keeps the
+// Phase 11/12 plaintext wire shape byte-for-byte. Both set causes
+// http.Server.ServeTLS to terminate TLS for /v1/report, /v1/providers/*,
+// and /healthz. Setting only one of the pair is a config error so a
+// half-configured TLS deployment can't silently fall back to
+// plaintext. Both paths must be absolute (same rationale as
+// auth_tokens_file). Cert rotation requires a restart in v1, matching
+// the bind-path policy; SIGHUP does not re-read the cert files.
+//
+// The combination of bearer-token auth and TLS closes the
+// plaintext-token risk ADR-007 named in its Non-goals — tokens are
+// no longer recoverable from a passive observer on the control
+// network segment. docs/decisions.md ADR-009 records the design.
 type ControlConfig struct {
 	Bind           string   `toml:"bind"`             // default: ":9092"; "" disables
 	AuthTokens     []string `toml:"auth_tokens"`      // inline bearer tokens; empty = no auth
 	AuthTokensFile string   `toml:"auth_tokens_file"` // absolute path; one token per line, # comments OK
 	GateHealthz    bool     `toml:"gate_healthz"`     // default false: /healthz stays ungated for liveness probes
+	TLSCertFile    string   `toml:"tls_cert_file"`    // absolute path; both-or-neither with tls_key_file
+	TLSKeyFile     string   `toml:"tls_key_file"`     // absolute path; both-or-neither with tls_cert_file
 }
 
 // UpstreamConfig declares one egress option that the router can pick.
@@ -604,6 +616,27 @@ func (c *Config) Validate() error {
 	}
 	if c.Control.AuthTokensFile != "" && !filepath.IsAbs(c.Control.AuthTokensFile) {
 		errs = append(errs, fmt.Errorf("control.auth_tokens_file must be an absolute path, got %q", c.Control.AuthTokensFile))
+	}
+	// TLS on the control listener is opt-in via the (cert, key) pair.
+	// Both empty preserves the Phase 11/12 plaintext wire shape;
+	// both set enables TLS; only one set is a config error so a
+	// half-configured TLS deployment can't silently fall back to
+	// plaintext. Paths must be absolute for the same reason
+	// auth_tokens_file requires absolute paths (no CWD ambiguity at
+	// startup).
+	hasCert := c.Control.TLSCertFile != ""
+	hasKey := c.Control.TLSKeyFile != ""
+	switch {
+	case hasCert && !hasKey:
+		errs = append(errs, errors.New("control.tls_cert_file is set but control.tls_key_file is empty (set both to enable TLS, or unset both to keep plaintext)"))
+	case !hasCert && hasKey:
+		errs = append(errs, errors.New("control.tls_key_file is set but control.tls_cert_file is empty (set both to enable TLS, or unset both to keep plaintext)"))
+	}
+	if hasCert && !filepath.IsAbs(c.Control.TLSCertFile) {
+		errs = append(errs, fmt.Errorf("control.tls_cert_file must be an absolute path, got %q", c.Control.TLSCertFile))
+	}
+	if hasKey && !filepath.IsAbs(c.Control.TLSKeyFile) {
+		errs = append(errs, fmt.Errorf("control.tls_key_file must be an absolute path, got %q", c.Control.TLSKeyFile))
 	}
 
 	if len(c.Upstreams) == 0 && len(c.UpstreamPools) == 0 {

@@ -231,3 +231,52 @@ The control listener gains two routes:
 - `internal/control/providers.go` — `GET /v1/providers` and `POST /v1/providers/{id_prefix}/refresh`.
 - `docs/providers.md` — the adapter-author guide for fork + PR.
 - `docs/control-api.md` — the route reference.
+
+## ADR-009: TLS on the control listener (1.2)
+
+### Context
+
+ADR-007 shipped opt-in bearer-token auth on the control endpoint (Phase 12) and explicitly named the plaintext-token transmission risk as the primary outstanding concern: tokens travel in cleartext over whatever network segment the control listener is bound to, so any passive observer on that segment can capture them. The named mitigation was "bind to loopback or to a private subnet", with TLS termination called out as a Phase 13 / 1.2 candidate.
+
+By 1.2, the rest of the control surface has grown: PR #32 added `GET /v1/providers` and `POST /v1/providers/{id_prefix}/refresh`, the latter triggering vendor-side state changes (Webshare's on-demand IP rotation). Every request on the listener now reads a bearer token plus, in some cases, an operator action that's worth protecting from replay. The case for closing the transport gap is clear.
+
+### Decision
+
+1. Add two new keys to `[control]`: `tls_cert_file` and `tls_key_file`. Both empty = plaintext (the pre-1.2 wire shape). Both set = the listener terminates HTTPS via `http.Server.ServeTLS` using the PEM-encoded files at those paths. Only one set is a config-load error so a half-configured TLS deployment cannot silently fall back to plaintext.
+2. Both paths must be absolute, matching the existing `auth_tokens_file` and `cache.persist_path` policy (no CWD ambiguity at startup).
+3. Cert rotation is **restart-only** in v1, matching the bind-path policy for `[control].bind`, `[metrics].bind`, and `[ui].bind`. SIGHUP does not re-read the cert files. Future enhancement (hot-reload via `tls.Config.GetCertificate`) is straightforward but deferred until an operator asks.
+4. `control.Server.TLSEnabled()` is a public method so callers (cmd/tunnelsmith startup log, tests, future metrics labels) can observe whether the listener is running TLS without poking private fields.
+5. The standard library's behaviour on a plaintext request to a TLS listener — HTTP 400 with a "Client sent an HTTP request to an HTTPS server" body — is left in place. Operators get a self-describing error in their client rather than a silent TCP reset.
+
+### Alternatives considered
+
+- **Reverse-proxy TLS termination only.** Telling operators "front the control listener with nginx if you need TLS" is what we did in Phase 12. It works but adds operational ceremony for a deployment shape that's increasingly common (control endpoint exposed beyond loopback for cooperative reporting from multiple workloads). In-binary TLS is two config keys vs. a whole second process.
+- **Listener-side mTLS instead of TLS-only.** ADR-007 explicitly rejected mTLS for the auth gate ("Bearer is the right size for v1 of auth"). The same reasoning applies here: mTLS is a separate authentication mechanism, not a transport-encryption mechanism, and bundling them would conflate two decisions. Adding mTLS later under a new `tls_client_ca_file` knob remains possible.
+- **Forcing TLS unconditionally in 1.2.** Rejected. The Phase 11 wire shape is in production today; flipping the default would break every deployment that hasn't generated certs. Opt-in is the upgrade-friendly path.
+- **Hot-reload via `GetCertificate` from day one.** Real value (Let's Encrypt cert rotation), real complexity (file watcher or per-handshake re-read). Deferred until an operator asks; restart-only is consistent with the surrounding listener policies.
+
+### Non-goals (named explicitly)
+
+- **TLS on the metrics or UI listeners.** Same pattern would apply; not in scope for 1.2. Operators who want it can front those listeners with a reverse proxy in the meantime.
+- **mTLS / client-cert auth.** Bearer remains the right size for v1 auth. A future ADR can add it under a new config key without breaking the v1 shape.
+- **ACME / Let's Encrypt integration.** Tunnelsmith reads the PEM files the operator already manages; cert provisioning is out of scope.
+- **Operator-tunable TLS minimum version / cipher pinning.** The implementation pins `MinVersion: tls.VersionTLS12` on the listener's `tls.Config` so the policy survives any future stdlib default flip — that's a fixed in-binary baseline, not an operator knob. Exposing it as a config key (or letting operators pick TLS 1.3+ only, or pin specific cipher suites) is a non-goal for 1.2; tuning knobs land in a follow-up if a workload demands them.
+
+### Consequences
+
+- Operators in multi-tenant or LAN-exposed deployments can pair Phase 12 bearer tokens with TLS termination on the same port, closing the plaintext-token risk ADR-007 named.
+- Operators relying on the Phase 11/12 default (no TLS, no auth, bound to loopback) keep working unchanged. Empty cert/key = byte-for-byte same wire.
+- `tunnelsmith --print-config` continues to show absolute paths to the cert/key files — these are operator-managed and not secret themselves; the private key on disk is what needs `0o600`.
+- Cert / key rotation requires a restart in 1.2. Operators on long-lived certs (1+ year self-signed) won't notice. Let's Encrypt users on a 90-day rotation will want to schedule a restart on each renewal until the hot-reload follow-up ships.
+- The Go SDK in `client/` needs no changes: when `Options.ControlURL` is `https://…`, the embedded `*http.Client` uses the system trust store. Operators pinning a self-signed cert can set a custom `http.Transport.TLSClientConfig` via the existing client construction path.
+- The new wire shape unblocks future improvements like `GetCertificate` hot-reload, per-handshake metrics, and listener-side mTLS without a config-shape change — those slot under the same two keys (plus possibly one or two more).
+
+### References
+
+- `internal/config/config.go` — `ControlConfig.TLSCertFile` / `TLSKeyFile` + validation.
+- `internal/control/server.go` — `ServerOptions.TLSCertFile` / `TLSKeyFile`, `Serve` picks `ServeTLS`, `TLSEnabled()`.
+- `internal/control/tls_test.go` — handshake + plaintext-reject + bad-cert tests.
+- `docs/configuration.md` — config key reference.
+- `docs/control-api.md` — route impact.
+- `docs/cooperative-reporting.md` — updated trust-stance section.
+- ADR-007 — the Phase 12 decision this closes the transport gap on.
