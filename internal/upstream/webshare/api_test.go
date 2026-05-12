@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -584,6 +585,342 @@ func TestListProxiesRejectsMalformedNextPath(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "next path") {
 		t.Fatalf("err = %v, want one mentioning 'next path'", err)
+	}
+}
+
+// TestListProxiesPushesValidFilter pins the server-side filter: in
+// direct mode we tell Webshare to skip invalid proxies entirely, which
+// reduces response size on a flapping pool. In backbone mode the
+// `valid` field is documented as unsupported, so we must NOT send it.
+func TestListProxiesPushesValidFilter(t *testing.T) {
+	t.Run("direct mode sends valid=true", func(t *testing.T) {
+		var observed string
+		srv, _ := newFakeServer(t, map[string]http.HandlerFunc{
+			"/proxy/list/": func(w http.ResponseWriter, r *http.Request) {
+				observed = r.URL.RawQuery
+				_, _ = w.Write(mustEncode(t, paginatedResponse([]Proxy{}, "")))
+			},
+		})
+		c := NewClient()
+		c.BaseURL = srv.URL
+		c.APIToken = "tok"
+		c.HTTPClient = srv.Client()
+		if _, err := c.ListProxies(context.Background(), ListProxiesOptions{Mode: "direct"}); err != nil {
+			t.Fatalf("ListProxies: %v", err)
+		}
+		if !strings.Contains(observed, "valid=true") {
+			t.Fatalf("expected valid=true in query, got %q", observed)
+		}
+	})
+	t.Run("backbone mode omits valid filter", func(t *testing.T) {
+		var observed string
+		srv, _ := newFakeServer(t, map[string]http.HandlerFunc{
+			"/proxy/list/": func(w http.ResponseWriter, r *http.Request) {
+				observed = r.URL.RawQuery
+				_, _ = w.Write(mustEncode(t, paginatedResponse([]Proxy{}, "")))
+			},
+		})
+		c := NewClient()
+		c.BaseURL = srv.URL
+		c.APIToken = "tok"
+		c.HTTPClient = srv.Client()
+		if _, err := c.ListProxies(context.Background(), ListProxiesOptions{Mode: "backbone"}); err != nil {
+			t.Fatalf("ListProxies: %v", err)
+		}
+		if strings.Contains(observed, "valid=") {
+			t.Fatalf("backbone mode must not send valid filter, got %q", observed)
+		}
+	})
+}
+
+// TestAPITokenAutoReloadOnUnauthorized exercises the credential-rotation
+// self-heal: a 401 from the vendor triggers a re-read of APITokenFile;
+// if the file has rotated, the client swaps the in-memory token and
+// retries the same request. The fake server returns 401 for the old
+// token and 200 for the new one, so a successful request after one
+// 401 proves the reload+retry fired.
+func TestAPITokenAutoReloadOnUnauthorized(t *testing.T) {
+	dir := t.TempDir()
+	tokPath := filepath.Join(dir, "tok")
+	if err := os.WriteFile(tokPath, []byte("old-token"), 0o600); err != nil {
+		t.Fatalf("seed token: %v", err)
+	}
+	var hits int
+	srv, _ := newFakeServer(t, map[string]http.HandlerFunc{
+		"/profile/": func(w http.ResponseWriter, r *http.Request) {
+			hits++
+			switch r.Header.Get("Authorization") {
+			case "Token new-token":
+				_, _ = w.Write([]byte(`{"id":1,"email":"u@example.com"}`))
+			default:
+				// Rotate the on-disk token between the first 401
+				// and the retry. This simulates an operator
+				// rewriting the secret file during the request
+				// window.
+				_ = os.WriteFile(tokPath, []byte("new-token"), 0o600)
+				w.WriteHeader(http.StatusUnauthorized)
+			}
+		},
+	})
+	c := NewClient()
+	c.BaseURL = srv.URL
+	c.APIToken = "old-token"
+	c.APITokenFile = tokPath
+	c.HTTPClient = srv.Client()
+	p, err := c.Profile(context.Background())
+	if err != nil {
+		t.Fatalf("Profile: %v", err)
+	}
+	if p.Email != "u@example.com" {
+		t.Fatalf("decoded profile mismatch: %+v", p)
+	}
+	if hits != 2 {
+		t.Fatalf("expected exactly 2 round-trips (401 then 200), got %d", hits)
+	}
+	if got := c.snapshotToken(); got != "new-token" {
+		t.Fatalf("in-memory token after reload = %q, want %q", got, "new-token")
+	}
+}
+
+// TestAPITokenAutoReloadNoFileNoRetry is the negative case: without
+// APITokenFile, a 401 must propagate unchanged. No retry, no reload.
+func TestAPITokenAutoReloadNoFileNoRetry(t *testing.T) {
+	hits := 0
+	srv, _ := newFakeServer(t, map[string]http.HandlerFunc{
+		"/profile/": func(w http.ResponseWriter, r *http.Request) {
+			hits++
+			w.WriteHeader(http.StatusUnauthorized)
+		},
+	})
+	c := NewClient()
+	c.BaseURL = srv.URL
+	c.APIToken = "stale"
+	// APITokenFile deliberately unset.
+	c.HTTPClient = srv.Client()
+	_, err := c.Profile(context.Background())
+	if !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("err = %v, want ErrUnauthorized", err)
+	}
+	if hits != 1 {
+		t.Fatalf("expected exactly 1 round-trip (no retry), got %d", hits)
+	}
+}
+
+// TestAPITokenAutoReloadSameFileNoRetry pins the conservative branch:
+// when the file content is unchanged, the 401 propagates without
+// retry. Otherwise a genuinely-bad token would cause an infinite
+// reload loop in production.
+func TestAPITokenAutoReloadSameFileNoRetry(t *testing.T) {
+	dir := t.TempDir()
+	tokPath := filepath.Join(dir, "tok")
+	if err := os.WriteFile(tokPath, []byte("same-token"), 0o600); err != nil {
+		t.Fatalf("seed token: %v", err)
+	}
+	hits := 0
+	srv, _ := newFakeServer(t, map[string]http.HandlerFunc{
+		"/profile/": func(w http.ResponseWriter, r *http.Request) {
+			hits++
+			w.WriteHeader(http.StatusUnauthorized)
+		},
+	})
+	c := NewClient()
+	c.BaseURL = srv.URL
+	c.APIToken = "same-token"
+	c.APITokenFile = tokPath
+	c.HTTPClient = srv.Client()
+	_, err := c.Profile(context.Background())
+	if !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("err = %v, want ErrUnauthorized", err)
+	}
+	if hits != 1 {
+		t.Fatalf("expected exactly 1 round-trip (no retry on unchanged file), got %d", hits)
+	}
+}
+
+// TestAPITokenAutoReloadCappedAtOneRetry confirms a second 401 after
+// the reload does not loop. The fake server returns 401 forever; the
+// file gets rotated to a different (but still wrong) value. We expect
+// exactly two round-trips (initial + one retry) and the second 401
+// propagates.
+func TestAPITokenAutoReloadCappedAtOneRetry(t *testing.T) {
+	dir := t.TempDir()
+	tokPath := filepath.Join(dir, "tok")
+	if err := os.WriteFile(tokPath, []byte("old"), 0o600); err != nil {
+		t.Fatalf("seed token: %v", err)
+	}
+	hits := 0
+	srv, _ := newFakeServer(t, map[string]http.HandlerFunc{
+		"/profile/": func(w http.ResponseWriter, r *http.Request) {
+			hits++
+			// Rotate the file on the first miss so the reload
+			// happens; the rotated value is still wrong from the
+			// server's view.
+			if hits == 1 {
+				_ = os.WriteFile(tokPath, []byte("also-wrong"), 0o600)
+			}
+			w.WriteHeader(http.StatusUnauthorized)
+		},
+	})
+	c := NewClient()
+	c.BaseURL = srv.URL
+	c.APIToken = "old"
+	c.APITokenFile = tokPath
+	c.HTTPClient = srv.Client()
+	_, err := c.Profile(context.Background())
+	if !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("err = %v, want ErrUnauthorized", err)
+	}
+	if hits != 2 {
+		t.Fatalf("expected initial + one retry = 2 round-trips, got %d", hits)
+	}
+}
+
+// TestAPITokenAutoReloadConcurrentReadsAreSafe runs many goroutines
+// against an httptest server that flips between 401 and 200 based on
+// the token sent. With the auto-reload path active and rotating the
+// file on first 401, the race detector should observe no data races
+// on the Client.APIToken field — that's the contract tokenMu is there
+// to enforce.
+//
+// The test deliberately bypasses newFakeServer's request-log slice
+// (which would race independently of anything in Client) and uses a
+// bare httptest server so the only object under race scrutiny is the
+// Client itself. A sync.Once guards the file rotation so 16
+// goroutines triggering the first 401 race do not collide on the
+// disk-write call.
+func TestAPITokenAutoReloadConcurrentReadsAreSafe(t *testing.T) {
+	dir := t.TempDir()
+	tokPath := filepath.Join(dir, "tok")
+	if err := os.WriteFile(tokPath, []byte("v1"), 0o600); err != nil {
+		t.Fatalf("seed token: %v", err)
+	}
+	var rotate sync.Once
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "Token v2" {
+			_, _ = w.Write([]byte(`{"id":1,"email":"ok@example.com"}`))
+			return
+		}
+		rotate.Do(func() {
+			_ = os.WriteFile(tokPath, []byte("v2"), 0o600)
+		})
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	t.Cleanup(srv.Close)
+	c := NewClient()
+	c.BaseURL = srv.URL
+	c.APIToken = "v1"
+	c.APITokenFile = tokPath
+	c.HTTPClient = srv.Client()
+
+	const goroutines = 16
+	errs := make(chan error, goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			_, err := c.Profile(context.Background())
+			errs <- err
+		}()
+	}
+	for i := 0; i < goroutines; i++ {
+		if err := <-errs; err != nil {
+			t.Errorf("goroutine %d: %v", i, err)
+		}
+	}
+}
+
+// TestFetchProxyListStatusRequiresPlanID pins the gating: the v3 status
+// endpoint mandates plan_id, and the client refuses to issue a request
+// that would just return 400 from the vendor.
+func TestFetchProxyListStatusRequiresPlanID(t *testing.T) {
+	c := NewClient()
+	c.APIToken = "tok"
+	_, err := c.FetchProxyListStatus(context.Background(), "")
+	if !errors.Is(err, ErrPlanIDRequired) {
+		t.Fatalf("FetchProxyListStatus(\"\") = %v, want ErrPlanIDRequired", err)
+	}
+	_, err = c.FetchProxyListStatus(context.Background(), "   ")
+	if !errors.Is(err, ErrPlanIDRequired) {
+		t.Fatalf("FetchProxyListStatus(whitespace) = %v, want ErrPlanIDRequired", err)
+	}
+}
+
+// TestFetchProxyListStatusDecodesResponse exercises the wire-shape decode.
+// The fake server returns a canonical Webshare-shaped response; the
+// returned struct fields must be populated.
+func TestFetchProxyListStatusDecodesResponse(t *testing.T) {
+	srv, _ := newFakeServer(t, map[string]http.HandlerFunc{
+		"/proxy/list/status": func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Query().Get("plan_id") != "plan-99" {
+				t.Errorf("plan_id missing: %q", r.URL.RawQuery)
+			}
+			_, _ = w.Write([]byte(`{
+				"state":"completed",
+				"countries":{"US":5,"FR":100},
+				"unallocated_countries":{},
+				"username":"u-fresh",
+				"password":"p-fresh",
+				"is_proxy_used":false
+			}`))
+		},
+	})
+	c := NewClient()
+	c.BaseURL = srv.URL
+	c.APIToken = "tok"
+	c.HTTPClient = srv.Client()
+	got, err := c.FetchProxyListStatus(context.Background(), "plan-99")
+	if err != nil {
+		t.Fatalf("FetchProxyListStatus: %v", err)
+	}
+	if got.State != "completed" || got.Username != "u-fresh" || got.Password != "p-fresh" {
+		t.Fatalf("decoded fields mismatch: %+v", got)
+	}
+	if got.Countries["US"] != 5 || got.Countries["FR"] != 100 {
+		t.Fatalf("countries map decoded wrong: %+v", got.Countries)
+	}
+}
+
+// TestFetchProxyListStatusSurfacesUnauthorized confirms the v3 doV3 path
+// shares the same typed-sentinel translation as the v2 do path: 401 →
+// ErrUnauthorized so errors.Is at higher layers (e.g. fetchCanonicalCreds
+// in the Expander) can dispatch without string matching.
+func TestFetchProxyListStatusSurfacesUnauthorized(t *testing.T) {
+	srv, _ := newFakeServer(t, map[string]http.HandlerFunc{
+		"/proxy/list/status": func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusUnauthorized)
+		},
+	})
+	c := NewClient()
+	c.BaseURL = srv.URL
+	c.APIToken = "bad"
+	c.HTTPClient = srv.Client()
+	_, err := c.FetchProxyListStatus(context.Background(), "plan-1")
+	if !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("err = %v, want ErrUnauthorized", err)
+	}
+}
+
+// TestBaseURLForV3SwapsVersionSegment locks the production URL
+// derivation: production BaseURL is /api/v2 → v3 base must be /api/v3.
+// Test BaseURL (no /api/vN suffix) returns as-is so httptest fakes
+// keep working without an unnecessary path segment.
+func TestBaseURLForV3SwapsVersionSegment(t *testing.T) {
+	cases := []struct {
+		name string
+		base string
+		want string
+	}{
+		{"production default", "https://proxy.webshare.io/api/v2", "https://proxy.webshare.io/api/v3"},
+		{"empty (uses default)", "", "https://proxy.webshare.io/api/v3"},
+		{"httptest root", "http://127.0.0.1:9999", "http://127.0.0.1:9999"},
+		{"custom host with v2", "https://proxy.example.com/api/v2", "https://proxy.example.com/api/v3"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Client{BaseURL: tc.base}
+			got := c.baseURLForV3()
+			if got != tc.want {
+				t.Fatalf("baseURLForV3 = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 

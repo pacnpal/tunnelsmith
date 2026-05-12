@@ -21,9 +21,26 @@
 //
 // Wire-protocol references (Webshare apidocs):
 //
-//	GET  /api/v2/profile/                — validates the API key
-//	GET  /api/v2/proxy/list/?mode=direct  — paginated proxy list
-//	POST /api/v2/proxy/list/refresh/      — on-demand list refresh
+//	GET  /api/v2/profile/                  — validates the API key
+//	GET  /api/v2/proxy/list/?mode=direct    — paginated proxy list
+//	POST /api/v2/proxy/list/refresh/        — on-demand list refresh
+//	GET  /api/v3/proxy/list/status?plan_id  — canonical creds + state
+//
+// Self-healing notes:
+//
+// Per Webshare's help center, "all your proxies share the same username
+// and password" (https://help.webshare.io/en/articles/8375637). The
+// per-proxy username/password fields in /proxy/list/ are therefore
+// effectively account-level credentials replicated N times. When an
+// operator rotates the password via the dashboard, the /proxy/list/
+// response can briefly serve the old credentials until a refresh
+// catches up, which surfaces in tunnelsmith as a 407 storm at the
+// CONNECT layer. The v3 /proxy/list/status endpoint always returns
+// the live canonical pair, so the expander consults it (when
+// plan_id is configured) and lets those creds win over what the
+// list returned. This is the structural fix that obsoletes the
+// manual proxy_username / proxy_password override for most cases —
+// the override stays as the emergency escape hatch.
 package webshare
 
 import (
@@ -40,6 +57,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -157,12 +175,34 @@ type ListProxiesOptions struct {
 // Client talks to Webshare's REST API. Construct one with NewClient,
 // override BaseURL/HTTPClient/Cache/Logger for tests, and call the
 // method that maps to the endpoint you need.
+//
+// Concurrency: APIToken is mutable when APITokenFile is set — the
+// client reloads from disk on a 401 to absorb operator-side token
+// rotation without a restart. All reads/writes of APIToken go through
+// snapshotToken / reloadIfRotated to keep the swap atomic; direct
+// field access from outside the package races and should only be
+// used in tests that own the client exclusively.
 type Client struct {
 	BaseURL    string
 	APIToken   string
 	HTTPClient *http.Client
 	Cache      *Cache       // optional on-disk fallback for ListProxies
 	Logger     *slog.Logger // optional; cache-write warnings go here
+
+	// APITokenFile, when set, is the on-disk source the client re-reads
+	// after observing an ErrUnauthorized response. This is the
+	// credential-rotation self-heal: an operator rewriting the secret
+	// file (kubectl rollout, Compose secret refresh, manual edit)
+	// gets picked up on the very next request that hits the vendor's
+	// 401, rather than the next process restart. Empty disables the
+	// reload path; provider.buildClient populates it from
+	// cfg.APITokenFile.
+	APITokenFile string
+
+	// tokenMu guards APIToken when the auto-reload path is active. A
+	// regular Mutex (not RWMutex) is enough — token reads are cheap
+	// and rare relative to the actual HTTP request that follows them.
+	tokenMu sync.Mutex
 }
 
 // NewClient returns a Client wired to the production endpoint. The
@@ -313,6 +353,15 @@ func (c *Client) listProxiesOnline(ctx context.Context, opts ListProxiesOptions)
 	q := url.Values{}
 	q.Set("mode", mode)
 	q.Set("page_size", strconv.Itoa(pageSize))
+	// Push the validity filter to the server in direct mode. Webshare's
+	// docs flag `valid` as unsupported in backbone (the backbone IP is
+	// constant so the field is meaningless there). Server-side
+	// filtering shrinks the response — a plan with thousands of
+	// proxies easily includes a handful flapping invalid — and the
+	// expander's client-side guard stays as defence in depth.
+	if mode == "direct" {
+		q.Set("valid", "true")
+	}
 	if opts.PlanID != "" {
 		q.Set("plan_id", opts.PlanID)
 	}
@@ -402,23 +451,139 @@ func (c *Client) RefreshProxyList(ctx context.Context, planID string) error {
 	return err
 }
 
-// do is the shared request executor. method is "GET"/"POST"; path is
+// ProxyListStatus mirrors GET /api/v3/proxy/list/status. State follows
+// the documented progression validating → processing → completed (or
+// failed). Username/Password are the canonical credentials for every
+// proxy on the plan — see the package-level self-healing note for why
+// these are the source of truth rather than the per-proxy values
+// returned by /proxy/list/.
+type ProxyListStatus struct {
+	State                string         `json:"state"`
+	Countries            map[string]int `json:"countries"`
+	UnallocatedCountries map[string]int `json:"unallocated_countries"`
+	Username             string         `json:"username"`
+	Password             string         `json:"password"`
+	IsProxyUsed          bool           `json:"is_proxy_used"`
+}
+
+// FetchProxyListStatus queries the v3 status endpoint for planID. planID
+// is required by Webshare's API for this endpoint and the function errors
+// out with ErrPlanIDRequired if it's empty so the caller fails fast at the
+// call site instead of seeing a 400 from the vendor.
+//
+// This is the credential-self-heal probe: the response carries the
+// canonical username/password regardless of whether /proxy/list/ has
+// caught up to the latest rotation.
+func (c *Client) FetchProxyListStatus(ctx context.Context, planID string) (*ProxyListStatus, error) {
+	if strings.TrimSpace(planID) == "" {
+		return nil, ErrPlanIDRequired
+	}
+	path := "/proxy/list/status?plan_id=" + url.QueryEscape(planID)
+	body, err := c.doV3(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	var s ProxyListStatus
+	if err := json.Unmarshal(body, &s); err != nil {
+		return nil, fmt.Errorf("webshare: decode proxy list status: %w", err)
+	}
+	return &s, nil
+}
+
+// ErrPlanIDRequired is returned by API methods that mandate a plan_id
+// query parameter (currently the v3 /proxy/list/status endpoint).
+// Surfaced as a sentinel so callers can errors.Is rather than match
+// on the message.
+var ErrPlanIDRequired = errors.New("webshare: plan_id is required for this endpoint")
+
+// baseURLForV3 derives the /api/v3 base from the configured BaseURL.
+// Production BaseURL ends in /api/v2; the v3 endpoints live alongside,
+// so a literal version-segment swap is enough. Tests that point
+// BaseURL at an httptest root (no /api/vN suffix) get the same root
+// back, which lets a test register its handler on a flat path
+// like "/proxy/list/status" without caring which API version the
+// production call uses.
+func (c *Client) baseURLForV3() string {
+	base := c.BaseURL
+	if base == "" {
+		base = BaseURL
+	}
+	if strings.HasSuffix(base, "/api/v2") {
+		return strings.TrimSuffix(base, "/api/v2") + "/api/v3"
+	}
+	return base
+}
+
+// doV3 is the v3-base variant of do. Shares the auth-retry pipeline so
+// the token-rotation self-heal also covers v3 endpoints.
+func (c *Client) doV3(ctx context.Context, method, path string, body io.Reader) ([]byte, error) {
+	return c.requestWithRetry(ctx, method, path, body, true)
+}
+
+// do is the v2 entry point: build URL from BaseURL+path, dispatch
+// through the auth-retry orchestrator. method is "GET"/"POST"; path is
 // the URL path after BaseURL. body is the optional request body
 // (typically nil for Webshare's GET/POST-empty endpoints). Returns the
 // full response body, capped at maxBodyBytes.
 func (c *Client) do(ctx context.Context, method, path string, body io.Reader) ([]byte, error) {
-	if c.APIToken == "" {
+	return c.requestWithRetry(ctx, method, path, body, false)
+}
+
+// requestWithRetry orchestrates one HTTP request with up-to-one retry
+// when the token file has rotated underneath us. Flow:
+//
+//  1. Snapshot the current in-memory token.
+//  2. Send the request.
+//  3. On any non-401 outcome, return.
+//  4. On 401, attempt reloadIfRotated. If the file is unchanged or
+//     APITokenFile is unset, return the 401 verbatim.
+//  5. Otherwise retry once with the freshly-loaded token. A request
+//     body (io.Reader, drained on first send) disables the retry but
+//     still triggers the reload so subsequent calls see the new token.
+//
+// The retry is bounded at one. A second 401 means the new token is
+// also wrong, which is operator-actionable and should not be retried.
+func (c *Client) requestWithRetry(ctx context.Context, method, path string, body io.Reader, useV3 bool) ([]byte, error) {
+	token := c.snapshotToken()
+	if token == "" {
 		return nil, fmt.Errorf("webshare: APIToken is empty")
 	}
-	base := c.BaseURL
-	if base == "" {
-		base = BaseURL
+	data, err := c.send(ctx, method, path, body, token, useV3)
+	if !errors.Is(err, ErrUnauthorized) {
+		return data, err
+	}
+	if body != nil {
+		// Body is already drained; we cannot replay it. Still try the
+		// reload so the next request benefits, but surface the 401.
+		_ = c.reloadIfRotated(token)
+		return data, err
+	}
+	if !c.reloadIfRotated(token) {
+		return data, err
+	}
+	if c.Logger != nil {
+		c.Logger.Info("webshare: api token reload after 401; retrying once")
+	}
+	return c.send(ctx, method, path, body, c.snapshotToken(), useV3)
+}
+
+// send executes a single request with the given token. No retry
+// logic; that's the caller's job.
+func (c *Client) send(ctx context.Context, method, path string, body io.Reader, token string, useV3 bool) ([]byte, error) {
+	var base string
+	if useV3 {
+		base = c.baseURLForV3()
+	} else {
+		base = c.BaseURL
+		if base == "" {
+			base = BaseURL
+		}
 	}
 	req, err := http.NewRequestWithContext(ctx, method, base+path, body)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Token "+c.APIToken)
+	req.Header.Set("Authorization", "Token "+token)
 	req.Header.Set("Accept", "application/json")
 	httpClient := c.HTTPClient
 	if httpClient == nil {
@@ -456,6 +621,63 @@ func (c *Client) do(ctx context.Context, method, path string, body io.Reader) ([
 			Body:       snippet(data),
 		}
 	}
+}
+
+// snapshotToken returns the current in-memory token under the lock so
+// the caller can use it for a single request without racing the
+// reload path. Returning the value (not a pointer) means a concurrent
+// reload after this snapshot is invisible to the caller's request,
+// which is exactly what we want — the next request will pick up the
+// new value.
+func (c *Client) snapshotToken() string {
+	c.tokenMu.Lock()
+	defer c.tokenMu.Unlock()
+	return c.APIToken
+}
+
+// reloadIfRotated re-reads APITokenFile (if set) and swaps the
+// in-memory token if the on-disk value differs from usedToken. Returns
+// true when the in-memory token now differs from usedToken — i.e. a
+// retry with the latest token has a chance of succeeding.
+//
+// usedToken is the token the failing request actually carried. The
+// concurrent-reload case (another goroutine already loaded the new
+// token between our request and our reload attempt) is detected by
+// comparing the in-memory token against usedToken: if they differ,
+// we report "rotated" without touching disk.
+//
+// A read or parse error on the file path is treated as "no rotation":
+// we fall through and surface the original 401. The Logger gets a
+// warn line so the operator sees the failed reload.
+func (c *Client) reloadIfRotated(usedToken string) bool {
+	if c.APITokenFile == "" {
+		return false
+	}
+	c.tokenMu.Lock()
+	defer c.tokenMu.Unlock()
+	if c.APIToken != usedToken {
+		// Another goroutine already reloaded between our send and
+		// our recheck. The new in-memory token differs from what we
+		// sent, so retrying is justified.
+		return true
+	}
+	newTok, err := LoadTokenFile(c.APITokenFile)
+	if err != nil {
+		if c.Logger != nil {
+			c.Logger.Warn("webshare: api token reload failed; keeping in-memory token",
+				slog.String("path", c.APITokenFile),
+				slog.Any("err", err),
+			)
+		}
+		return false
+	}
+	if newTok == c.APIToken {
+		// Token file unchanged. The 401 reflects a genuinely wrong
+		// token, not a stale-in-memory copy. Surface it.
+		return false
+	}
+	c.APIToken = newTok
+	return true
 }
 
 // snippet returns a short preview of a response body for error
