@@ -3,6 +3,7 @@ package upstream_test
 import (
 	"bufio"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	socks5 "github.com/armon/go-socks5"
 
 	"github.com/pacnpal/tunnelsmith/internal/config"
+	"github.com/pacnpal/tunnelsmith/internal/failure"
 	"github.com/pacnpal/tunnelsmith/internal/upstream"
 )
 
@@ -374,6 +376,42 @@ func TestHTTPUpstreamCONNECTNon2xx(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "CONNECT got status 502") {
 		t.Errorf("error = %q, want one mentioning the 502 status", err.Error())
+	}
+	// 502 must NOT wrap failure.ErrProxyAuth — that sentinel is the
+	// 407-specific signal the auto-heal driver subscribes to, and a
+	// generic 502 should still classify as KindRefused.
+	if errors.Is(err, failure.ErrProxyAuth) {
+		t.Errorf("502 unexpectedly wraps ErrProxyAuth: %v", err)
+	}
+}
+
+// TestHTTPUpstreamCONNECT407WrapsProxyAuth pins the contract the
+// auto-heal driver depends on: an upstream HTTP proxy answering CONNECT
+// with 407 produces a dial error whose chain includes failure.ErrProxyAuth.
+// scoreboard.DialFor's ClassifyDialError dispatches on that sentinel
+// to record KindProxyAuth, which the driver counts toward its heal
+// threshold. A regression that drops the wrap would silently downgrade
+// the kind to KindRefused and break the 407→Heal pipeline.
+func TestHTTPUpstreamCONNECT407WrapsProxyAuth(t *testing.T) {
+	t.Parallel()
+
+	proxy := newFakeConnectProxy(t, http.StatusProxyAuthRequired, nil, "")
+
+	up, err := upstream.New(config.UpstreamConfig{ID: "h", Kind: config.KindHTTP, Addr: proxy.addr()}, 2*time.Second)
+	if err != nil {
+		t.Fatalf("New http: %v", err)
+	}
+	_, err = up.Dial(context.Background(), "tcp", "example.com:443")
+	if err == nil {
+		t.Fatal("expected error from 407 CONNECT, got nil")
+	}
+	if !errors.Is(err, failure.ErrProxyAuth) {
+		t.Fatalf("err = %v, want one wrapping failure.ErrProxyAuth", err)
+	}
+	// The message should still surface the status code so the operator
+	// log makes the cause obvious without inspecting the error chain.
+	if !strings.Contains(err.Error(), "407") {
+		t.Errorf("error = %q, want one mentioning the 407 status", err.Error())
 	}
 }
 

@@ -162,13 +162,40 @@ func run(args []string, stdout, stderr *os.File) error {
 	metricsRegistry := metrics.New()
 	metricsRegistry.SetUpstreamPoolSize(pool.Len())
 
-	sb, err := scoreboard.New(pool, scoreboard.FromConfig(cfg.Failure.Scoring, cfg.Failure.Status, cfg.Failure.ConnectionRefused),
+	// Build the auto-heal drivers BEFORE scoreboard.New so the
+	// FailureHook can be threaded through the constructor. One driver
+	// per [[upstream_pool]] block whose Expander implements
+	// provider.Healer (today: webshare only); blocks without a Healer
+	// (mullvad) get no driver and never trigger Heal. Drivers stay
+	// composer-less here — newPoolComposer runs further down — and
+	// get wired via connectAuthHealDriversToComposer once the
+	// composer exists. No traffic flows until the listener starts
+	// later, so the window where a hook could fire against a nil
+	// composer is closed by ordering rather than by extra locking.
+	authHealDrivers := buildAuthHealDrivers(poolBlocks, logger)
+	authHealHook := fanoutFailureHook(authHealDrivers)
+
+	scoreboardOpts := []scoreboard.Option{
 		scoreboard.WithLogger(logger),
 		scoreboard.WithMetrics(metricsRegistry),
 		scoreboard.WithRules(rules),
+	}
+	if authHealHook != nil {
+		scoreboardOpts = append(scoreboardOpts, scoreboard.WithFailureHook(authHealHook))
+	}
+	sb, err := scoreboard.New(pool, scoreboard.FromConfig(cfg.Failure.Scoring, cfg.Failure.Status, cfg.Failure.ConnectionRefused),
+		scoreboardOpts...,
 	)
 	if err != nil {
 		return fmt.Errorf("build scoreboard: %w", err)
+	}
+	if len(authHealDrivers) > 0 {
+		logger.Info("auth-heal drivers registered",
+			"count", len(authHealDrivers),
+			"threshold", authHealThreshold,
+			"window_ms", authHealWindow.Milliseconds(),
+			"cooldown_ms", authHealCooldown.Milliseconds(),
+		)
 	}
 	if cfg.Cache.PersistPath != "" {
 		if err := sb.LoadSnapshot(cfg.Cache.PersistPath); err != nil {
@@ -329,6 +356,12 @@ func run(args []string, stdout, stderr *os.File) error {
 		cfg.Failure.MaxRetriesPerRequest,
 		dialTimeout,
 	)
+	// Wire the auto-heal drivers to the composer now that it exists.
+	// The scoreboard hook is registered but cannot fire until the
+	// listener starts taking traffic below, so the brief window
+	// between "scoreboard.New returns" and "drivers have composer"
+	// is closed by ordering.
+	connectAuthHealDriversToComposer(authHealDrivers, composer)
 	for _, pb := range poolBlocks {
 		pb := pb
 		g.Go(func() error { return pb.runRefresh(gctx, composer) })

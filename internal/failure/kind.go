@@ -1,6 +1,18 @@
 package failure
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
+
+// ErrProxyAuth is the sentinel a dial path wraps when an upstream HTTP
+// proxy answered the CONNECT handshake with 407 Proxy Authentication
+// Required. Wrap with %w so errors.Is(err, ErrProxyAuth) matches across
+// the chain (the listener's aggregated errors.Join from
+// Scoreboard.DialFor preserves the chain). ClassifyDialError consults
+// this sentinel to return KindProxyAuth without an import cycle through
+// the upstream package.
+var ErrProxyAuth = errors.New("upstream proxy returned 407 Proxy Authentication Required")
 
 // Kind tags the shape of an upstream-side failure so the scoreboard can apply
 // the right penalty and cooldown. Values are stable strings so they survive
@@ -43,6 +55,16 @@ const (
 	// destination returned a 2xx page that the configured regex identified
 	// as a soft block (typical "not available in your region" page).
 	KindBodyMatch Kind = "body_match"
+
+	// KindProxyAuth covers an upstream HTTP proxy answering the CONNECT
+	// handshake with 407 Proxy Authentication Required. Differs from
+	// KindRefused (TCP-level rejection) and KindForbidden (destination
+	// 403): the proxy itself rejected our credentials before the request
+	// reached the destination. Driven by ClassifyDialError matching the
+	// ErrProxyAuth sentinel; the auto-heal driver in cmd/tunnelsmith
+	// subscribes to these events and triggers a credential refresh on
+	// the configured provider when a burst suggests a rotated password.
+	KindProxyAuth Kind = "proxy_auth"
 )
 
 // AllKinds lists every Kind in declaration order. Useful for building per-kind
@@ -55,6 +77,7 @@ var AllKinds = []Kind{
 	KindForbidden,
 	KindLegalBlock,
 	KindBodyMatch,
+	KindProxyAuth,
 }
 
 // String returns the kind's stable wire form. Used in log lines and metrics.
@@ -65,23 +88,32 @@ func (k Kind) String() string { return string(k) }
 // example, a status-rule mapping) can guard their lookups.
 func (k Kind) Valid() bool {
 	switch k {
-	case KindRefused, KindTimeout, KindRateLimit, KindForbidden, KindLegalBlock, KindBodyMatch:
+	case KindRefused, KindTimeout, KindRateLimit, KindForbidden, KindLegalBlock, KindBodyMatch, KindProxyAuth:
 		return true
 	}
 	return false
 }
 
-// ClassifyDialError maps a dial error to a Kind. Timeout wins over refused
-// because a timeout-shaped error can also satisfy IsConnectionRefused on some
-// platforms when the deadline fires mid-handshake; Phase 4 wants the softer
-// kind in that case so a slow exit does not get punished as if it had
-// actively refused. Anything that does not classify falls into KindRefused,
-// which matches the proposal's "treat unclassified dial failures as the
-// canonical hard signal" stance.
+// ClassifyDialError maps a dial error to a Kind. Order matters:
+//
+//   - ErrProxyAuth wins first. A CONNECT 407 is a credential signal we
+//     want the auto-heal driver to react to; misclassifying it as
+//     KindRefused (the catch-all branch) would silently bury the
+//     event so the operator only sees a generic dial failure.
+//   - Timeout wins over refused because a timeout-shaped error can
+//     also satisfy IsConnectionRefused on some platforms when the
+//     deadline fires mid-handshake; Phase 4 wants the softer kind in
+//     that case so a slow exit does not get punished as if it had
+//     actively refused.
+//   - Anything else falls into KindRefused, matching the proposal's
+//     "treat unclassified dial failures as the canonical hard signal"
+//     stance.
 func ClassifyDialError(err error) Kind {
 	switch {
 	case err == nil:
 		return ""
+	case errors.Is(err, ErrProxyAuth):
+		return KindProxyAuth
 	case IsTimeout(err):
 		return KindTimeout
 	case IsConnectionRefused(err):

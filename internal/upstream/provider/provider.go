@@ -81,6 +81,18 @@ type RefreshOptions struct {
 	PlanID string
 }
 
+// Healer is an optional capability some Expanders advertise: trigger a
+// vendor-side refresh AND apply the resulting snapshot in one call.
+// The auto-heal driver in cmd/tunnelsmith uses Healer (via a type
+// assertion against an Expander) to react to credential-rotation
+// signals (CONNECT 407 bursts mapped to failure.KindProxyAuth)
+// without waiting for the scheduled refresh tick. Providers without
+// vendor-side rotation (e.g. mullvad) do not implement this; the
+// driver simply skips their pool blocks.
+type Healer interface {
+	Heal(ctx context.Context) ([]config.UpstreamConfig, error)
+}
+
 // API is the optional vendor-API control surface. Providers that have
 // nothing to expose return ErrAPINotSupported from Provider.BuildAPI.
 //
