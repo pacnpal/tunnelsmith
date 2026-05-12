@@ -359,12 +359,15 @@ func run(args []string, stdout, stderr *os.File) error {
 		cfg.Failure.MaxRetriesPerRequest,
 		dialTimeout,
 	)
-	// Wire the auto-heal drivers to the composer now that it exists.
-	// The scoreboard hook is registered but cannot fire until the
-	// listener starts taking traffic below, so the brief window
-	// between "scoreboard.New returns" and "drivers have composer"
-	// is closed by ordering.
-	connectAuthHealDriversToComposer(authHealDrivers, composer)
+	// Wire the auto-heal drivers to the composer AND to the errgroup
+	// context now that both exist. Composer enables hot-swap; gctx
+	// gives runHeal a shutdown-aware parent so a SIGTERM cancels the
+	// in-flight Healer.Heal RPC instead of dangling past shutdown.
+	// The scoreboard hook is already registered but cannot fire
+	// until the listener starts taking traffic below, so any
+	// buffered events from the brief startup window land here
+	// against a fully-wired driver.
+	connectAuthHealDriversToComposer(authHealDrivers, gctx, composer)
 	for _, pb := range poolBlocks {
 		pb := pb
 		g.Go(func() error { return pb.runRefresh(gctx, composer) })

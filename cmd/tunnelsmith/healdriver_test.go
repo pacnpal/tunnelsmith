@@ -350,6 +350,82 @@ func TestValidateNoStaticPoolPrefixCollision(t *testing.T) {
 	})
 }
 
+// TestAuthHealDriverHonorsParentContext pins the shutdown-aware
+// behavior: cancelling the parent context cancels the per-heal
+// timeout context, which surfaces as ctx.Done() inside the healer.
+// Without this, a SIGTERM mid-heal would let the Webshare RPC run to
+// completion (or its own 60s timeout) instead of unwinding cleanly.
+func TestAuthHealDriverHonorsParentContext(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	clock := func() time.Time { return now }
+	healStarted := make(chan struct{}, 1)
+	gotErr := make(chan error, 1)
+	healer := &fakeHealer{
+		healFn: func(ctx context.Context) ([]config.UpstreamConfig, error) {
+			select {
+			case healStarted <- struct{}{}:
+			default:
+			}
+			<-ctx.Done()
+			gotErr <- ctx.Err()
+			return nil, ctx.Err()
+		},
+	}
+	d := newTestDriver("ws", healer, clock)
+	parent, parentCancel := context.WithCancel(context.Background())
+	defer parentCancel()
+	d.setParentContext(parent)
+
+	for i := 0; i < authHealThreshold; i++ {
+		d.Observe("example.com", "ws-d-1", failure.KindProxyAuth)
+	}
+	select {
+	case <-healStarted:
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for the heal to start")
+	}
+	// Cancel the parent: the healer's <-ctx.Done() must unblock.
+	parentCancel()
+	select {
+	case err := <-gotErr:
+		if err == nil {
+			t.Fatal("healer observed nil ctx.Err() after parent cancel")
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("parent cancel did not propagate into the heal context")
+	}
+}
+
+// TestAuthHealDriverEventsSliceBoundedAtThreshold pins the O(1)
+// guarantee on the hot Observe path: even during a sustained 407 storm
+// in cooldown (heal cannot fire, events keep arriving), the events
+// slice does not grow past the threshold. Without the cap, the slice
+// would accumulate one entry per Observe within the window, which
+// turns the per-Observe scan-and-compact into O(events-in-window).
+func TestAuthHealDriverEventsSliceBoundedAtThreshold(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	clock := func() time.Time { return now }
+	healer := &fakeHealer{}
+	d := newTestDriver("ws", healer, clock)
+	// Fire one heal so we're in cooldown for the next bumps.
+	for i := 0; i < authHealThreshold; i++ {
+		d.Observe("example.com", "ws-d-1", failure.KindProxyAuth)
+	}
+	waitForCalls(t, healer, 1, 1*time.Second)
+	// Now in cooldown. Send many more events; slice must stay bounded.
+	for i := 0; i < 10_000; i++ {
+		d.Observe("example.com", "ws-d-1", failure.KindProxyAuth)
+	}
+	d.mu.Lock()
+	got := len(d.events)
+	d.mu.Unlock()
+	if got > d.threshold {
+		t.Fatalf("events slice grew to %d during cooldown burst; want <= threshold=%d", got, d.threshold)
+	}
+}
+
 // TestAuthHealDriverSingleInFlight pins the concurrency contract: while
 // one Heal is in flight, threshold-crossing bumps must not spawn a
 // second concurrent Heal. Otherwise a sustained 407 storm could burn
@@ -360,6 +436,11 @@ func TestAuthHealDriverSingleInFlight(t *testing.T) {
 	clock := func() time.Time { return now }
 	healStarted := make(chan struct{}, 1)
 	healCanReturn := make(chan struct{})
+	// Defer the close so a t.Fatal between here and the explicit close
+	// at the end still unblocks the fakeHealer's goroutine; otherwise a
+	// failure would leak a permanently-blocked goroutine and hang the
+	// race-detector's leak check.
+	defer close(healCanReturn)
 	healer := &fakeHealer{
 		healFn: func(ctx context.Context) ([]config.UpstreamConfig, error) {
 			select {
@@ -374,7 +455,11 @@ func TestAuthHealDriverSingleInFlight(t *testing.T) {
 	for i := 0; i < authHealThreshold; i++ {
 		d.Observe("example.com", "ws-d-1", failure.KindProxyAuth)
 	}
-	<-healStarted
+	select {
+	case <-healStarted:
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for the first heal to start")
+	}
 	// Try to trigger again while the first heal is blocked.
 	for i := 0; i < authHealThreshold*3; i++ {
 		d.Observe("example.com", "ws-d-1", failure.KindProxyAuth)
@@ -383,6 +468,4 @@ func TestAuthHealDriverSingleInFlight(t *testing.T) {
 	if got := healer.calls.Load(); got != 1 {
 		t.Fatalf("Heal called %d times while one was in flight; want 1", got)
 	}
-	// Let the first heal finish.
-	close(healCanReturn)
 }

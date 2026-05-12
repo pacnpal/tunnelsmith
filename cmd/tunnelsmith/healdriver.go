@@ -57,11 +57,17 @@ type authHealDriver struct {
 	callTimeout time.Duration
 	clock       func() time.Time
 
-	// composer is wired after construction because newPoolComposer runs
-	// later in main() than the scoreboard hook the driver is registered
-	// under. composerMu guards the swap; reads from runHeal take it.
-	composerMu sync.Mutex
-	composer   poolUpdater
+	// composer + parentCtx are wired after construction because
+	// newPoolComposer and the errgroup context both materialise later
+	// in main() than the scoreboard hook the driver is registered
+	// under. wireMu guards both; reads from runHeal take it. parentCtx
+	// defaults to context.Background() so a driver that's never wired
+	// (test paths, defensive) still produces a valid context, but in
+	// production main() always upgrades it to gctx so a SIGTERM cancels
+	// in-flight heal RPCs cleanly.
+	wireMu    sync.Mutex
+	composer  poolUpdater
+	parentCtx context.Context
 
 	mu       sync.Mutex
 	events   []time.Time
@@ -84,6 +90,7 @@ func newAuthHealDriver(idPrefix string, healer provider.Healer, logger *slog.Log
 		cooldown:    authHealCooldown,
 		callTimeout: authHealCallTimeout,
 		clock:       time.Now,
+		parentCtx:   context.Background(),
 	}
 }
 
@@ -93,9 +100,25 @@ func newAuthHealDriver(idPrefix string, healer provider.Healer, logger *slog.Log
 // composer is still nil (see bump) so the first burst after startup
 // heals correctly.
 func (d *authHealDriver) setComposer(c poolUpdater) {
-	d.composerMu.Lock()
+	d.wireMu.Lock()
 	d.composer = c
-	d.composerMu.Unlock()
+	d.wireMu.Unlock()
+}
+
+// setParentContext wires the shutdown-aware parent context the driver
+// derives its per-heal timeout from. main() calls this with the
+// errgroup context so a SIGTERM or SIGHUP cancels any in-flight
+// Healer.Heal RPC. Defaults to context.Background() before this call
+// fires; only the brief startup window between scoreboard.New and
+// connectAuthHealDriversToComposer can observe the default, and
+// production traffic doesn't flow yet during that window.
+func (d *authHealDriver) setParentContext(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	d.wireMu.Lock()
+	d.parentCtx = ctx
+	d.wireMu.Unlock()
 }
 
 // Observe is the scoreboard FailureHook callback. Cheap and non-blocking:
@@ -138,6 +161,15 @@ func (d *authHealDriver) bump() {
 		}
 	}
 	keep = append(keep, now)
+	// Bound the events slice at threshold. Only the count within the
+	// window matters for the firing decision (>= threshold triggers);
+	// keeping more than threshold timestamps wastes memory and CPU
+	// during a sustained 407 storm in cooldown, where bumps keep
+	// arriving but cannot fire a heal. Capping at threshold turns the
+	// per-Observe scan from O(events-in-window) into O(threshold).
+	if len(keep) > d.threshold {
+		keep = keep[len(keep)-d.threshold:]
+	}
 	d.events = keep
 	if len(d.events) < d.threshold {
 		return
@@ -153,9 +185,9 @@ func (d *authHealDriver) bump() {
 	// subsequent bump after the composer lands fires immediately. The
 	// 407 storm at startup is exactly the scenario this branch
 	// protects against.
-	d.composerMu.Lock()
+	d.wireMu.Lock()
 	composerReady := d.composer != nil
-	d.composerMu.Unlock()
+	d.wireMu.Unlock()
 	if !composerReady {
 		return
 	}
@@ -165,11 +197,14 @@ func (d *authHealDriver) bump() {
 	go d.runHeal()
 }
 
-// runHeal invokes Healer.Heal under a bounded context and forwards the
-// resulting snapshot through the pool composer. Failures log a warn
-// line but never panic; the inFlight flag is cleared in any case so a
-// subsequent burst can re-arm. Logs include the upstream count so an
-// operator watching the journal can correlate the heal with the
+// runHeal invokes Healer.Heal under a bounded context derived from the
+// driver's parent context, then forwards the resulting snapshot through
+// the pool composer. Failures log a warn line but never panic; the
+// inFlight flag is cleared in any case so a subsequent burst can
+// re-arm. The success log fires only AFTER composer.Update lands so a
+// later reader of the journal cannot mistake a fetched-but-not-applied
+// heal for a successful pool rotation. Logs include the upstream count
+// so an operator watching the journal can correlate the heal with the
 // follow-on pool size.
 func (d *authHealDriver) runHeal() {
 	defer func() {
@@ -177,22 +212,26 @@ func (d *authHealDriver) runHeal() {
 		d.inFlight = false
 		d.mu.Unlock()
 	}()
-	ctx, cancel := context.WithTimeout(context.Background(), d.callTimeout)
+	d.wireMu.Lock()
+	parent := d.parentCtx
+	composer := d.composer
+	d.wireMu.Unlock()
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, d.callTimeout)
 	defer cancel()
 	next, err := d.healer.Heal(ctx)
 	if err != nil {
 		d.logger.Warn("auth heal failed", "err", err)
 		return
 	}
-	d.logger.Info("auth heal: pool refreshed after KindProxyAuth burst",
-		"upstreams", len(next))
-	d.composerMu.Lock()
-	composer := d.composer
-	d.composerMu.Unlock()
+	d.logger.Debug("auth heal: snapshot fetched", "upstreams", len(next))
 	if composer == nil {
 		// Should not happen in production (main wires the composer
 		// before any traffic flows), but defensive: log and bail
-		// rather than nil-deref.
+		// rather than nil-deref. Logged at warn because if we ever
+		// reach here it means the bump composer-ready gate slipped.
 		d.logger.Warn("auth heal: composer not wired; skipping pool hot-swap")
 		return
 	}
@@ -202,7 +241,8 @@ func (d *authHealDriver) runHeal() {
 		return
 	}
 	if applied {
-		d.logger.Info("auth heal: pool hot-swap applied", "upstreams", len(next))
+		d.logger.Info("auth heal: pool hot-swap applied after KindProxyAuth burst",
+			"upstreams", len(next))
 	} else {
 		d.logger.Debug("auth heal: pool unchanged after heal", "upstreams", len(next))
 	}
@@ -245,14 +285,19 @@ func buildAuthHealDrivers(blocks []*poolBlock, logger *slog.Logger) []*authHealD
 	return drivers
 }
 
-// connectAuthHealDriversToComposer wires composer into every driver
-// after newPoolComposer has built it. Composer may not exist at
-// scoreboard-construction time, so drivers buffer events until this
-// call lands; bump() defers cooldown advancement when composer is
-// nil so the first burst after startup heals correctly.
-func connectAuthHealDriversToComposer(drivers []*authHealDriver, composer poolUpdater) {
+// connectAuthHealDriversToComposer wires composer AND the parent
+// context into every driver after newPoolComposer has built it.
+// Composer may not exist at scoreboard-construction time, so drivers
+// buffer events until this call lands; bump() defers cooldown
+// advancement when composer is nil so the first burst after startup
+// heals correctly. parentCtx is the errgroup context from main —
+// cancelling it (SIGTERM, SIGHUP) propagates into the per-heal
+// timeout context so an in-flight Healer.Heal RPC is cancelled
+// instead of dangling past shutdown.
+func connectAuthHealDriversToComposer(drivers []*authHealDriver, parentCtx context.Context, composer poolUpdater) {
 	for _, d := range drivers {
 		d.setComposer(composer)
+		d.setParentContext(parentCtx)
 	}
 }
 
