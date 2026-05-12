@@ -300,7 +300,10 @@ func TestProviderBuildExpanderResolvesProxyCredsFromEnv(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildExpander: %v", err)
 	}
-	concrete := exp.(*Expander)
+	concrete, ok := exp.(*Expander)
+	if !ok {
+		t.Fatalf("BuildExpander returned %T, want *Expander", exp)
+	}
 	concrete.client.BaseURL = srv.URL
 	concrete.client.HTTPClient = srv.Client()
 
@@ -310,6 +313,58 @@ func TestProviderBuildExpanderResolvesProxyCredsFromEnv(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].Username != "env-user" || got[0].Password != "env-pass" {
 		t.Fatalf("expected env-resolved creds on the upstream, got %+v", got)
+	}
+}
+
+func TestProviderBuildExpanderTrimsResolvedProxyCreds(t *testing.T) {
+	// Both branches of resolveCred must strip surrounding whitespace
+	// before the value reaches the upstream's Proxy-Authorization
+	// header. A trailing newline or space in a Docker compose
+	// environment: line (or an accidentally-padded TOML literal)
+	// would otherwise produce a 407 indistinguishable from a real
+	// credential mismatch.
+	t.Setenv("WS_PROXY_USER_PADDED", "  env-user  \n")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"count": 1,
+			"results": []Proxy{
+				{ID: "d-1", Username: "vendor", Password: "vendor", ProxyAddress: "1.1.1.1", Port: 1, Valid: true},
+			},
+		})
+	}))
+	t.Cleanup(srv.Close)
+
+	p := &Provider{}
+	exp, err := p.BuildExpander(config.UpstreamPoolConfig{
+		Provider:         "webshare",
+		IDPrefix:         "ws",
+		APIToken:         "tok",
+		ProxyUsernameEnv: "WS_PROXY_USER_PADDED",
+		ProxyPassword:    "  inline-pass  ",
+	}, nil)
+	if err != nil {
+		t.Fatalf("BuildExpander: %v", err)
+	}
+	concrete, ok := exp.(*Expander)
+	if !ok {
+		t.Fatalf("BuildExpander returned %T, want *Expander", exp)
+	}
+	concrete.client.BaseURL = srv.URL
+	concrete.client.HTTPClient = srv.Client()
+
+	got, err := concrete.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d upstreams, want 1", len(got))
+	}
+	if got[0].Username != "env-user" {
+		t.Errorf("env-resolved username = %q, want %q (trimmed)", got[0].Username, "env-user")
+	}
+	if got[0].Password != "inline-pass" {
+		t.Errorf("inline password = %q, want %q (trimmed)", got[0].Password, "inline-pass")
 	}
 }
 

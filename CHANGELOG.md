@@ -7,9 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-05-12
+
+One additive feature on top of v1.2.0 plus a bundled fix: an operator-controlled override for the per-proxy CONNECT credentials on the Webshare provider, so deployments hitting stale-credential 407 storms can pin the auth header from the config or a Docker `environment:` block instead of waiting on the next vendor list-refresh tick. The fix corrects a whitespace-trimming asymmetry in the env-var resolution path that landed with the feature itself. Default behaviour is byte-identical to v1.2.0.
+
 ### Added
 
-- **Webshare per-proxy credential override.** New `proxy_username` / `proxy_password` (inline) and `proxy_username_env` / `proxy_password_env` (read from named environment variables at startup) on the `[[upstream_pool]]` provider block let the operator pin the CONNECT credentials for every materialised Webshare upstream instead of inheriting them from the vendor's `/proxy/list/` response. The escape hatch for "Webshare returns stale per-proxy credentials and every CONNECT comes back 407" without waiting on the next refresh tick. Both credentials must be set together; a half-populated pair fails at config-load. The env-var path matches the Docker pattern of `environment:` blocks injecting secrets; resolved values never appear in `--print-config`. Rotation is restart-only, matching `api_token_file`. See `docs/providers.md#per-proxy-connect-credentials` and the Docker example in `docs/deployment.md`.
+- **Webshare per-proxy credential override.** New `proxy_username` / `proxy_password` (inline) and `proxy_username_env` / `proxy_password_env` (read from named environment variables at startup) on the `[[upstream_pool]]` provider block let the operator pin the CONNECT credentials for every materialised Webshare upstream instead of inheriting them from the vendor's `GET /api/v2/proxy/list/` response. The escape hatch for "Webshare returns stale per-proxy credentials and every CONNECT comes back 407" without waiting on the next refresh tick. Both credentials must be set together; a half-populated pair fails at config-load. The env-var path matches the Docker pattern of `environment:` blocks injecting secrets; resolved values never appear in `--print-config`. Rotation is restart-only, matching `api_token_file`. See `docs/providers.md#per-proxy-connect-credentials` and the Docker example in `docs/deployment.md`.
+
+### Fixed
+
+- **Webshare proxy credential resolver now strips whitespace on the env-var path.** The inline branch of `resolveCred` already trimmed; the env branch returned the raw `os.Getenv` result, so a trailing newline or stray space in a Docker compose `environment:` line would land verbatim in the `Proxy-Authorization` header and produce a 407 indistinguishable from a genuine credential mismatch (exactly the failure mode this override was built to escape). Both branches now strip surrounding whitespace consistently. New test in `internal/upstream/webshare/provider_test.go` pins both branches end-to-end.
 
 ## [1.2.0] - 2026-05-11
 

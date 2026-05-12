@@ -252,12 +252,13 @@ const UpstreamPoolMullvad UpstreamPoolKind = "mullvad"
 //   - PlanID: vendor plan/subscription scope (Webshare)
 //   - Mode: provider-specific routing flavor ("direct" | "backbone" for Webshare)
 //   - Kind: upstream kind to materialise as ("http" or "socks5"); default "http"
-//   - ProxyUsername / ProxyPasswordEnv etc: optional override for the
-//     per-proxy CONNECT credentials. When set, the expander stamps every
-//     materialised upstream with these values instead of the ones
-//     returned by the vendor's proxy-list endpoint. Useful when the
-//     vendor returns stale per-proxy creds (Webshare 407 storms) or when
-//     the operator wants to drive auth from a Docker env var.
+//   - ProxyUsername / ProxyPassword / ProxyUsernameEnv / ProxyPasswordEnv:
+//     optional override for the per-proxy CONNECT credentials. When
+//     set, the expander stamps every materialised upstream with these
+//     values instead of the ones returned by the vendor's proxy-list
+//     endpoint. Useful when the vendor returns stale per-proxy creds
+//     (Webshare 407 storms) or when the operator wants to drive auth
+//     from a Docker env var.
 //
 // Priority and Refresh use *int / *Duration sentinels so applyDefaults
 // can tell "field omitted" from "user wrote 0" / "user wrote 0s". After
