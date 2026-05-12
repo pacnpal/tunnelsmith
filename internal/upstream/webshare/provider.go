@@ -205,6 +205,16 @@ func buildClient(cfg config.UpstreamPoolConfig, logger *slog.Logger) (*Client, e
 	c := NewClient()
 	c.APIToken = token
 	c.Logger = logger
+	// Plumbing for the token-rotation self-heal: only the token-file
+	// branch is reload-eligible. An inline api_token in TOML is a
+	// "trust this exact value" declaration with no file the operator
+	// expects the binary to watch, so we deliberately leave
+	// APITokenFile empty for that path. resolveToken already trimmed
+	// the field; pass the trimmed value so a stray space in the
+	// config doesn't trip filepath.IsAbs in the reload helper.
+	if path := strings.TrimSpace(cfg.APITokenFile); path != "" {
+		c.APITokenFile = path
+	}
 	if cfg.CachePath != "" {
 		c.Cache = &Cache{Path: cfg.CachePath}
 	}
