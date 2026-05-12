@@ -7,7 +7,7 @@
 
 A per-destination egress router for HTTP and SOCKS5. Picks the right exit for each URL based on what is actually working.
 
-> **Status: v1.2.1.** v1.0.0 shipped the per-host scoreboard, Mullvad pool integration, web UI, metrics, and Phase 11 cooperative outcome reporting; v1.1.0 added Phase 11.1 (hot-swap of the running `[[upstream_pool]]` on Mullvad relay churn) and Phase 12 (opt-in bearer-token auth on the control endpoint); v1.2.0 added Phase 13 (pluggable `[[upstream_pool]]` providers plus a first-class Webshare adapter, with two new bearer-gated control routes for vendor-side proxy-list refresh) and Phase 14 (opt-in TLS on the control listener, closing the plaintext-token risk ADR-007 named in its Non-goals). v1.2.1 adds a per-proxy CONNECT credential override on the Webshare provider (`proxy_username` / `proxy_password` inline, or `proxy_username_env` / `proxy_password_env` for Docker `environment:` blocks). See [`CHANGELOG.md`](CHANGELOG.md) for the full release notes.
+> **Status: v1.2.1.** v1.0.0 shipped the per-host scoreboard, Mullvad pool integration, web UI, metrics, and Phase 11 cooperative outcome reporting; v1.1.0 added Phase 11.1 (hot-swap of the running `[[upstream_pool]]` on Mullvad relay churn) and Phase 12 (opt-in bearer-token auth on the control endpoint); v1.2.0 added Phase 13 (pluggable `[[upstream_pool]]` providers plus a first-class Webshare adapter, with two new bearer-gated control routes for vendor-side proxy-list refresh) and Phase 14 (opt-in TLS on the control listener, closing the plaintext-token risk ADR-007 named in its Non-goals); v1.2.1 adds a per-proxy CONNECT credential override on the Webshare provider (`proxy_username` / `proxy_password` inline, or `proxy_username_env` / `proxy_password_env` for Docker `environment:` blocks). See [`CHANGELOG.md`](CHANGELOG.md) for the full release notes.
 
 ## What it does
 
@@ -30,7 +30,7 @@ docker pull ghcr.io/pacnpal/tunnelsmith:1.2.1
 docker run --rm ghcr.io/pacnpal/tunnelsmith:1.2.1 --version
 ```
 
-Image tags omit the leading `v` that git tags carry (so git tag `v1.2.1` → image tag `1.2.1`). The release workflow publishes `:1.2.1`, `:1.2`, `:1`, and `:latest` on every release cut from the default branch; the `:latest` digest is verified to match the version tag before the GitHub release is created (per [ADR-005](docs/decisions.md)). **Pin to a semver tag in production** - `:latest` moves on every release. Replace `1.2.1` with the desired version from the [releases page](https://github.com/pacnpal/tunnelsmith/releases).
+Image tags omit the leading `v` that git tags carry (so git tag `v1.2.1` → image tag `1.2.1`). The release workflow publishes `:1.2.1`, `:1.2`, `:1`, and `:latest` on every release cut from the default branch; the `:latest` digest is verified to match the version tag before the GitHub release is created (per [ADR-005](docs/decisions.md)). **Pin to a semver tag in production**: `:latest` moves on every release. Replace `1.2.1` with the desired version from the [releases page](https://github.com/pacnpal/tunnelsmith/releases).
 
 The image is built from [`Dockerfile`](Dockerfile) using a distroless base (`gcr.io/distroless/static-debian12:nonroot`) and runs as a non-root user. The Dockerfile `EXPOSE`s ports `8080` (HTTP CONNECT), `1080` (SOCKS5), `9090` (metrics), and `9091` (web UI). The control endpoint on `:9092` is enabled by default but not in the `EXPOSE` list; publish it explicitly when you need it (`-p 9092:9092`).
 
