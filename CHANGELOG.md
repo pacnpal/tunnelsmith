@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-05-12
+
+One additive feature on top of v1.2.0: an operator-controlled override for the per-proxy CONNECT credentials on the Webshare provider, so deployments hitting stale-credential 407 storms can pin the auth header from the config or a Docker `environment:` block instead of waiting on the next vendor list-refresh tick. Default behaviour is byte-identical to v1.2.0.
+
 ### Added
 
 - **Webshare per-proxy credential override.** New `proxy_username` / `proxy_password` (inline) and `proxy_username_env` / `proxy_password_env` (read from named environment variables at startup) on the `[[upstream_pool]]` provider block let the operator pin the CONNECT credentials for every materialised Webshare upstream instead of inheriting them from the vendor's `/proxy/list/` response. The escape hatch for "Webshare returns stale per-proxy credentials and every CONNECT comes back 407" without waiting on the next refresh tick. Both credentials must be set together; a half-populated pair fails at config-load. The env-var path matches the Docker pattern of `environment:` blocks injecting secrets; resolved values never appear in `--print-config`. Rotation is restart-only, matching `api_token_file`. See `docs/providers.md#per-proxy-connect-credentials` and the Docker example in `docs/deployment.md`.
