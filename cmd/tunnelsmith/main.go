@@ -181,7 +181,11 @@ func run(args []string, stdout, stderr *os.File) error {
 	// here even though both ordering edges (composer wired ↔
 	// listeners up) interleave at startup.
 	authHealDrivers := buildAuthHealDrivers(poolBlocks, logger)
-	if err := validateNoPoolPrefixCollision(cfg.Upstreams, authHealDrivers); err != nil {
+	allPoolPrefixes := make([]string, 0, len(poolBlocks))
+	for _, b := range poolBlocks {
+		allPoolPrefixes = append(allPoolPrefixes, b.idPrefix)
+	}
+	if err := validateNoPoolPrefixCollision(cfg.Upstreams, authHealDrivers, allPoolPrefixes); err != nil {
 		return err
 	}
 	authHealHook := fanoutFailureHook(authHealDrivers)

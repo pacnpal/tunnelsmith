@@ -321,7 +321,7 @@ func TestValidateNoStaticPoolPrefixCollision(t *testing.T) {
 		drivers := []*authHealDriver{
 			newAuthHealDriver("ws", &fakeHealer{}, quietDriverLogger()),
 		}
-		err := validateNoPoolPrefixCollision(static, drivers)
+		err := validateNoPoolPrefixCollision(static, drivers, []string{"ws"})
 		if err == nil {
 			t.Fatal("expected collision error, got nil")
 		}
@@ -338,13 +338,13 @@ func TestValidateNoStaticPoolPrefixCollision(t *testing.T) {
 		drivers := []*authHealDriver{
 			newAuthHealDriver("ws", &fakeHealer{}, quietDriverLogger()),
 		}
-		if err := validateNoPoolPrefixCollision(static, drivers); err != nil {
+		if err := validateNoPoolPrefixCollision(static, drivers, []string{"ws"}); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
 	t.Run("no drivers means nothing to check", func(t *testing.T) {
 		static := []config.UpstreamConfig{{ID: "ws-anything"}}
-		if err := validateNoPoolPrefixCollision(static, nil); err != nil {
+		if err := validateNoPoolPrefixCollision(static, nil, []string{"ws"}); err != nil {
 			t.Fatalf("with no drivers, validation must always pass; got %v", err)
 		}
 	})
@@ -357,7 +357,7 @@ func TestValidateNoStaticPoolPrefixCollision(t *testing.T) {
 			newAuthHealDriver("ws", &fakeHealer{}, quietDriverLogger()),
 			newAuthHealDriver("ws-east", &fakeHealer{}, quietDriverLogger()),
 		}
-		err := validateNoPoolPrefixCollision(nil, drivers)
+		err := validateNoPoolPrefixCollision(nil, drivers, []string{"ws", "ws-east"})
 		if err == nil {
 			t.Fatal("expected pool-pool collision error, got nil")
 		}
@@ -373,8 +373,26 @@ func TestValidateNoStaticPoolPrefixCollision(t *testing.T) {
 			newAuthHealDriver("ws-east", &fakeHealer{}, quietDriverLogger()),
 			newAuthHealDriver("ws-west", &fakeHealer{}, quietDriverLogger()),
 		}
-		if err := validateNoPoolPrefixCollision(nil, drivers); err != nil {
+		if err := validateNoPoolPrefixCollision(nil, drivers, []string{"ws-east", "ws-west"}); err != nil {
 			t.Fatalf("sibling prefixes must validate: %v", err)
+		}
+	})
+	t.Run("non-Healer pool prefix-collides with a driver", func(t *testing.T) {
+		// "ws" pool has the Healer; "ws-mv" is a non-Healer pool
+		// (e.g. a future mullvad block) whose upstream ids
+		// "ws-mv-relay-1" would match the "ws" driver's matcher
+		// and trigger Webshare heals on mullvad failures. The
+		// validator must see ALL pool prefixes, not just driver
+		// prefixes, to catch this.
+		drivers := []*authHealDriver{
+			newAuthHealDriver("ws", &fakeHealer{}, quietDriverLogger()),
+		}
+		err := validateNoPoolPrefixCollision(nil, drivers, []string{"ws", "ws-mv"})
+		if err == nil {
+			t.Fatal("expected collision against non-Healer pool, got nil")
+		}
+		if !strings.Contains(err.Error(), "ws-mv") || !strings.Contains(err.Error(), "ws") {
+			t.Errorf("err = %q, want one mentioning both prefixes", err.Error())
 		}
 	})
 }
