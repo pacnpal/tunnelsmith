@@ -321,7 +321,7 @@ func TestValidateNoStaticPoolPrefixCollision(t *testing.T) {
 		drivers := []*authHealDriver{
 			newAuthHealDriver("ws", &fakeHealer{}, quietDriverLogger()),
 		}
-		err := validateNoStaticPoolPrefixCollision(static, drivers)
+		err := validateNoPoolPrefixCollision(static, drivers)
 		if err == nil {
 			t.Fatal("expected collision error, got nil")
 		}
@@ -338,16 +338,98 @@ func TestValidateNoStaticPoolPrefixCollision(t *testing.T) {
 		drivers := []*authHealDriver{
 			newAuthHealDriver("ws", &fakeHealer{}, quietDriverLogger()),
 		}
-		if err := validateNoStaticPoolPrefixCollision(static, drivers); err != nil {
+		if err := validateNoPoolPrefixCollision(static, drivers); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
 	t.Run("no drivers means nothing to check", func(t *testing.T) {
 		static := []config.UpstreamConfig{{ID: "ws-anything"}}
-		if err := validateNoStaticPoolPrefixCollision(static, nil); err != nil {
+		if err := validateNoPoolPrefixCollision(static, nil); err != nil {
 			t.Fatalf("with no drivers, validation must always pass; got %v", err)
 		}
 	})
+	t.Run("pool-pool sub-prefix collision detected", func(t *testing.T) {
+		// "ws-east" starts with "ws-", so the "ws" driver's matcher
+		// would also fire on ws-east's events. The validator must
+		// catch this at startup rather than letting the binary boot
+		// into a misrouted state.
+		drivers := []*authHealDriver{
+			newAuthHealDriver("ws", &fakeHealer{}, quietDriverLogger()),
+			newAuthHealDriver("ws-east", &fakeHealer{}, quietDriverLogger()),
+		}
+		err := validateNoPoolPrefixCollision(nil, drivers)
+		if err == nil {
+			t.Fatal("expected pool-pool collision error, got nil")
+		}
+		if !strings.Contains(err.Error(), "ws") || !strings.Contains(err.Error(), "ws-east") {
+			t.Errorf("err = %q, want one mentioning both colliding prefixes", err.Error())
+		}
+	})
+	t.Run("pool-pool sibling prefixes are fine", func(t *testing.T) {
+		// Neither "ws-east" nor "ws-west" is a sub-prefix of the
+		// other; both share the parent "ws" but diverge after the
+		// first segment.
+		drivers := []*authHealDriver{
+			newAuthHealDriver("ws-east", &fakeHealer{}, quietDriverLogger()),
+			newAuthHealDriver("ws-west", &fakeHealer{}, quietDriverLogger()),
+		}
+		if err := validateNoPoolPrefixCollision(nil, drivers); err != nil {
+			t.Fatalf("sibling prefixes must validate: %v", err)
+		}
+	})
+}
+
+// TestAuthHealDriverCooldownMeasuresFromCompletion pins the cooldown
+// semantics: the gap is from one heal's completion to the next heal's
+// dispatch, not from dispatch to dispatch. A long-running Heal RPC
+// would otherwise let the next heal fire immediately on completion,
+// undermining the "let one heal complete and propagate" intent.
+func TestAuthHealDriverCooldownMeasuresFromCompletion(t *testing.T) {
+	t.Parallel()
+	var nowMu sync.Mutex
+	now := time.Now()
+	clock := func() time.Time {
+		nowMu.Lock()
+		defer nowMu.Unlock()
+		return now
+	}
+	advance := func(d time.Duration) {
+		nowMu.Lock()
+		now = now.Add(d)
+		nowMu.Unlock()
+	}
+	// Simulate a slow Heal: advance the clock by most of the cooldown
+	// duration BEFORE returning. With dispatch-time cooldown, the next
+	// bump after completion would clear the gate; with completion-time
+	// cooldown, it must still be blocked.
+	healer := &fakeHealer{
+		healFn: func(ctx context.Context) ([]config.UpstreamConfig, error) {
+			advance(authHealCooldown - 1*time.Second)
+			return nil, nil
+		},
+	}
+	d := newTestDriver("ws", healer, clock)
+	for i := 0; i < authHealThreshold; i++ {
+		d.Observe("example.com", "ws-d-1", failure.KindProxyAuth)
+	}
+	waitForCalls(t, healer, 1, 1*time.Second)
+	// Heal completed. With completion-time cooldown, the gate is
+	// "cooldown - 1s" old; the next bump above threshold must NOT
+	// fire (cooldown is 60s, only 0s has elapsed since completion).
+	for i := 0; i < authHealThreshold*3; i++ {
+		d.Observe("example.com", "ws-d-1", failure.KindProxyAuth)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if got := healer.calls.Load(); got != 1 {
+		t.Fatalf("Heal called %d times immediately post-completion; want 1 (cooldown should still apply)", got)
+	}
+	// After advancing past the post-completion cooldown, the next
+	// burst fires.
+	advance(authHealCooldown + 1*time.Second)
+	for i := 0; i < authHealThreshold; i++ {
+		d.Observe("example.com", "ws-d-1", failure.KindProxyAuth)
+	}
+	waitForCalls(t, healer, 2, 1*time.Second)
 }
 
 // TestAuthHealDriverHonorsParentContext pins the shutdown-aware

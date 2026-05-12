@@ -173,7 +173,7 @@ func run(args []string, stdout, stderr *os.File) error {
 	// later, so the window where a hook could fire against a nil
 	// composer is closed by ordering rather than by extra locking.
 	authHealDrivers := buildAuthHealDrivers(poolBlocks, logger)
-	if err := validateNoStaticPoolPrefixCollision(cfg.Upstreams, authHealDrivers); err != nil {
+	if err := validateNoPoolPrefixCollision(cfg.Upstreams, authHealDrivers); err != nil {
 		return err
 	}
 	authHealHook := fanoutFailureHook(authHealDrivers)
@@ -363,10 +363,16 @@ func run(args []string, stdout, stderr *os.File) error {
 	// context now that both exist. Composer enables hot-swap; gctx
 	// gives runHeal a shutdown-aware parent so a SIGTERM cancels the
 	// in-flight Healer.Heal RPC instead of dangling past shutdown.
-	// The scoreboard hook is already registered but cannot fire
-	// until the listener starts taking traffic below, so any
-	// buffered events from the brief startup window land here
-	// against a fully-wired driver.
+	//
+	// The listener goroutines (httpSrv.Serve / socksSrv.Serve) have
+	// already started above, so a 407 storm CAN reach the failure
+	// hook before this line. That window is closed by the driver
+	// itself: bump() defers cooldown advancement and event clearing
+	// when composer is nil, so any buffered events trigger the heal
+	// on the first bump after this call lands. The wiring helper
+	// sets parentCtx before composer so a heal dispatched at the
+	// exact moment of wiring still inherits the shutdown-aware
+	// parent.
 	connectAuthHealDriversToComposer(authHealDrivers, gctx, composer)
 	for _, pb := range poolBlocks {
 		pb := pb
