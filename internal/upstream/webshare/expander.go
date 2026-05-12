@@ -320,11 +320,13 @@ func (e *Expander) RunRefresh(ctx context.Context, prev []config.UpstreamConfig,
 // too early and lose the backoff shape entirely.
 func backoffCap(base time.Duration) time.Duration {
 	const hardCap = 30 * time.Minute
-	limit := 8 * base
-	if limit > hardCap {
+	// Compare base to hardCap/8 to avoid multiplying first: if base >
+	// hardCap/8 then 8×base would overflow or exceed hardCap, so return
+	// hardCap directly without computing the product.
+	if base > hardCap/8 {
 		return hardCap
 	}
-	return limit
+	return 8 * base
 }
 
 // backoffInterval returns the next sleep duration after a run of

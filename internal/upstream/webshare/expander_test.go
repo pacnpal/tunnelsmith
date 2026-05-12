@@ -586,11 +586,12 @@ func TestBackoffCapPicksSmaller(t *testing.T) {
 		base time.Duration
 		want time.Duration
 	}{
-		{1 * time.Second, 8 * time.Second},   // 8× < 30m
-		{1 * time.Minute, 8 * time.Minute},   // 8× < 30m
-		{10 * time.Minute, 30 * time.Minute}, // 8× = 80m > 30m, clamp
-		{1 * time.Hour, 30 * time.Minute},    // 8× = 8h > 30m, clamp
-		{24 * time.Hour, 30 * time.Minute},   // 8× = 192h > 30m, clamp
+		{1 * time.Second, 8 * time.Second},            // 8× < 30m
+		{1 * time.Minute, 8 * time.Minute},            // 8× < 30m
+		{10 * time.Minute, 30 * time.Minute},          // 8× = 80m > 30m, clamp
+		{1 * time.Hour, 30 * time.Minute},             // 8× = 8h > 30m, clamp
+		{24 * time.Hour, 30 * time.Minute},            // 8× = 192h > 30m, clamp
+		{time.Duration(1<<60), 30 * time.Minute},      // 8× would overflow int64, clamp
 	}
 	for _, tc := range cases {
 		got := backoffCap(tc.base)

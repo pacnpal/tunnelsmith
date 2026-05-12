@@ -443,6 +443,7 @@ func (c *Client) listProxiesOnline(ctx context.Context, opts ListProxiesOptions)
 // optional ("" = use the account's default plan). The endpoint returns
 // 204 No Content on success.
 func (c *Client) RefreshProxyList(ctx context.Context, planID string) error {
+	planID = strings.TrimSpace(planID)
 	path := "/proxy/list/refresh/"
 	if planID != "" {
 		path += "?plan_id=" + url.QueryEscape(planID)

@@ -253,6 +253,51 @@ func TestRefreshProxyListThreadsPlanID(t *testing.T) {
 	}
 }
 
+func TestRefreshProxyListTrimsPlanID(t *testing.T) {
+	var observed string
+	srv, _ := newFakeServer(t, map[string]http.HandlerFunc{
+		"/proxy/list/refresh/": func(w http.ResponseWriter, r *http.Request) {
+			observed = r.URL.RawQuery
+			w.WriteHeader(http.StatusNoContent)
+		},
+	})
+	c := NewClient()
+	c.BaseURL = srv.URL
+	c.APIToken = "tok"
+	c.HTTPClient = srv.Client()
+
+	// Leading/trailing whitespace must be stripped; the query must carry
+	// the clean plan_id value, not an encoded space.
+	if err := c.RefreshProxyList(context.Background(), "  plan-42  "); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if !strings.Contains(observed, "plan_id=plan-42") {
+		t.Fatalf("whitespace not trimmed from plan_id: %q", observed)
+	}
+}
+
+func TestRefreshProxyListWhitespaceOnlyPlanIDOmitted(t *testing.T) {
+	var observed string
+	srv, _ := newFakeServer(t, map[string]http.HandlerFunc{
+		"/proxy/list/refresh/": func(w http.ResponseWriter, r *http.Request) {
+			observed = r.URL.RawQuery
+			w.WriteHeader(http.StatusNoContent)
+		},
+	})
+	c := NewClient()
+	c.BaseURL = srv.URL
+	c.APIToken = "tok"
+	c.HTTPClient = srv.Client()
+
+	// Whitespace-only plan_id must be treated as absent (no query param).
+	if err := c.RefreshProxyList(context.Background(), "   "); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if observed != "" {
+		t.Fatalf("expected no query string for whitespace-only plan_id, got %q", observed)
+	}
+}
+
 func TestRefreshProxyListSurfacesForbidden(t *testing.T) {
 	srv, _ := newFakeServer(t, map[string]http.HandlerFunc{
 		"/proxy/list/refresh/": func(w http.ResponseWriter, r *http.Request) {
