@@ -68,6 +68,14 @@ func NewExpander(cfg ExpanderConfig, client *Client, logger *slog.Logger) (*Expa
 	}
 	cfg.Mode = mode
 	cfg.Kind = kind
+	// Trim PlanID once at construction so every downstream call site
+	// (Heal, fetchCanonicalCreds, the ListProxies plan_id pass-through)
+	// sees a clean value. A whitespace-padded TOML literal or env
+	// indirection would otherwise either reach Webshare's API as an
+	// encoded-space query (avoidable 4xx) or skip the canonical-creds
+	// probe entirely because the gate compares against "". One trim
+	// here keeps both paths honest.
+	cfg.PlanID = strings.TrimSpace(cfg.PlanID)
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -304,12 +312,12 @@ func (e *Expander) RunRefresh(ctx context.Context, prev []config.UpstreamConfig,
 
 // backoffCap returns the maximum delay between refresh attempts after
 // consecutive failures. Picks the smaller of 8× the configured base or
-// 30 minutes, whichever is shorter. The 30-minute floor matters when
-// operators configure a daily refresh (24h base): without it,
-// 8× would push the cap out to over a week, which is longer than any
-// operator-tolerable outage. The 8× ceiling matters when the base is
-// short (e.g. 30s): without it, the cap would clamp early and lose
-// the backoff shape entirely.
+// 30 minutes, whichever is shorter. The 30-minute ceiling matters when
+// operators configure a daily refresh (24h base): without it, 8× would
+// push the cap out to over a week, which is longer than any
+// operator-tolerable outage. The 8× multiplier matters when the base
+// is short (e.g. 30s): without it, the 30-minute ceiling would clamp
+// too early and lose the backoff shape entirely.
 func backoffCap(base time.Duration) time.Duration {
 	const hardCap = 30 * time.Minute
 	limit := 8 * base

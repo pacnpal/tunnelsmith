@@ -843,6 +843,34 @@ func TestFetchProxyListStatusRequiresPlanID(t *testing.T) {
 	}
 }
 
+// TestFetchProxyListStatusTrimsPlanID confirms the trim is applied
+// before URL-encoding: a whitespace-padded plan_id from a TOML
+// literal or env indirection must reach Webshare as the clean value,
+// not as encoded spaces that would 4xx server-side.
+func TestFetchProxyListStatusTrimsPlanID(t *testing.T) {
+	var observed string
+	srv, _ := newFakeServer(t, map[string]http.HandlerFunc{
+		"/proxy/list/status": func(w http.ResponseWriter, r *http.Request) {
+			observed = r.URL.Query().Get("plan_id")
+			_, _ = w.Write(mustEncode(t, map[string]any{
+				"state":    "completed",
+				"username": "u",
+				"password": "p",
+			}))
+		},
+	})
+	c := NewClient()
+	c.BaseURL = srv.URL
+	c.APIToken = "tok"
+	c.HTTPClient = srv.Client()
+	if _, err := c.FetchProxyListStatus(context.Background(), "  plan-77  "); err != nil {
+		t.Fatalf("FetchProxyListStatus: %v", err)
+	}
+	if observed != "plan-77" {
+		t.Fatalf("plan_id sent = %q, want %q (trimmed)", observed, "plan-77")
+	}
+}
+
 // TestFetchProxyListStatusDecodesResponse exercises the wire-shape decode.
 // The fake server returns a canonical Webshare-shaped response; the
 // returned struct fields must be populated.
@@ -921,6 +949,8 @@ func TestBaseURLForV3SwapsVersionSegment(t *testing.T) {
 		{"empty (uses default)", "", "https://proxy.webshare.io/api/v3"},
 		{"httptest root", "http://127.0.0.1:9999", "http://127.0.0.1:9999"},
 		{"custom host with v2", "https://proxy.example.com/api/v2", "https://proxy.example.com/api/v3"},
+		{"v2 with trailing slash", "https://proxy.webshare.io/api/v2/", "https://proxy.webshare.io/api/v3"},
+		{"v2 with many trailing slashes", "https://proxy.webshare.io/api/v2///", "https://proxy.webshare.io/api/v3"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

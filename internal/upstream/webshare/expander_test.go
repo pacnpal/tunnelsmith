@@ -309,6 +309,82 @@ func TestExpanderOperatorOverrideBeatsCanonical(t *testing.T) {
 	}
 }
 
+// TestExpanderTrimsPlanIDAtConstruction pins the construction-time
+// trim: whitespace-only PlanID falls back to "no plan_id" semantics
+// (no status probe), and a padded value reaches downstream API calls
+// without surrounding whitespace. Both branches of the original
+// padded-PlanID bug — silently slipping the gate AND sending dirty
+// values to the vendor — are covered.
+func TestExpanderTrimsPlanIDAtConstruction(t *testing.T) {
+	t.Run("whitespace-only PlanID acts like empty", func(t *testing.T) {
+		var statusHits int
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/proxy/list/":
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"count": 1,
+					"results": []Proxy{
+						{ID: "d-1", Username: "u", Password: "p", ProxyAddress: "1.1.1.1", Port: 1, Valid: true},
+					},
+				})
+			case "/proxy/list/status":
+				statusHits++
+			}
+		}))
+		t.Cleanup(srv.Close)
+		c := NewClient()
+		c.BaseURL = srv.URL
+		c.APIToken = "tok"
+		c.HTTPClient = srv.Client()
+		exp, err := NewExpander(ExpanderConfig{IDPrefix: "ws", Priority: 1, PlanID: "   "}, c, nil)
+		if err != nil {
+			t.Fatalf("NewExpander: %v", err)
+		}
+		if _, err := exp.Snapshot(context.Background()); err != nil {
+			t.Fatalf("Snapshot: %v", err)
+		}
+		if statusHits != 0 {
+			t.Fatalf("whitespace PlanID still triggered %d status probes; want 0", statusHits)
+		}
+	})
+	t.Run("padded PlanID reaches API trimmed", func(t *testing.T) {
+		var observed string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/proxy/list/":
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"count": 1,
+					"results": []Proxy{
+						{ID: "d-1", Username: "u", Password: "p", ProxyAddress: "1.1.1.1", Port: 1, Valid: true},
+					},
+				})
+			case "/proxy/list/status":
+				observed = r.URL.Query().Get("plan_id")
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"state":    "completed",
+					"username": "u",
+					"password": "p",
+				})
+			}
+		}))
+		t.Cleanup(srv.Close)
+		c := NewClient()
+		c.BaseURL = srv.URL
+		c.APIToken = "tok"
+		c.HTTPClient = srv.Client()
+		exp, err := NewExpander(ExpanderConfig{IDPrefix: "ws", Priority: 1, PlanID: "  plan-42\t"}, c, nil)
+		if err != nil {
+			t.Fatalf("NewExpander: %v", err)
+		}
+		if _, err := exp.Snapshot(context.Background()); err != nil {
+			t.Fatalf("Snapshot: %v", err)
+		}
+		if observed != "plan-42" {
+			t.Fatalf("status probe received plan_id %q, want %q (trimmed)", observed, "plan-42")
+		}
+	})
+}
+
 // TestExpanderSkipsStatusProbeWithoutPlanID asserts the probe is gated
 // on plan_id (Webshare's API requires it). With no PlanID, /proxy/list/status
 // must NEVER be called.

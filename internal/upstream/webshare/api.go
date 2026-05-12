@@ -475,7 +475,8 @@ type ProxyListStatus struct {
 // canonical username/password regardless of whether /proxy/list/ has
 // caught up to the latest rotation.
 func (c *Client) FetchProxyListStatus(ctx context.Context, planID string) (*ProxyListStatus, error) {
-	if strings.TrimSpace(planID) == "" {
+	planID = strings.TrimSpace(planID)
+	if planID == "" {
 		return nil, ErrPlanIDRequired
 	}
 	path := "/proxy/list/status?plan_id=" + url.QueryEscape(planID)
@@ -503,11 +504,17 @@ var ErrPlanIDRequired = errors.New("webshare: plan_id is required for this endpo
 // back, which lets a test register its handler on a flat path
 // like "/proxy/list/status" without caring which API version the
 // production call uses.
+//
+// A trailing slash on BaseURL ("…/api/v2/") is normalized before the
+// suffix check so a custom BaseURL the operator wrote with a
+// trailing slash still resolves to a clean /api/v3 base instead of
+// silently falling through to the v2 prefix.
 func (c *Client) baseURLForV3() string {
 	base := c.BaseURL
 	if base == "" {
 		base = BaseURL
 	}
+	base = strings.TrimRight(base, "/")
 	if strings.HasSuffix(base, "/api/v2") {
 		return strings.TrimSuffix(base, "/api/v2") + "/api/v3"
 	}
