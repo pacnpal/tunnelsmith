@@ -115,10 +115,10 @@ func TestClassifyDialError(t *testing.T) {
 		// The sentinel wrapped via %w is exactly how upstream.go marks
 		// a CONNECT-407 dial error. ClassifyDialError must recognise it
 		// via errors.Is across the chain so the auto-heal driver
-		// observes the event under the right kind.
-		wrapped := errors.New("http upstream \"ws-d-1\": CONNECT got status 407: " + failure.ErrProxyAuth.Error())
-		// errors.New doesn't actually wrap; build a real wrap.
-		_ = wrapped
+		// observes the event under the right kind. fakeWrappedErr's
+		// Unwrap exposes the sentinel so errors.Is walks to it,
+		// mirroring what fmt.Errorf("…: %w", ErrProxyAuth) produces in
+		// upstream.go.
 		dialErr := fakeWrappedErr{inner: failure.ErrProxyAuth}
 		if got := failure.ClassifyDialError(dialErr); got != failure.KindProxyAuth {
 			t.Errorf("ClassifyDialError(ErrProxyAuth) = %q, want proxy_auth", got)

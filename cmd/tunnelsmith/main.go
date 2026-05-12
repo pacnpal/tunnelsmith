@@ -169,9 +169,17 @@ func run(args []string, stdout, stderr *os.File) error {
 	// (mullvad) get no driver and never trigger Heal. Drivers stay
 	// composer-less here — newPoolComposer runs further down — and
 	// get wired via connectAuthHealDriversToComposer once the
-	// composer exists. No traffic flows until the listener starts
-	// later, so the window where a hook could fire against a nil
-	// composer is closed by ordering rather than by extra locking.
+	// composer exists.
+	//
+	// The listener goroutines (httpSrv.Serve / socksSrv.Serve) start
+	// further down too, ahead of newPoolComposer; that means a 407
+	// can reach the failure hook before the driver's composer is
+	// wired. The driver handles that startup window itself: bump()
+	// defers cooldown advancement and event clearing when the
+	// composer is nil, so any buffered events fire the heal on the
+	// first bump after wiring lands. The hook is safe to register
+	// here even though both ordering edges (composer wired ↔
+	// listeners up) interleave at startup.
 	authHealDrivers := buildAuthHealDrivers(poolBlocks, logger)
 	if err := validateNoPoolPrefixCollision(cfg.Upstreams, authHealDrivers); err != nil {
 		return err
