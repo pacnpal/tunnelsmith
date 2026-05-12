@@ -856,8 +856,8 @@ func TestFetchProxyListStatusDecodesResponse(t *testing.T) {
 				"state":"completed",
 				"countries":{"US":5,"FR":100},
 				"unallocated_countries":{},
-				"username":"u-fresh",
-				"password":"p-fresh",
+				"username":"ufresh",
+				"password":"pfresh",
 				"is_proxy_used":false
 			}`))
 		},
@@ -870,7 +870,7 @@ func TestFetchProxyListStatusDecodesResponse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FetchProxyListStatus: %v", err)
 	}
-	if got.State != "completed" || got.Username != "u-fresh" || got.Password != "p-fresh" {
+	if got.State != "completed" || got.Username != "ufresh" || got.Password != "pfresh" {
 		t.Fatalf("decoded fields mismatch: %+v", got)
 	}
 	if got.Countries["US"] != 5 || got.Countries["FR"] != 100 {

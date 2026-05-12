@@ -232,7 +232,7 @@ func TestExpanderFallsBackToListCredsWhenStatusFails(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"count": 1,
 				"results": []Proxy{
-					{ID: "d-1", Username: "list-u", Password: "list-p", ProxyAddress: "1.1.1.1", Port: 1, Valid: true},
+					{ID: "d-1", Username: "ulist", Password: "plist", ProxyAddress: "1.1.1.1", Port: 1, Valid: true},
 				},
 			})
 		case "/proxy/list/status":
@@ -256,7 +256,7 @@ func TestExpanderFallsBackToListCredsWhenStatusFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}
-	if len(got) != 1 || got[0].Username != "list-u" || got[0].Password != "list-p" {
+	if len(got) != 1 || got[0].Username != "ulist" || got[0].Password != "plist" {
 		t.Fatalf("expected list-derived creds when status fails, got %+v", got)
 	}
 }
@@ -272,12 +272,12 @@ func TestExpanderOperatorOverrideBeatsCanonical(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"count": 1,
 				"results": []Proxy{
-					{ID: "d-1", Username: "list-u", Password: "list-p", ProxyAddress: "1.1.1.1", Port: 1, Valid: true},
+					{ID: "d-1", Username: "ulist", Password: "plist", ProxyAddress: "1.1.1.1", Port: 1, Valid: true},
 				},
 			})
 		case "/proxy/list/status":
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"state": "completed", "username": "canon", "password": "canon-p",
+				"state": "completed", "username": "canon", "password": "canonp",
 			})
 		default:
 			http.NotFound(w, r)
@@ -359,7 +359,7 @@ func TestExpanderIgnoresEmptyCanonicalCreds(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"count": 1,
 				"results": []Proxy{
-					{ID: "d-1", Username: "list-u", Password: "list-p", ProxyAddress: "1.1.1.1", Port: 1, Valid: true},
+					{ID: "d-1", Username: "ulist", Password: "plist", ProxyAddress: "1.1.1.1", Port: 1, Valid: true},
 				},
 			})
 		case "/proxy/list/status":
@@ -381,7 +381,7 @@ func TestExpanderIgnoresEmptyCanonicalCreds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}
-	if len(got) != 1 || got[0].Username != "list-u" || got[0].Password != "list-p" {
+	if len(got) != 1 || got[0].Username != "ulist" || got[0].Password != "plist" {
 		t.Fatalf("empty status creds must be ignored; got %+v", got)
 	}
 }
@@ -486,7 +486,7 @@ func TestBackoffIntervalShape(t *testing.T) {
 		consecutive int
 		want        time.Duration
 	}{
-		{0, base},      // pre-failure
+		{0, base}, // pre-failure
 		{1, 1 * time.Second},
 		{2, 2 * time.Second},
 		{3, 4 * time.Second},
@@ -510,11 +510,11 @@ func TestBackoffCapPicksSmaller(t *testing.T) {
 		base time.Duration
 		want time.Duration
 	}{
-		{1 * time.Second, 8 * time.Second},       // 8× < 30m
-		{1 * time.Minute, 8 * time.Minute},       // 8× < 30m
-		{10 * time.Minute, 30 * time.Minute},     // 8× = 80m > 30m, clamp
-		{1 * time.Hour, 30 * time.Minute},        // 8× = 8h > 30m, clamp
-		{24 * time.Hour, 30 * time.Minute},       // 8× = 192h > 30m, clamp
+		{1 * time.Second, 8 * time.Second},   // 8× < 30m
+		{1 * time.Minute, 8 * time.Minute},   // 8× < 30m
+		{10 * time.Minute, 30 * time.Minute}, // 8× = 80m > 30m, clamp
+		{1 * time.Hour, 30 * time.Minute},    // 8× = 8h > 30m, clamp
+		{24 * time.Hour, 30 * time.Minute},   // 8× = 192h > 30m, clamp
 	}
 	for _, tc := range cases {
 		got := backoffCap(tc.base)
