@@ -241,13 +241,20 @@ func resolveProxyCreds(cfg config.UpstreamPoolConfig) (string, string, error) {
 // pair. inlineVal wins when set; envVar names an environment variable
 // to look up (an empty result is an error so a typo in the env-var name
 // fails fast instead of silently producing empty credentials).
+//
+// Both branches strip surrounding whitespace before returning. A
+// stray newline or trailing space in an inline TOML value or in a
+// compose `environment:` line would otherwise reach the
+// Proxy-Authorization header verbatim and produce a 407 indistinguishable
+// from a genuine credential mismatch, which is the exact failure
+// mode this override was built to escape.
 func resolveCred(inlineVal, envVar, field string) (string, error) {
 	if v := strings.TrimSpace(inlineVal); v != "" {
 		return v, nil
 	}
 	if e := strings.TrimSpace(envVar); e != "" {
-		val := os.Getenv(e)
-		if strings.TrimSpace(val) == "" {
+		val := strings.TrimSpace(os.Getenv(e))
+		if val == "" {
 			return "", fmt.Errorf("webshare: %s_env points at %q but the variable is unset or empty", field, e)
 		}
 		return val, nil
