@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-05-12
+
+Two additive features on top of v1.2.1, both finishing the credential self-healing arc started by v1.2.0's per-proxy override. v1.3.0 makes the recovery automatic end-to-end: Webshare credentials drift back to the live values without operator intervention, and a 407 storm at the listener triggers a server-side refresh + canonical-credential probe in seconds rather than waiting for the next scheduled refresh tick. Default behaviour is byte-identical to v1.2.1 when `api_token_file` and a Webshare `[[upstream_pool]]` are both absent.
+
+### Added
+
+- **Webshare self-healing adapter.** The Webshare expander now self-heals across the three failure modes the v1.2.1 manual override was the escape hatch for:
+  - **Canonical credentials from `/api/v3/proxy/list/status`.** When `plan_id` is configured on the `[[upstream_pool]]` block, every `Snapshot` consults the v3 status endpoint alongside the paginated `/proxy/list/` fetch and stamps the live username/password onto every expanded upstream. Per Webshare's docs, "all your proxies share the same username and password"; the status endpoint always returns the post-rotation pair, so a dashboard password change is picked up on the very next refresh tick without manual intervention. The operator override (`proxy_username` / `proxy_password`) still wins over the canonical pair so the manual escape hatch from v1.2.1 stays available for sub-user credentials.
+  - **API-token auto-reload on 401.** When `api_token_file` is configured, the client re-reads the file after observing `ErrUnauthorized` from the vendor; if the on-disk value has rotated since startup, the in-memory token is swapped under a mutex and the request retries once with the new token. Covers k8s/Compose secret-rotation flows without a binary restart. Bounded at one retry per request; bodyless requests only (all current Webshare endpoints qualify).
+  - **Exponential backoff in `RunRefresh`.** Consecutive `Snapshot` failures grow the next attempt delay by 2× up to `min(8×, 30min)` so a hard outage at Webshare's API stops hammering the vendor while the live pool keeps serving the last good list. Snaps back to the configured base on first recovery.
+  - **`Expander.Heal(ctx)` method.** Refresh + re-snapshot in one call, tolerant to a refresh-quota-exhausted vendor (the canonical-credential probe still lands). Hookable from any in-binary caller that wants to drive a heal on demand.
+  - **Server-side `valid=true` filter.** Direct-mode `/proxy/list/` requests now push the validity filter to the API so a flapping pool returns a smaller response.
+- **407 → `Healer.Heal` auto-trigger pipeline.** The credential-rotation feedback loop is closed end-to-end:
+  - A new `failure.KindProxyAuth` kind classifies CONNECT-407 responses distinctly from `KindRefused` / `KindTimeout` / `KindForbidden`. `failure.ErrProxyAuth` is the sentinel an upstream wraps on 407; `ClassifyDialError` checks it first so 407 wins over the generic dial-error branches.
+  - The scoreboard accepts an optional `WithFailureHook` observer, fired after each surviving `RecordFailure` (debounce-suppressed events skip the hook). Lock released before invoke so observers can take their own locks.
+  - A new `provider.Healer` optional interface (`Heal(ctx) ([]config.UpstreamConfig, error)`) flags Expanders that advertise vendor-side rotation. Webshare implements it; Mullvad does not, so its pool blocks are skipped automatically.
+  - `cmd/tunnelsmith` builds one `authHealDriver` per `[[upstream_pool]]` block whose Expander implements `provider.Healer`. The driver counts `KindProxyAuth` events in a 30s sliding window, fires `Healer.Heal` on threshold (3 events) with a 60s cooldown measured from completion (not dispatch), and routes the resulting snapshot through `poolComposer.Update` to hot-swap the running pool. Single-in-flight guard prevents concurrent heals; sliding-window storage is bounded at the threshold so the failure-hook path stays O(1). A shutdown-aware parent context derived from main's errgroup gctx cancels in-flight heals on SIGTERM. Startup-time `validateNoPoolPrefixCollision` rejects configurations where a static `[[upstream]]` id or another pool's `id_prefix` would mis-route into a driver (e.g. `id_prefix="ws"` plus a static `ws-fixed` upstream, or `id_prefix="ws"` plus a non-Healer pool with `id_prefix="ws-mv"`).
+
+### Changed
+
+- `internal/scoreboard/FromConfig` now emits a default policy for `failure.KindProxyAuth` (penalty 4, cooldown 15s — short on purpose so a successful heal observes recovery without a long quarantine). Not config-tunable yet; can be promoted to `[failure]` keys if operators need to retune.
+- `internal/scoreboard/observeDialFailure` now emits `outcome="proxy_auth"` as a first-class dial-outcome metric label instead of collapsing into `other` so the auto-heal flow is observable on the existing dial-failure histogram.
+- `internal/upstream/webshare/Client`: token-rotation path makes `APIToken` mutable when `APITokenFile` is set; `tokenMu` guards the swap. All reads go through `snapshotToken`. Direct field access from outside the package races with the reload path and should only happen in tests that own the client exclusively.
+- `internal/upstream/webshare/api.go`: v2 and v3 endpoint paths share a single `requestWithRetry` orchestrator so the token-rotation retry covers both API versions.
+- `internal/upstream/provider`: new `Healer` interface declared alongside `API`. Existing `Provider` / `Expander` / `API` interfaces are unchanged so the v1.2.0 adapter contract still holds.
+
 ## [1.2.1] - 2026-05-12
 
 One additive feature on top of v1.2.0 plus a bundled fix: an operator-controlled override for the per-proxy CONNECT credentials on the Webshare provider, so deployments hitting stale-credential 407 storms can pin the auth header from the config or a Docker `environment:` block instead of waiting on the next vendor list-refresh tick. The fix corrects a whitespace-trimming asymmetry in the env-var resolution path that landed with the feature itself. Default behaviour is byte-identical to v1.2.0.
