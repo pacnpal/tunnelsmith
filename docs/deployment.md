@@ -215,6 +215,49 @@ The new list lands on the next refresh tick (or sooner if a tick is in flight). 
 - **Kind.** `kind = "http"` (default) authenticates with `Proxy-Authorization: Basic` per RFC 7617. `kind = "socks5"` uses SOCKS5 user/pass auth instead.
 - **Rate limits.** Webshare answers `429 Too Many Requests` when you call `/proxy/list/refresh/` more often than your plan allows. Tunnelsmith wraps the vendor error with `provider.ErrAPIRateLimited`, so the control route surfaces it as `429` with a sanitised `"vendor rate limited"` category in the JSON body. The full vendor-side error chain stays in the operator log. See [`docs/control-api.md`](control-api.md) for the full status / category table.
 
+### Override per-proxy CONNECT credentials via Docker env
+
+When the vendor's `/proxy/list/` response carries stale `username` / `password` values, every CONNECT comes back `407` and the next refresh tick is hours away. The `proxy_username_env` / `proxy_password_env` block pins the credentials at startup from environment variables, which fits the way Docker deployments usually inject secrets:
+
+```toml
+[[upstream_pool]]
+provider           = "webshare"
+id_prefix          = "ws"
+api_token_file     = "/etc/tunnelsmith/webshare.token"
+proxy_username_env = "WEBSHARE_PROXY_USERNAME"
+proxy_password_env = "WEBSHARE_PROXY_PASSWORD"
+```
+
+With `docker run`:
+
+```sh
+docker run -d \
+    --name tunnelsmith \
+    -p 8080:8080 -p 1080:1080 -p 9092:9092 \
+    -e WEBSHARE_PROXY_USERNAME \
+    -e WEBSHARE_PROXY_PASSWORD \
+    -v $(pwd)/config.toml:/etc/tunnelsmith/config.toml:ro \
+    -v /etc/tunnelsmith/webshare.token:/etc/tunnelsmith/webshare.token:ro \
+    ghcr.io/pacnpal/tunnelsmith:1.2.1 \
+    --config /etc/tunnelsmith/config.toml
+```
+
+(Set the two variables on the host shell, or pass them via `--env-file`.) With Docker Compose:
+
+```yaml
+services:
+  tunnelsmith:
+    image: ghcr.io/pacnpal/tunnelsmith:1.2.1
+    environment:
+      WEBSHARE_PROXY_USERNAME: "${WEBSHARE_PROXY_USERNAME}"
+      WEBSHARE_PROXY_PASSWORD: "${WEBSHARE_PROXY_PASSWORD}"
+    volumes:
+      - ./config.toml:/etc/tunnelsmith/config.toml:ro
+      - /etc/tunnelsmith/webshare.token:/etc/tunnelsmith/webshare.token:ro
+```
+
+Both variables must be set when the binary starts; an unset or empty env var fails the pool expansion with a clear error so the typo surfaces immediately. Rotation is restart-only, matching `api_token_file`. The resolved password never appears in `--print-config` (only the variable name does).
+
 ### Combining with Mullvad
 
 A single config can run both providers; the scoreboard learns per-host which works best:

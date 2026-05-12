@@ -22,6 +22,16 @@ type ExpanderConfig struct {
 	PlanID       string   // optional
 	CountryCodes []string // ISO 3166-1 alpha-2; empty = no filter
 	Refresh      time.Duration
+
+	// ProxyUsername / ProxyPassword override the per-proxy CONNECT
+	// credentials returned by Webshare's /proxy/list/ endpoint. Both
+	// must be set together. When empty, the expander threads through
+	// the per-proxy values from the API response. The provider
+	// resolves env-var indirection (proxy_username_env, etc.) before
+	// populating these fields, so the expander only deals with
+	// literal values.
+	ProxyUsername string
+	ProxyPassword string
 }
 
 // Expander pulls Webshare's proxy list and turns each entry into a
@@ -103,13 +113,27 @@ func (e *Expander) transform(proxies []Proxy) []config.UpstreamConfig {
 			)
 			continue
 		}
+		username := p.Username
+		password := p.Password
+		// When the operator sets proxy_username / proxy_password (or
+		// the env-var variants) on the [[upstream_pool]] block, those
+		// values win over whatever the vendor returned. This is the
+		// escape hatch for "Webshare's list shows stale credentials and
+		// every CONNECT comes back 407" without forcing a full
+		// list-refresh round-trip.
+		if e.cfg.ProxyUsername != "" {
+			username = e.cfg.ProxyUsername
+		}
+		if e.cfg.ProxyPassword != "" {
+			password = e.cfg.ProxyPassword
+		}
 		out = append(out, config.UpstreamConfig{
 			ID:       e.cfg.IDPrefix + "-" + p.ID,
 			Kind:     kind,
 			Addr:     p.HostPort(),
 			Priority: priorityPtr,
-			Username: p.Username,
-			Password: p.Password,
+			Username: username,
+			Password: password,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {

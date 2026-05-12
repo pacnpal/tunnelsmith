@@ -48,6 +48,20 @@ Webshare's API token is account-wide. Two options:
 - **`api_token`** — inline in the TOML. Cleartext in `--print-config` and in any logs that dump the resolved config. Use only for throwaway tokens or short-lived debugging.
 - **`api_token_file`** — absolute path to a one-token-per-file file (whitespace and a trailing newline are stripped). Recommended for production. The file must exist at startup; the token is read once during pool expansion and the in-memory copy is reused by the refresh ticker and the control-API surface. **Rotation requires a restart** in v1 — the SIGHUP path does not re-read the Webshare token file (the Phase 12 `auth_tokens_file` reload is for the control listener's own bearer tokens, not the vendor token).
 
+### Per-proxy CONNECT credentials
+
+By default the Webshare expander threads the per-proxy `username` and `password` from the `/proxy/list/` response into every materialised upstream, so each CONNECT carries the credentials Webshare returned for that exact proxy. Sometimes this is the wrong source: the vendor's list may briefly carry stale credentials after a plan change or password rotation, every CONNECT comes back `407 Proxy Authentication Required`, and the next refresh tick is hours away.
+
+The `proxy_username` / `proxy_password` block lets the operator pin the CONNECT credentials directly on the pool block. When set, every expanded upstream uses these values instead of whatever the vendor returned. Both must be set together (or both empty); a half-populated pair is rejected at config-load.
+
+Three sources, mix and match per credential:
+
+- **Inline.** `proxy_username = "..."` / `proxy_password = "..."`. Cleartext in `--print-config`. Useful for quick verification.
+- **Environment variable.** `proxy_username_env = "WEBSHARE_PROXY_USERNAME"` / `proxy_password_env = "WEBSHARE_PROXY_PASSWORD"`. The provider reads the named variable at startup and stamps the value onto every expanded upstream. The variable name is what appears in `--print-config`; the resolved value never does. Recommended for Docker deployments that inject secrets via `environment:` or `--env-file`.
+- **Omitted.** Keep the per-proxy values from the vendor response (the default and the v1.2.0 behaviour).
+
+The override is restart-only: rotating the secret value requires a binary restart, the same contract `api_token_file` already follows. A typo in the env-var name (variable unset or empty) fails the pool expansion at startup with a clear error rather than silently producing 407s at runtime.
+
 ### Vendor API
 
 When the Webshare provider is configured, `POST /v1/providers/{id_prefix}/refresh` on the control endpoint forwards to `POST /api/v2/proxy/list/refresh/`. See [`docs/control-api.md`](control-api.md) for the route shape, status codes, and auth requirements.

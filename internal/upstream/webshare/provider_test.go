@@ -217,6 +217,123 @@ func TestProviderBuildExpanderLoadsTokenFile(t *testing.T) {
 	}
 }
 
+func TestProviderValidateProxyCreds(t *testing.T) {
+	p := &Provider{}
+	base := config.UpstreamPoolConfig{
+		Provider: "webshare", IDPrefix: "ws", APIToken: "tok",
+	}
+	t.Run("both unset is fine", func(t *testing.T) {
+		if err := p.ValidateConfig(base); err != nil {
+			t.Fatalf("ValidateConfig: %v", err)
+		}
+	})
+	t.Run("inline pair is fine", func(t *testing.T) {
+		cfg := base
+		cfg.ProxyUsername = "u"
+		cfg.ProxyPassword = "p"
+		if err := p.ValidateConfig(cfg); err != nil {
+			t.Fatalf("ValidateConfig: %v", err)
+		}
+	})
+	t.Run("env pair is fine", func(t *testing.T) {
+		cfg := base
+		cfg.ProxyUsernameEnv = "WS_USER"
+		cfg.ProxyPasswordEnv = "WS_PASS"
+		if err := p.ValidateConfig(cfg); err != nil {
+			t.Fatalf("ValidateConfig: %v", err)
+		}
+	})
+	t.Run("mixed inline + env across creds is fine", func(t *testing.T) {
+		// One credential inline, the other via env is allowed: each
+		// credential picks its own source. The pairing rule only
+		// requires that both credentials are set, not that they use
+		// the same source.
+		cfg := base
+		cfg.ProxyUsername = "u"
+		cfg.ProxyPasswordEnv = "WS_PASS"
+		if err := p.ValidateConfig(cfg); err != nil {
+			t.Fatalf("ValidateConfig: %v", err)
+		}
+	})
+	t.Run("inline + env on same credential rejected", func(t *testing.T) {
+		cfg := base
+		cfg.ProxyUsername = "u"
+		cfg.ProxyUsernameEnv = "WS_USER"
+		cfg.ProxyPassword = "p"
+		err := p.ValidateConfig(cfg)
+		if err == nil || !strings.Contains(err.Error(), "only one") {
+			t.Fatalf("ValidateConfig: got %v, want exclusivity error", err)
+		}
+	})
+	t.Run("half-set pair rejected", func(t *testing.T) {
+		cfg := base
+		cfg.ProxyUsername = "u" // password missing
+		err := p.ValidateConfig(cfg)
+		if err == nil || !strings.Contains(err.Error(), "must be set together") {
+			t.Fatalf("ValidateConfig: got %v, want pairing error", err)
+		}
+	})
+}
+
+func TestProviderBuildExpanderResolvesProxyCredsFromEnv(t *testing.T) {
+	t.Setenv("WS_PROXY_USER_TEST", "env-user")
+	t.Setenv("WS_PROXY_PASS_TEST", "env-pass")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"count": 1,
+			"results": []Proxy{
+				{ID: "d-1", Username: "vendor", Password: "vendor", ProxyAddress: "1.1.1.1", Port: 1, Valid: true},
+			},
+		})
+	}))
+	t.Cleanup(srv.Close)
+
+	p := &Provider{}
+	exp, err := p.BuildExpander(config.UpstreamPoolConfig{
+		Provider:         "webshare",
+		IDPrefix:         "ws",
+		APIToken:         "tok",
+		ProxyUsernameEnv: "WS_PROXY_USER_TEST",
+		ProxyPasswordEnv: "WS_PROXY_PASS_TEST",
+	}, nil)
+	if err != nil {
+		t.Fatalf("BuildExpander: %v", err)
+	}
+	concrete := exp.(*Expander)
+	concrete.client.BaseURL = srv.URL
+	concrete.client.HTTPClient = srv.Client()
+
+	got, err := concrete.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if len(got) != 1 || got[0].Username != "env-user" || got[0].Password != "env-pass" {
+		t.Fatalf("expected env-resolved creds on the upstream, got %+v", got)
+	}
+}
+
+func TestProviderBuildExpanderRejectsMissingEnv(t *testing.T) {
+	// The env-var path must fail closed when the named variable is
+	// unset. Otherwise a typo in the env name would silently produce
+	// upstreams with empty credentials and surface as a 407 storm at
+	// runtime, exactly the symptom this feature is supposed to fix.
+	t.Setenv("WS_PROXY_USER_PRESENT", "user")
+	// WS_PROXY_PASS_MISSING deliberately not set.
+
+	p := &Provider{}
+	_, err := p.BuildExpander(config.UpstreamPoolConfig{
+		Provider:         "webshare",
+		IDPrefix:         "ws",
+		APIToken:         "tok",
+		ProxyUsernameEnv: "WS_PROXY_USER_PRESENT",
+		ProxyPasswordEnv: "WS_PROXY_PASS_MISSING",
+	}, nil)
+	if err == nil || !strings.Contains(err.Error(), "WS_PROXY_PASS_MISSING") {
+		t.Fatalf("BuildExpander: got %v, want unset-env error naming WS_PROXY_PASS_MISSING", err)
+	}
+}
+
 func TestProviderBuildAPITokenError(t *testing.T) {
 	p := &Provider{}
 	// Both empty: BuildExpander/BuildAPI must fail before any
