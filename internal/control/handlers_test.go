@@ -101,7 +101,15 @@ func newTestServerWithAuth(t *testing.T, backend Backend, m MetricsSink, tokens 
 
 func postJSON(t *testing.T, srv *httptest.Server, path, body string) *http.Response {
 	t.Helper()
-	resp, err := http.Post(srv.URL+path, "application/json", strings.NewReader(body))
+	// Use srv.Client() rather than http.DefaultClient so each httptest
+	// server gets a transport scoped to its own lifecycle: httptest
+	// closes the client's idle connections on Server.Close (per the
+	// stdlib doc), which keeps t.Parallel() subtests from racing on
+	// the shared http.DefaultTransport connection pool. A previous
+	// flake surfaced as "http: CloseIdleConnections called" mid-POST
+	// when many subtests with cleanup-triggered server shutdowns ran
+	// concurrently.
+	resp, err := srv.Client().Post(srv.URL+path, "application/json", strings.NewReader(body))
 	if err != nil {
 		t.Fatalf("POST %s: %v", path, err)
 	}
