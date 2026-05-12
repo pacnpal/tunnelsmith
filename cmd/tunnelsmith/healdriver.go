@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/pacnpal/tunnelsmith/internal/config"
 	"github.com/pacnpal/tunnelsmith/internal/failure"
 	"github.com/pacnpal/tunnelsmith/internal/upstream/provider"
 )
@@ -23,6 +25,16 @@ const (
 	authHealCooldown    = 60 * time.Second // min gap between heal runs
 	authHealCallTimeout = 60 * time.Second // bound the Heal RPC
 )
+
+// poolUpdater is the small slice of poolComposer the driver depends on
+// — just the hot-swap entry point. Factored as an interface so the
+// driver's unit tests can inject a no-op without standing up the full
+// composer dependency graph (scoreboard, listener, metrics, gauges).
+// The production *poolComposer satisfies this implicitly via its
+// existing Update method.
+type poolUpdater interface {
+	Update(idPrefix string, next []config.UpstreamConfig) (bool, error)
+}
 
 // authHealDriver observes KindProxyAuth events for one [[upstream_pool]]
 // block and triggers Healer.Heal when a burst suggests credentials have
@@ -49,7 +61,7 @@ type authHealDriver struct {
 	// later in main() than the scoreboard hook the driver is registered
 	// under. composerMu guards the swap; reads from runHeal take it.
 	composerMu sync.Mutex
-	composer   *poolComposer
+	composer   poolUpdater
 
 	mu       sync.Mutex
 	events   []time.Time
@@ -76,10 +88,11 @@ func newAuthHealDriver(idPrefix string, healer provider.Healer, logger *slog.Log
 }
 
 // setComposer wires the composer the driver will route healed snapshots
-// through. Set once at startup before the scoreboard's hook can fire
-// (no traffic has reached the listener at that point); subsequent reads
-// from runHeal take the lock to observe the assignment.
-func (d *authHealDriver) setComposer(c *poolComposer) {
+// through. Set once at startup after newPoolComposer returns; the
+// driver buffers events and defers cooldown advancement when the
+// composer is still nil (see bump) so the first burst after startup
+// heals correctly.
+func (d *authHealDriver) setComposer(c poolUpdater) {
 	d.composerMu.Lock()
 	d.composer = c
 	d.composerMu.Unlock()
@@ -101,9 +114,18 @@ func (d *authHealDriver) Observe(host, upstreamID string, kind failure.Kind) {
 }
 
 // bump records one event and, when the threshold has been hit within the
-// sliding window AND the cooldown has elapsed AND no heal is in flight,
-// kicks off a goroutine that calls Healer.Heal. The events slice gets
-// trimmed to the window on every bump so it cannot grow unboundedly.
+// sliding window AND the cooldown has elapsed AND no heal is in flight
+// AND the composer has already been wired, kicks off a goroutine that
+// calls Healer.Heal. The events slice gets trimmed to the window on
+// every bump so it cannot grow unboundedly.
+//
+// The composer-nil check is deliberately the last gate before committing
+// state changes (advancing lastHeal, clearing events, marking inFlight).
+// During the brief startup window between scoreboard.New (which
+// registers the failure hook) and connectAuthHealDriversToComposer
+// (which wires the composer), a burst of 407s reaching this point
+// would otherwise burn the cooldown on a no-op heal and leave the
+// driver unable to react once the composer becomes available.
 func (d *authHealDriver) bump() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -124,6 +146,17 @@ func (d *authHealDriver) bump() {
 		return
 	}
 	if !d.lastHeal.IsZero() && now.Sub(d.lastHeal) < d.cooldown {
+		return
+	}
+	// Composer-ready check: if the composer isn't wired yet, leave the
+	// events buffered (don't clear) and skip cooldown advancement so a
+	// subsequent bump after the composer lands fires immediately. The
+	// 407 storm at startup is exactly the scenario this branch
+	// protects against.
+	d.composerMu.Lock()
+	composerReady := d.composer != nil
+	d.composerMu.Unlock()
+	if !composerReady {
 		return
 	}
 	d.lastHeal = now
@@ -213,11 +246,36 @@ func buildAuthHealDrivers(blocks []*poolBlock, logger *slog.Logger) []*authHealD
 }
 
 // connectAuthHealDriversToComposer wires composer into every driver
-// after newPoolComposer has built it. Must be called before the
-// scoreboard begins recording failures (i.e. before the listener
-// starts taking traffic).
-func connectAuthHealDriversToComposer(drivers []*authHealDriver, composer *poolComposer) {
+// after newPoolComposer has built it. Composer may not exist at
+// scoreboard-construction time, so drivers buffer events until this
+// call lands; bump() defers cooldown advancement when composer is
+// nil so the first burst after startup heals correctly.
+func connectAuthHealDriversToComposer(drivers []*authHealDriver, composer poolUpdater) {
 	for _, d := range drivers {
 		d.setComposer(composer)
 	}
+}
+
+// validateNoStaticPoolPrefixCollision refuses to start the binary when
+// a static [[upstream]] id starts with any auto-heal pool's id_prefix
+// followed by "-". Without the guard, a static upstream named
+// "ws-fixed" (when a [[upstream_pool]] block uses id_prefix="ws")
+// would feed 407 events into the wrong driver and fire a Webshare
+// Heal in response to failures from an entirely unrelated upstream.
+// Failing at startup is preferable to silently routing the events
+// incorrectly: the operator either renames the static upstream or
+// changes the pool's id_prefix and learns which fix they wanted.
+func validateNoStaticPoolPrefixCollision(static []config.UpstreamConfig, drivers []*authHealDriver) error {
+	for _, d := range drivers {
+		prefix := d.idPrefix + "-"
+		for _, u := range static {
+			if strings.HasPrefix(u.ID, prefix) {
+				return fmt.Errorf(
+					"auth-heal driver: static [[upstream]] id %q collides with [[upstream_pool]] id_prefix %q (a 407 from the static upstream would trigger a vendor Heal on the pool); rename the static upstream or change the pool's id_prefix",
+					u.ID, d.idPrefix,
+				)
+			}
+		}
+	}
+	return nil
 }

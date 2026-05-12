@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -38,13 +39,46 @@ func quietDriverLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-// newTestDriver returns a driver pre-configured with the manual clock so
-// tests can exercise the sliding window and cooldown without sleeping.
+// stubUpdater is a poolUpdater implementation that records every
+// Update call so tests can assert hot-swap semantics without standing
+// up the full poolComposer dependency graph.
+type stubUpdater struct {
+	mu    sync.Mutex
+	calls []stubUpdateCall
+}
+
+type stubUpdateCall struct {
+	idPrefix string
+	count    int
+}
+
+func (s *stubUpdater) Update(idPrefix string, next []config.UpstreamConfig) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls = append(s.calls, stubUpdateCall{idPrefix: idPrefix, count: len(next)})
+	return true, nil
+}
+
+func (s *stubUpdater) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.calls)
+}
+
+// newTestDriver returns a driver pre-configured with the manual clock
+// and a stub composer so tests can exercise the sliding window,
+// cooldown, and heal logic without sleeping or wiring real pool
+// dependencies. Tests that need to exercise the composer-nil branch
+// can call setComposer(nil) before calling Observe.
 func newTestDriver(idPrefix string, healer *fakeHealer, now func() time.Time) *authHealDriver {
 	d := newAuthHealDriver(idPrefix, healer, quietDriverLogger())
 	if now != nil {
 		d.clock = now
 	}
+	// Default to a stub composer so the bump composer-ready gate doesn't
+	// short-circuit heal dispatch. Tests that want the composer-nil
+	// path call d.setComposer(nil) explicitly.
+	d.setComposer(&stubUpdater{})
 	return d
 }
 
@@ -220,6 +254,100 @@ func TestAuthHealDriverHealErrorClearsInFlight(t *testing.T) {
 		d.Observe("example.com", "ws-d-1", failure.KindProxyAuth)
 	}
 	waitForCalls(t, healer, 2, 1*time.Second)
+}
+
+// TestAuthHealDriverDefersUntilComposerWired pins the startup-window
+// fix: a 407 burst that crosses the threshold while the composer is
+// still nil must NOT advance the cooldown or clear the events. Once
+// the composer becomes available, the very next bump should fire the
+// heal immediately (no cooldown wait). Without this gate, the first
+// burst after startup gets silently dropped AND blocks the next heal
+// for the cooldown window.
+func TestAuthHealDriverDefersUntilComposerWired(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	clock := func() time.Time { return now }
+	healer := &fakeHealer{}
+	d := newTestDriver("ws", healer, clock)
+	// Reset to the composer-nil starting state (newTestDriver wires a
+	// stub by default for convenience).
+	d.setComposer(nil)
+
+	// Cross the threshold many times with composer still nil.
+	for i := 0; i < authHealThreshold*5; i++ {
+		d.Observe("example.com", "ws-d-1", failure.KindProxyAuth)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if got := healer.calls.Load(); got != 0 {
+		t.Fatalf("Heal called %d times before composer wired; want 0", got)
+	}
+	// lastHeal must still be zero so the next bump fires
+	// unconditionally once composer is wired.
+	d.mu.Lock()
+	if !d.lastHeal.IsZero() {
+		t.Errorf("lastHeal advanced during composer-nil window: %v", d.lastHeal)
+	}
+	bufferedEvents := len(d.events)
+	d.mu.Unlock()
+	if bufferedEvents < authHealThreshold {
+		t.Errorf("events were cleared during composer-nil window: %d buffered, want >= %d",
+			bufferedEvents, authHealThreshold)
+	}
+
+	// Wire the composer. The buffered events already cross threshold;
+	// the very next bump should fire the heal.
+	updater := &stubUpdater{}
+	d.setComposer(updater)
+	d.Observe("example.com", "ws-d-1", failure.KindProxyAuth)
+	waitForCalls(t, healer, 1, 1*time.Second)
+
+	// The composer must have been called once with the right id_prefix.
+	if got := updater.callCount(); got != 1 {
+		t.Errorf("composer.Update calls = %d, want 1", got)
+	}
+}
+
+// TestValidateNoStaticPoolPrefixCollision pins the startup-time check
+// that rejects a static [[upstream]] id which would otherwise match
+// the auto-heal driver's id_prefix and trigger heals on unrelated
+// failures.
+func TestValidateNoStaticPoolPrefixCollision(t *testing.T) {
+	t.Parallel()
+	t.Run("collision detected", func(t *testing.T) {
+		static := []config.UpstreamConfig{
+			{ID: "direct-1"},
+			{ID: "ws-fixed"}, // collides with the ws auto-heal driver
+		}
+		drivers := []*authHealDriver{
+			newAuthHealDriver("ws", &fakeHealer{}, quietDriverLogger()),
+		}
+		err := validateNoStaticPoolPrefixCollision(static, drivers)
+		if err == nil {
+			t.Fatal("expected collision error, got nil")
+		}
+		if !strings.Contains(err.Error(), "ws-fixed") || !strings.Contains(err.Error(), "id_prefix") {
+			t.Errorf("err = %q, want one mentioning both the colliding id and id_prefix", err.Error())
+		}
+	})
+	t.Run("no collision is fine", func(t *testing.T) {
+		static := []config.UpstreamConfig{
+			{ID: "direct-1"},
+			{ID: "mv-relay-2"}, // different pool prefix
+			{ID: "ws"},         // pool prefix alone is NOT a collision; the check is on the trailing "-"
+		}
+		drivers := []*authHealDriver{
+			newAuthHealDriver("ws", &fakeHealer{}, quietDriverLogger()),
+		}
+		if err := validateNoStaticPoolPrefixCollision(static, drivers); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+	t.Run("no drivers means nothing to check", func(t *testing.T) {
+		static := []config.UpstreamConfig{{ID: "ws-anything"}}
+		if err := validateNoStaticPoolPrefixCollision(static, nil); err != nil {
+			t.Fatalf("with no drivers, validation must always pass; got %v", err)
+		}
+	})
 }
 
 // TestAuthHealDriverSingleInFlight pins the concurrency contract: while

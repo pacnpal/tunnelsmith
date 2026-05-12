@@ -191,12 +191,20 @@ func (p *Provider) BuildAPI(cfg config.UpstreamPoolConfig, logger *slog.Logger) 
 
 // buildClient centralises the token-load + cache-wiring so both
 // BuildExpander and BuildAPI share one construction path. Each call
-// allocates a fresh *Client: the Client struct is read-only after
-// construction, has no shared mutable state, and the cache uses an
-// atomic tmp-and-rename write, so two separate clients pointed at
-// the same cache path are safe. The cost (one extra token-file read
-// at startup) is negligible and avoids the lifecycle questions
-// caching would introduce.
+// allocates a fresh *Client.
+//
+// Mutability note: Client.APIToken is mutable when APITokenFile is
+// set — the in-memory token gets swapped on a 401 retry via
+// reloadIfRotated, guarded by Client.tokenMu. All reads of APIToken
+// inside the Client go through snapshotToken to stay race-free. Two
+// clients sharing the same APITokenFile observe rotations
+// independently (each holds its own mu and reads disk on its own
+// 401 path), which is fine because LoadTokenFile is read-only and
+// the disk file is the source of truth. The cache still uses an
+// atomic tmp-and-rename write so concurrent cache writers stay
+// safe. The cost (one extra token-file read at startup) is
+// negligible and avoids the lifecycle questions a shared Client
+// would introduce.
 func buildClient(cfg config.UpstreamPoolConfig, logger *slog.Logger) (*Client, error) {
 	token, err := resolveToken(cfg)
 	if err != nil {

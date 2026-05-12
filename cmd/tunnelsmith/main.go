@@ -173,6 +173,9 @@ func run(args []string, stdout, stderr *os.File) error {
 	// later, so the window where a hook could fire against a nil
 	// composer is closed by ordering rather than by extra locking.
 	authHealDrivers := buildAuthHealDrivers(poolBlocks, logger)
+	if err := validateNoStaticPoolPrefixCollision(cfg.Upstreams, authHealDrivers); err != nil {
+		return err
+	}
 	authHealHook := fanoutFailureHook(authHealDrivers)
 
 	scoreboardOpts := []scoreboard.Option{

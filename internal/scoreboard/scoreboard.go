@@ -1098,9 +1098,12 @@ func (s *Scoreboard) observeDialSuccess(upstreamID string, latency time.Duration
 }
 
 // observeDialFailure records a failed dial against the metrics sink.
-// Known kinds (KindRefused, KindTimeout) map to their named outcomes;
-// any other value, including the empty Kind ClassifyDialError returns
-// for unrecognized errors, falls into "other".
+// Named outcomes are recorded for the kinds the dial path actually
+// produces (KindRefused, KindTimeout, KindProxyAuth); other values,
+// including the empty Kind ClassifyDialError returns for unrecognized
+// errors, fall into "other". KindProxyAuth is named so the auto-heal
+// driver's effect (407 burst → heal → recovery) shows up on the dial
+// metric as a distinct outcome rather than blending into "other".
 func (s *Scoreboard) observeDialFailure(upstreamID string, kind failure.Kind, latency time.Duration) {
 	if s.metrics == nil {
 		return
@@ -1111,6 +1114,8 @@ func (s *Scoreboard) observeDialFailure(upstreamID string, kind failure.Kind, la
 		outcome = "refused"
 	case failure.KindTimeout:
 		outcome = "timeout"
+	case failure.KindProxyAuth:
+		outcome = "proxy_auth"
 	default:
 		outcome = "other"
 	}
