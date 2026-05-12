@@ -171,6 +171,10 @@ Webshare-specific keys. Exactly one of `api_token` / `api_token_file` is require
 | `kind`            | string           | `"http"`   | upstream kind to materialise as: `http` (sends `Proxy-Authorization: Basic` per RFC 7617) or `socks5` (uses SOCKS5 user/pass auth) |
 | `plan_id`         | string           | `""`       | optional Webshare plan id; empty uses the account's default plan |
 | `country_codes`   | array of strings | `[]`       | ISO 3166-1 alpha-2 codes (`"US"`, `"DE"`); empty = no filter. Note: this is **`country_codes`**, not `countries` — Webshare's API filters by ISO code, not display name |
+| `proxy_username`  | string           | `""`       | optional override for the per-proxy CONNECT username. When set, every materialised upstream uses this value instead of the one returned by Webshare's proxy-list response. Must be paired with `proxy_password`. Mutually exclusive with `proxy_username_env` |
+| `proxy_password`  | string           | `""`       | optional override for the per-proxy CONNECT password. Must be paired with `proxy_username`. Mutually exclusive with `proxy_password_env` |
+| `proxy_username_env` | string        | `""`       | name of an environment variable to read the proxy username from at startup. Useful for Docker `environment:` blocks. Read once at startup; the resolved value never appears in `--print-config`. Mutually exclusive with `proxy_username` |
+| `proxy_password_env` | string        | `""`       | name of an environment variable to read the proxy password from at startup. Same semantics as `proxy_username_env`. Mutually exclusive with `proxy_password` |
 
 Example:
 

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Webshare per-proxy credential override.** New `proxy_username` / `proxy_password` (inline) and `proxy_username_env` / `proxy_password_env` (read from named environment variables at startup) on the `[[upstream_pool]]` provider block let the operator pin the CONNECT credentials for every materialised Webshare upstream instead of inheriting them from the vendor's `/proxy/list/` response. The escape hatch for "Webshare returns stale per-proxy credentials and every CONNECT comes back 407" without waiting on the next refresh tick. Both credentials must be set together; a half-populated pair fails at config-load. The env-var path matches the Docker pattern of `environment:` blocks injecting secrets; resolved values never appear in `--print-config`. Rotation is restart-only, matching `api_token_file`. See `docs/providers.md#per-proxy-connect-credentials` and the Docker example in `docs/deployment.md`.
+
 ## [1.2.0] - 2026-05-11
 
 Two additive features on top of v1.1.0: pluggable `[[upstream_pool]]` providers (Phase 13) — a small registry behind `cmd/tunnelsmith` so adding a vendor is a new package plus one blank import — landing alongside a first-class Webshare adapter (HTTP-with-Basic-auth or SOCKS5, paginated proxy list, disk-backed last-known-good cache), and opt-in TLS on the control listener (Phase 14) closing the plaintext-token risk ADR-007 named in its Non-goals. Both ship with the Phase 11/12 wire shape byte-for-byte preserved when the new opt-ins are left at defaults.

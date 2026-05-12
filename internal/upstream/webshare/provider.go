@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 
 	"github.com/pacnpal/tunnelsmith/internal/config"
@@ -81,6 +82,39 @@ func (p *Provider) ValidateConfig(cfg config.UpstreamPoolConfig) error {
 			return fmt.Errorf("webshare: country_codes[%d] %q must be a two-letter ISO 3166-1 alpha-2 code (ASCII letters only)", i, code)
 		}
 	}
+	if err := validateProxyCreds(cfg); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateProxyCreds enforces the inline/env exclusivity rule and the
+// pairing rule for proxy_username and proxy_password. Both credentials
+// are optional overall: a config with neither field set is fine, and
+// keeps the per-proxy values from the vendor's /proxy/list/ response.
+// When one credential is set the other must also be set so the dialer
+// never sends a half-populated Proxy-Authorization header.
+//
+// Env-var fields name the variable, not the value: tunnelsmith reads
+// the named variable at BuildExpander time. Resolution happens there
+// (not here) so that ValidateConfig stays side-effect free; this
+// function only checks for misconfiguration shapes.
+func validateProxyCreds(cfg config.UpstreamPoolConfig) error {
+	uInline := strings.TrimSpace(cfg.ProxyUsername) != ""
+	uEnv := strings.TrimSpace(cfg.ProxyUsernameEnv) != ""
+	pInline := strings.TrimSpace(cfg.ProxyPassword) != ""
+	pEnv := strings.TrimSpace(cfg.ProxyPasswordEnv) != ""
+	if uInline && uEnv {
+		return errors.New("webshare: set only one of proxy_username or proxy_username_env")
+	}
+	if pInline && pEnv {
+		return errors.New("webshare: set only one of proxy_password or proxy_password_env")
+	}
+	uSet := uInline || uEnv
+	pSet := pInline || pEnv
+	if uSet != pSet {
+		return errors.New("webshare: proxy_username and proxy_password must be set together (both inline or both via _env)")
+	}
 	return nil
 }
 
@@ -115,14 +149,20 @@ func (p *Provider) BuildExpander(cfg config.UpstreamPoolConfig, logger *slog.Log
 	if err != nil {
 		return nil, err
 	}
+	proxyUser, proxyPass, err := resolveProxyCreds(cfg)
+	if err != nil {
+		return nil, err
+	}
 	exp, err := NewExpander(ExpanderConfig{
-		IDPrefix:     cfg.IDPrefix,
-		Priority:     cfg.PriorityValue(),
-		Mode:         cfg.Mode,
-		Kind:         cfg.Kind,
-		PlanID:       cfg.PlanID,
-		CountryCodes: cfg.CountryCodes,
-		Refresh:      cfg.RefreshDuration(),
+		IDPrefix:      cfg.IDPrefix,
+		Priority:      cfg.PriorityValue(),
+		Mode:          cfg.Mode,
+		Kind:          cfg.Kind,
+		PlanID:        cfg.PlanID,
+		CountryCodes:  cfg.CountryCodes,
+		Refresh:       cfg.RefreshDuration(),
+		ProxyUsername: proxyUser,
+		ProxyPassword: proxyPass,
 	}, client, logger)
 	if err != nil {
 		return nil, err
@@ -169,6 +209,50 @@ func buildClient(cfg config.UpstreamPoolConfig, logger *slog.Logger) (*Client, e
 		c.Cache = &Cache{Path: cfg.CachePath}
 	}
 	return c, nil
+}
+
+// resolveProxyCreds returns the literal username/password to stamp into
+// every expanded upstream, or ("", "", nil) when the operator has not
+// asked for an override. The env-var path reads at startup so a
+// rotated secret only needs a restart (matches the rest of the
+// Webshare token-handling contract). Both credentials must be set
+// together; validateProxyCreds enforces that earlier in the load path,
+// but this function double-checks the resolved values to catch the
+// "env var named but unset" case that ValidateConfig cannot see.
+func resolveProxyCreds(cfg config.UpstreamPoolConfig) (string, string, error) {
+	user, err := resolveCred(cfg.ProxyUsername, cfg.ProxyUsernameEnv, "proxy_username")
+	if err != nil {
+		return "", "", err
+	}
+	pass, err := resolveCred(cfg.ProxyPassword, cfg.ProxyPasswordEnv, "proxy_password")
+	if err != nil {
+		return "", "", err
+	}
+	if (user == "") != (pass == "") {
+		// One side resolved to empty (env var unset, most likely) while
+		// the other carries a value. The same pairing rule from
+		// validateProxyCreds applies post-resolution.
+		return "", "", fmt.Errorf("webshare: proxy_username and proxy_password must both resolve to non-empty values")
+	}
+	return user, pass, nil
+}
+
+// resolveCred returns the literal value behind an inline-or-env field
+// pair. inlineVal wins when set; envVar names an environment variable
+// to look up (an empty result is an error so a typo in the env-var name
+// fails fast instead of silently producing empty credentials).
+func resolveCred(inlineVal, envVar, field string) (string, error) {
+	if v := strings.TrimSpace(inlineVal); v != "" {
+		return v, nil
+	}
+	if e := strings.TrimSpace(envVar); e != "" {
+		val := os.Getenv(e)
+		if strings.TrimSpace(val) == "" {
+			return "", fmt.Errorf("webshare: %s_env points at %q but the variable is unset or empty", field, e)
+		}
+		return val, nil
+	}
+	return "", nil
 }
 
 func resolveToken(cfg config.UpstreamPoolConfig) (string, error) {
