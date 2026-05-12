@@ -300,7 +300,10 @@ func TestProviderBuildExpanderResolvesProxyCredsFromEnv(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildExpander: %v", err)
 	}
-	concrete := exp.(*Expander)
+	concrete, ok := exp.(*Expander)
+	if !ok {
+		t.Fatalf("BuildExpander returned %T, want *Expander", exp)
+	}
 	concrete.client.BaseURL = srv.URL
 	concrete.client.HTTPClient = srv.Client()
 
@@ -343,7 +346,10 @@ func TestProviderBuildExpanderTrimsResolvedProxyCreds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildExpander: %v", err)
 	}
-	concrete := exp.(*Expander)
+	concrete, ok := exp.(*Expander)
+	if !ok {
+		t.Fatalf("BuildExpander returned %T, want *Expander", exp)
+	}
 	concrete.client.BaseURL = srv.URL
 	concrete.client.HTTPClient = srv.Client()
 

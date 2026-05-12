@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.2.1] - 2026-05-12
 
-One additive feature on top of v1.2.0: an operator-controlled override for the per-proxy CONNECT credentials on the Webshare provider, so deployments hitting stale-credential 407 storms can pin the auth header from the config or a Docker `environment:` block instead of waiting on the next vendor list-refresh tick. Default behaviour is byte-identical to v1.2.0.
+One additive feature on top of v1.2.0 plus a bundled fix: an operator-controlled override for the per-proxy CONNECT credentials on the Webshare provider, so deployments hitting stale-credential 407 storms can pin the auth header from the config or a Docker `environment:` block instead of waiting on the next vendor list-refresh tick. The fix corrects a whitespace-trimming asymmetry in the env-var resolution path that landed with the feature itself. Default behaviour is byte-identical to v1.2.0.
 
 ### Added
 
