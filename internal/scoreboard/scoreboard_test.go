@@ -420,6 +420,108 @@ func TestTimeDecayDriftsScoresTowardZero(t *testing.T) {
 // host B's view of the same upstream. One RecordFailure is enough to make
 // hostA's u1 score negative; hostB has no entry yet, which is the actual
 // independence claim under test.
+// TestFailureHookFiresOnRecordedFailure pins the contract the auto-heal
+// driver depends on: a RecordFailure that survives the debounce window
+// triggers the configured FailureHook exactly once with the same
+// arguments, and a debounce-suppressed call does NOT fire the hook a
+// second time. The hook fires after the scoreboard lock is released so
+// observers can take their own locks without risking deadlock.
+func TestFailureHookFiresOnRecordedFailure(t *testing.T) {
+	t.Parallel()
+	type event struct {
+		host, upstreamID string
+		kind             failure.Kind
+	}
+	var (
+		mu     sync.Mutex
+		events []event
+	)
+	hook := func(host, upstreamID string, kind failure.Kind) {
+		mu.Lock()
+		defer mu.Unlock()
+		events = append(events, event{host, upstreamID, kind})
+	}
+
+	clock := newManualClock(time.Date(2026, 5, 12, 12, 0, 0, 0, time.UTC))
+	entries := []upstream.PoolEntry{{Up: alwaysOK("u1"), Priority: 10}}
+	pool, err := upstream.NewPool(entries, 1, quietLogger())
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	cfg := scoreboard.Config{
+		ConnectionRefused: true,
+		KindPolicy: map[failure.Kind]scoreboard.Policy{
+			failure.KindProxyAuth: {Penalty: 4, Cooldown: 15 * time.Second},
+			failure.KindRefused:   {Penalty: 3, Cooldown: 30 * time.Second},
+		},
+		ScoreCap:       10,
+		DebounceWindow: 100 * time.Millisecond,
+	}
+	sb, err := scoreboard.New(pool, cfg,
+		scoreboard.WithLogger(quietLogger()),
+		scoreboard.WithClock(clock.Now),
+		scoreboard.WithFailureHook(hook),
+	)
+	if err != nil {
+		t.Fatalf("scoreboard.New: %v", err)
+	}
+
+	sb.RecordFailure("example.com", "u1", failure.KindProxyAuth, nil)
+	mu.Lock()
+	if len(events) != 1 {
+		mu.Unlock()
+		t.Fatalf("hook fired %d times, want 1", len(events))
+	}
+	got := events[0]
+	mu.Unlock()
+	if got.host != "example.com" || got.upstreamID != "u1" || got.kind != failure.KindProxyAuth {
+		t.Fatalf("hook event = %+v, want example.com/u1/proxy_auth", got)
+	}
+
+	// Within debounce window: hook must NOT fire again.
+	sb.RecordFailure("example.com", "u1", failure.KindProxyAuth, nil)
+	mu.Lock()
+	if len(events) != 1 {
+		t.Fatalf("hook fired during debounce window (%d events); want 1", len(events))
+	}
+	mu.Unlock()
+
+	// Past debounce window: hook fires again.
+	clock.Add(200 * time.Millisecond)
+	sb.RecordFailure("example.com", "u1", failure.KindProxyAuth, nil)
+	mu.Lock()
+	if len(events) != 2 {
+		t.Fatalf("hook fired %d times after debounce expiry, want 2", len(events))
+	}
+	mu.Unlock()
+}
+
+// TestFailureHookNotInvokedWhenNil exercises the nil-hook branch to
+// confirm RecordFailure still runs to completion without a configured
+// hook. Without the guard, a nil-hook call would panic at the call
+// site and trip every scoreboard test that doesn't opt into the hook.
+func TestFailureHookNotInvokedWhenNil(t *testing.T) {
+	t.Parallel()
+	entries := []upstream.PoolEntry{{Up: alwaysOK("u1"), Priority: 10}}
+	pool, err := upstream.NewPool(entries, 1, quietLogger())
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	cfg := scoreboard.Config{
+		ConnectionRefused: true,
+		KindPolicy: map[failure.Kind]scoreboard.Policy{
+			failure.KindRefused: {Penalty: 3, Cooldown: 30 * time.Second},
+		},
+		ScoreCap: 10,
+	}
+	sb, err := scoreboard.New(pool, cfg, scoreboard.WithLogger(quietLogger()))
+	if err != nil {
+		t.Fatalf("scoreboard.New: %v", err)
+	}
+	// Must not panic with no hook configured.
+	sb.RecordFailure("example.com", "u1", failure.KindRefused, nil)
+}
+
 func TestPerHostIndependence(t *testing.T) {
 	t.Parallel()
 	up1 := alwaysOK("u1")

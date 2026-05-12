@@ -162,13 +162,55 @@ func run(args []string, stdout, stderr *os.File) error {
 	metricsRegistry := metrics.New()
 	metricsRegistry.SetUpstreamPoolSize(pool.Len())
 
-	sb, err := scoreboard.New(pool, scoreboard.FromConfig(cfg.Failure.Scoring, cfg.Failure.Status, cfg.Failure.ConnectionRefused),
+	// Build the auto-heal drivers BEFORE scoreboard.New so the
+	// FailureHook can be threaded through the constructor. One driver
+	// per [[upstream_pool]] block whose Expander implements
+	// provider.Healer (today: webshare only); blocks without a Healer
+	// (mullvad) get no driver and never trigger Heal. Drivers stay
+	// composer-less here — newPoolComposer runs further down — and
+	// get wired via connectAuthHealDriversToComposer once the
+	// composer exists.
+	//
+	// The listener goroutines (httpSrv.Serve / socksSrv.Serve) start
+	// further down too, ahead of newPoolComposer; that means a 407
+	// can reach the failure hook before the driver's composer is
+	// wired. The driver handles that startup window itself: bump()
+	// defers cooldown advancement and event clearing when the
+	// composer is nil, so any buffered events fire the heal on the
+	// first bump after wiring lands. The hook is safe to register
+	// here even though both ordering edges (composer wired ↔
+	// listeners up) interleave at startup.
+	authHealDrivers := buildAuthHealDrivers(poolBlocks, logger)
+	allPoolPrefixes := make([]string, 0, len(poolBlocks))
+	for _, b := range poolBlocks {
+		allPoolPrefixes = append(allPoolPrefixes, b.idPrefix)
+	}
+	if err := validateNoPoolPrefixCollision(cfg.Upstreams, authHealDrivers, allPoolPrefixes); err != nil {
+		return err
+	}
+	authHealHook := fanoutFailureHook(authHealDrivers)
+
+	scoreboardOpts := []scoreboard.Option{
 		scoreboard.WithLogger(logger),
 		scoreboard.WithMetrics(metricsRegistry),
 		scoreboard.WithRules(rules),
+	}
+	if authHealHook != nil {
+		scoreboardOpts = append(scoreboardOpts, scoreboard.WithFailureHook(authHealHook))
+	}
+	sb, err := scoreboard.New(pool, scoreboard.FromConfig(cfg.Failure.Scoring, cfg.Failure.Status, cfg.Failure.ConnectionRefused),
+		scoreboardOpts...,
 	)
 	if err != nil {
 		return fmt.Errorf("build scoreboard: %w", err)
+	}
+	if len(authHealDrivers) > 0 {
+		logger.Info("auth-heal drivers registered",
+			"count", len(authHealDrivers),
+			"threshold", authHealThreshold,
+			"window_ms", authHealWindow.Milliseconds(),
+			"cooldown_ms", authHealCooldown.Milliseconds(),
+		)
 	}
 	if cfg.Cache.PersistPath != "" {
 		if err := sb.LoadSnapshot(cfg.Cache.PersistPath); err != nil {
@@ -329,6 +371,21 @@ func run(args []string, stdout, stderr *os.File) error {
 		cfg.Failure.MaxRetriesPerRequest,
 		dialTimeout,
 	)
+	// Wire the auto-heal drivers to the composer AND to the errgroup
+	// context now that both exist. Composer enables hot-swap; gctx
+	// gives runHeal a shutdown-aware parent so a SIGTERM cancels the
+	// in-flight Healer.Heal RPC instead of dangling past shutdown.
+	//
+	// The listener goroutines (httpSrv.Serve / socksSrv.Serve) have
+	// already started above, so a 407 storm CAN reach the failure
+	// hook before this line. That window is closed by the driver
+	// itself: bump() defers cooldown advancement and event clearing
+	// when composer is nil, so any buffered events trigger the heal
+	// on the first bump after this call lands. The wiring helper
+	// sets parentCtx before composer so a heal dispatched at the
+	// exact moment of wiring still inherits the shutdown-aware
+	// parent.
+	connectAuthHealDriversToComposer(authHealDrivers, gctx, composer)
 	for _, pb := range poolBlocks {
 		pb := pb
 		g.Go(func() error { return pb.runRefresh(gctx, composer) })

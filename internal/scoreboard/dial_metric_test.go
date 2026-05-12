@@ -25,6 +25,10 @@ func TestObserveDialFailureNeverReportsSuccess(t *testing.T) {
 		{name: "empty kind", kind: "", want: "other"},
 		{name: "refused", kind: failure.KindRefused, want: "refused"},
 		{name: "timeout", kind: failure.KindTimeout, want: "timeout"},
+		// proxy_auth is the named outcome the auto-heal pipeline
+		// relies on for observability; collapsing it into "other"
+		// would silently break the heal-event metric label contract.
+		{name: "proxy auth", kind: failure.KindProxyAuth, want: "proxy_auth"},
 		{name: "unknown kind", kind: failure.Kind("nonsense"), want: "other"},
 	}
 

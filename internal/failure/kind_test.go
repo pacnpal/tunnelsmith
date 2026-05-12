@@ -21,6 +21,7 @@ func TestKindStringMatchesValue(t *testing.T) {
 		{failure.KindForbidden, "forbidden"},
 		{failure.KindLegalBlock, "legal_block"},
 		{failure.KindBodyMatch, "body_match"},
+		{failure.KindProxyAuth, "proxy_auth"},
 	}
 	for _, c := range cases {
 		if got := c.k.String(); got != c.want {
@@ -55,6 +56,7 @@ func TestAllKindsCoversEveryDeclaredValue(t *testing.T) {
 		failure.KindForbidden:  true,
 		failure.KindLegalBlock: true,
 		failure.KindBodyMatch:  true,
+		failure.KindProxyAuth:  true,
 	}
 	if len(failure.AllKinds) != len(want) {
 		t.Fatalf("len(AllKinds) = %d, want %d", len(failure.AllKinds), len(want))
@@ -108,6 +110,34 @@ func TestClassifyDialError(t *testing.T) {
 		}
 	})
 
+	t.Run("ErrProxyAuth maps to KindProxyAuth", func(t *testing.T) {
+		t.Parallel()
+		// The sentinel wrapped via %w is exactly how upstream.go marks
+		// a CONNECT-407 dial error. ClassifyDialError must recognise it
+		// via errors.Is across the chain so the auto-heal driver
+		// observes the event under the right kind. fakeWrappedErr's
+		// Unwrap exposes the sentinel so errors.Is walks to it,
+		// mirroring what fmt.Errorf("…: %w", ErrProxyAuth) produces in
+		// upstream.go.
+		dialErr := fakeWrappedErr{inner: failure.ErrProxyAuth}
+		if got := failure.ClassifyDialError(dialErr); got != failure.KindProxyAuth {
+			t.Errorf("ClassifyDialError(ErrProxyAuth) = %q, want proxy_auth", got)
+		}
+	})
+
+	t.Run("ErrProxyAuth wins over a wrapped timeout", func(t *testing.T) {
+		t.Parallel()
+		// Defensive case: if a future code path produces an error that
+		// satisfies both branches (e.g. CONNECT response read returned
+		// 407 after a deadline-extended retry), the proxy-auth kind
+		// must still win because the operator-actionable signal is
+		// the 407, not the timeout.
+		dialErr := wrappedProxyAuthAndTimeout{}
+		if got := failure.ClassifyDialError(dialErr); got != failure.KindProxyAuth {
+			t.Errorf("ClassifyDialError(proxyAuth+timeout) = %q, want proxy_auth", got)
+		}
+	})
+
 	t.Run("timeout wins over a wrapped refused", func(t *testing.T) {
 		t.Parallel()
 		// Construct an error that satisfies both Timeout() and ECONNREFUSED.
@@ -152,3 +182,27 @@ func (wrappedTimeoutAndRefused) Error() string        { return "timeout-after-re
 func (wrappedTimeoutAndRefused) Timeout() bool        { return true }
 func (wrappedTimeoutAndRefused) Temporary() bool      { return false }
 func (wrappedTimeoutAndRefused) Is(target error) bool { return target == syscall.ECONNREFUSED }
+
+// fakeWrappedErr is a minimal error whose Unwrap exposes the inner
+// error so errors.Is walks to it. Lets the test demonstrate the
+// "wrapped via %w" production shape without depending on fmt.Errorf
+// behavior changes across Go versions.
+type fakeWrappedErr struct {
+	inner error
+}
+
+func (f fakeWrappedErr) Error() string { return "wrap: " + f.inner.Error() }
+func (f fakeWrappedErr) Unwrap() error { return f.inner }
+
+// wrappedProxyAuthAndTimeout satisfies both errors.Is(failure.ErrProxyAuth)
+// and the net.Error Timeout() check. ClassifyDialError must prefer the
+// proxy-auth classification because that is the operator-actionable
+// kind that the auto-heal driver subscribes to.
+type wrappedProxyAuthAndTimeout struct{}
+
+func (wrappedProxyAuthAndTimeout) Error() string   { return "proxy-auth-and-timeout" }
+func (wrappedProxyAuthAndTimeout) Timeout() bool   { return true }
+func (wrappedProxyAuthAndTimeout) Temporary() bool { return false }
+func (wrappedProxyAuthAndTimeout) Is(target error) bool {
+	return target == failure.ErrProxyAuth
+}

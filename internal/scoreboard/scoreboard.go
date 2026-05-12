@@ -127,6 +127,22 @@ func FromConfig(s config.ScoringConfig, status []config.StatusRule, connectionRe
 			Penalty:  s.BodyMatchPenalty,
 			Cooldown: s.BodyMatchCooldown.Duration(),
 		},
+		// KindProxyAuth penalty and cooldown are not config-tunable yet:
+		// the kind only fires when an upstream HTTP proxy answers
+		// CONNECT with 407, which is a credential-rotation signal the
+		// auto-heal driver reacts to. Penalty matches rate-limit
+		// (significant but not catastrophic — once the heal lands,
+		// every upstream in the pool gets the fresh credentials).
+		// Cooldown is short on purpose so a successful heal observes
+		// recovery within seconds rather than waiting out a long
+		// quarantine. Operators who need to tune this can add config
+		// later; the defaults are picked so the typical
+		// password-rotation case self-resolves end-to-end without
+		// operator intervention.
+		failure.KindProxyAuth: {
+			Penalty:  4.0,
+			Cooldown: 15 * time.Second,
+		},
 	}
 	for _, sr := range status {
 		switch sr.Code {
@@ -234,7 +250,24 @@ type Scoreboard struct {
 	// metrics are disabled; every call site uses recordMetric helpers
 	// that no-op on nil.
 	metrics MetricsSink
+
+	// failureHook, when non-nil, fires once after each successful
+	// RecordFailure (i.e. one that survived the per-(host, upstream,
+	// kind) debounce window). The hook receives the same arguments
+	// RecordFailure observed. The Scoreboard releases mu before
+	// invoking the hook so observers may take their own locks without
+	// risking the scoreboard's lock ordering, but observers should be
+	// cheap — RecordFailure runs on the hot dial-failure path. Heavy
+	// work should be queued onto an observer-owned goroutine. The
+	// auto-heal driver in cmd/tunnelsmith is the first consumer.
+	failureHook FailureHook
 }
+
+// FailureHook is the signature of the optional observer invoked after
+// each surviving RecordFailure. host is the destination host the dial
+// targeted, upstreamID identifies which exit failed, and kind names
+// the failure shape that was actually recorded.
+type FailureHook func(host, upstreamID string, kind failure.Kind)
 
 // entry is per-(host, upstream) state. Field comments name the invariants;
 // all reads/writes happen under Scoreboard.mu.
@@ -302,6 +335,18 @@ func WithRand(r *rand.Rand) Option {
 func WithMetrics(m MetricsSink) Option {
 	return func(s *Scoreboard) {
 		s.metrics = m
+	}
+}
+
+// WithFailureHook attaches an observer that fires after each surviving
+// RecordFailure. Passing nil clears any previously-set hook. The hook
+// is invoked synchronously without the scoreboard lock; observers
+// should be cheap or offload work to their own goroutine. Used by
+// cmd/tunnelsmith to drive the credential-auto-heal pipeline against
+// KindProxyAuth bursts.
+func WithFailureHook(h FailureHook) Option {
+	return func(s *Scoreboard) {
+		s.failureHook = h
 	}
 }
 
@@ -866,6 +911,16 @@ func (s *Scoreboard) RecordFailure(host, upstreamID string, kind failure.Kind, c
 		"cooldown_ms", cooldown.Milliseconds(),
 		"score", score,
 	)
+	// Fire the optional failure hook after the lock is released so
+	// observers can take their own locks (or call into other
+	// scoreboard methods) without provoking a deadlock. Observers are
+	// expected to be cheap; heavy work should be offloaded to a
+	// goroutine the observer owns. Skipped events (debounce drops,
+	// invalid kind) do not reach this point, matching the
+	// globalFailureCount accounting.
+	if hook := s.failureHook; hook != nil {
+		hook(host, upstreamID, kind)
+	}
 }
 
 // acceptForDebounce returns true if a (host, upstream, kind) penalty should
@@ -1043,9 +1098,12 @@ func (s *Scoreboard) observeDialSuccess(upstreamID string, latency time.Duration
 }
 
 // observeDialFailure records a failed dial against the metrics sink.
-// Known kinds (KindRefused, KindTimeout) map to their named outcomes;
-// any other value, including the empty Kind ClassifyDialError returns
-// for unrecognized errors, falls into "other".
+// Named outcomes are recorded for the kinds the dial path actually
+// produces (KindRefused, KindTimeout, KindProxyAuth); other values,
+// including the empty Kind ClassifyDialError returns for unrecognized
+// errors, fall into "other". KindProxyAuth is named so the auto-heal
+// driver's effect (407 burst → heal → recovery) shows up on the dial
+// metric as a distinct outcome rather than blending into "other".
 func (s *Scoreboard) observeDialFailure(upstreamID string, kind failure.Kind, latency time.Duration) {
 	if s.metrics == nil {
 		return
@@ -1056,6 +1114,8 @@ func (s *Scoreboard) observeDialFailure(upstreamID string, kind failure.Kind, la
 		outcome = "refused"
 	case failure.KindTimeout:
 		outcome = "timeout"
+	case failure.KindProxyAuth:
+		outcome = "proxy_auth"
 	default:
 		outcome = "other"
 	}

@@ -81,6 +81,20 @@ type RefreshOptions struct {
 	PlanID string
 }
 
+// Healer is an optional capability some Expanders advertise: trigger a
+// vendor-side refresh and return the resulting fresh snapshot. The
+// snapshot is NOT applied by the Healer itself — applying (hot-swap
+// onto the running pool) is the caller's job. cmd/tunnelsmith's
+// auto-heal driver pairs Healer.Heal with poolComposer.Update to
+// complete the round-trip in response to credential-rotation signals
+// (CONNECT 407 bursts mapped to failure.KindProxyAuth), without
+// waiting for the scheduled refresh tick. Providers without
+// vendor-side rotation (e.g. mullvad) do not implement this; the
+// driver simply skips their pool blocks.
+type Healer interface {
+	Heal(ctx context.Context) ([]config.UpstreamConfig, error)
+}
+
 // API is the optional vendor-API control surface. Providers that have
 // nothing to expose return ErrAPINotSupported from Provider.BuildAPI.
 //

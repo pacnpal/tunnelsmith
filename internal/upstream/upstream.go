@@ -21,6 +21,7 @@ import (
 	"golang.org/x/net/proxy"
 
 	"github.com/pacnpal/tunnelsmith/internal/config"
+	"github.com/pacnpal/tunnelsmith/internal/failure"
 )
 
 // Upstream is one egress option. Implementations dial the destination
@@ -159,6 +160,15 @@ func (u *httpUpstream) Dial(ctx context.Context, network, addr string) (net.Conn
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		_ = resp.Body.Close()
 		_ = conn.Close()
+		// 407 specifically carries the failure.ErrProxyAuth sentinel so
+		// the scoreboard's ClassifyDialError maps it to KindProxyAuth.
+		// The auto-heal driver subscribes to that kind to trigger a
+		// credential refresh when a burst suggests rotation. Other
+		// non-2xx statuses (502 from a sick upstream, etc.) stay
+		// generic and fall into the existing KindRefused bucket.
+		if resp.StatusCode == http.StatusProxyAuthRequired {
+			return nil, fmt.Errorf("http upstream %q: CONNECT got status 407: %w", u.id, failure.ErrProxyAuth)
+		}
 		return nil, fmt.Errorf("http upstream %q: CONNECT got status %d", u.id, resp.StatusCode)
 	}
 	_ = resp.Body.Close()
